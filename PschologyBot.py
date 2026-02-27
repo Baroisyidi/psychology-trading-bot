@@ -120,7 +120,7 @@ async def get_instrument_constraints(symbol: str) -> Tuple[float, float]:
     
     except Exception as e:
         print(f"Failed to get constraints for {symbol}: {e}")
-        return 0.001, 0.001  # very safe fallback
+        return 0.001, 0.001
 
 
 async def get_trade_qty(symbol: str) -> str:
@@ -335,7 +335,27 @@ async def run_bot():
     application.add_handler(CommandHandler("add_symbol", add_symbol))
     application.add_error_handler(error_handler)
 
-    print("Telegram application built. Starting polling...")
+    print("Telegram application built. Initializing...")
+
+    # Start Telegram components
+    await application.initialize()
+    print("Telegram application initialized.")
+
+    # Start polling as a non-blocking task
+    updater = application.updater
+    polling_task = asyncio.create_task(
+        updater.start_polling(
+            poll_interval=0.0,
+            timeout=10,
+            bootstrap_retries=-1,
+            read_timeout=30,
+            write_timeout=30,
+            connect_timeout=30,
+            pool_timeout=30,
+            drop_pending_updates=True,
+        )
+    )
+    print("Polling task started.")
 
     # Async health endpoint with aiohttp
     async def health(request):
@@ -350,25 +370,16 @@ async def run_bot():
     await site.start()
     print(f"Async health server running on port {os.environ.get('PORT', 10000)}")
 
-    # Run polling as a non-blocking task
-    polling_task = asyncio.create_task(
-        application.run_polling(
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True,
-            poll_interval=0.0,
-        )
-    )
+    print("Bot is fully running... Waiting for messages and jobs.")
 
-    print("Polling task scheduled. Bot is now running...")
-
-    # Keep the event loop alive forever
-    await asyncio.Event().wait()
-
-    # Cleanup (reached only on shutdown)
-    print("Shutting down gracefully...")
-    await polling_task
-    await application.shutdown()
-    await runner.cleanup()
+    # Keep loop alive
+    try:
+        await asyncio.Event().wait()
+    finally:
+        print("Shutting down gracefully...")
+        await updater.stop()
+        await application.shutdown()
+        await runner.cleanup()
 
 
 if __name__ == "__main__":
