@@ -15,7 +15,7 @@ from telegram.ext import (
     JobQueue,
 )
 
-# For async HTTP server (health endpoint)
+# Async HTTP server for health check (Render requirement)
 from aiohttp import web
 
 # ────────────────────────────────────────────────
@@ -29,7 +29,7 @@ BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET")
 CHAT_ID_STR = os.getenv("CHAT_ID")
 
 if not all([TELEGRAM_TOKEN, BYBIT_API_KEY, BYBIT_API_SECRET, CHAT_ID_STR]):
-    raise ValueError("Missing required environment variables! Check .env file.")
+    raise ValueError("Missing required environment variables! Check .env file or Render env vars.")
 
 try:
     CHAT_ID = int(CHAT_ID_STR)
@@ -110,14 +110,14 @@ async def get_instrument_constraints(symbol: str) -> Tuple[float, float]:
         info = bybit_session.get_instruments_info(category="linear", symbol=symbol)
         if info["retCode"] != 0:
             raise ValueError(info["retMsg"])
-       
+        
         lot_filter = info["result"]["list"][0]["lotSizeFilter"]
         min_qty = float(lot_filter["minOrderQty"])
         qty_step = float(lot_filter["qtyStep"])
-       
+        
         print(f"[{symbol}] Min qty: {min_qty}, Qty step: {qty_step}")
         return min_qty, qty_step
-   
+    
     except Exception as e:
         print(f"Failed to get constraints for {symbol}: {e}")
         return 0.001, 0.001  # very safe fallback
@@ -337,7 +337,7 @@ async def run_bot():
 
     print("Telegram application built. Starting polling...")
 
-    # Async health endpoint using aiohttp
+    # Async health endpoint with aiohttp
     async def health(request):
         return web.Response(text="OK")
 
@@ -350,12 +350,25 @@ async def run_bot():
     await site.start()
     print(f"Async health server running on port {os.environ.get('PORT', 10000)}")
 
-    # Start Telegram polling in the same loop
-    await application.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
-        poll_interval=0.0,
+    # Run polling as a non-blocking task
+    polling_task = asyncio.create_task(
+        application.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+            poll_interval=0.0,
+        )
     )
+
+    print("Polling task scheduled. Bot is now running...")
+
+    # Keep the event loop alive forever
+    await asyncio.Event().wait()
+
+    # Cleanup (reached only on shutdown)
+    print("Shutting down gracefully...")
+    await polling_task
+    await application.shutdown()
+    await runner.cleanup()
 
 
 if __name__ == "__main__":
