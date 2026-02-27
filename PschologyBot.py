@@ -368,8 +368,9 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    # Start Flask in background thread to keep Render happy
+    print("=== Render startup: Initializing ===")
     port = int(os.environ.get("PORT", 10000))
+    print(f"Starting Flask on port {port}...")
     Thread(target=app.run, kwargs={
         "host": "0.0.0.0",
         "port": port,
@@ -377,10 +378,17 @@ if __name__ == "__main__":
         "use_reloader": False
     }).start()
     
-    # Start Telegram bot
+    print("Flask thread launched. Loading Telegram bot...")
+    print(f"TELEGRAM_TOKEN loaded (length: {len(TELEGRAM_TOKEN)} chars)")
+    print(f"CHAT_ID loaded: {CHAT_ID}")
+    
     try:
+        print("Calling main()...")
         main()
+        print("main() completed (should not reach here with polling)")
     except KeyboardInterrupt:
         print("\nBot stopped by user.")
     except Exception as exc:
-        print(f"Fatal startup error: {exc}")
+        print(f"Fatal startup error in main(): {exc}")
+        import traceback
+        traceback.print_exc()  # Full stack trace
