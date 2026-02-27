@@ -1,8 +1,4 @@
-# Add at the top
-from flask import Flask
-from threading import Thread
 import os
-import asyncio
 import asyncio
 from datetime import datetime
 from typing import Optional, Tuple
@@ -19,15 +15,9 @@ from telegram.ext import (
     JobQueue,
 )
 
-# Create a minimal Flask app for the /health endpoint
-app = Flask(__name__)
+# For async HTTP server (health endpoint)
+from aiohttp import web
 
-@app.route('/health')
-def health():
-    return "OK", 200
-
-
-# Run python "New BOT\PschologyBot.py"
 # ────────────────────────────────────────────────
 #  Load environment variables
 # ────────────────────────────────────────────────
@@ -136,7 +126,6 @@ async def get_instrument_constraints(symbol: str) -> Tuple[float, float]:
 async def get_trade_qty(symbol: str) -> str:
     """Calculate qty = 20% of totalAvailableBalance / price + round to valid step."""
     try:
-        # Get unified wallet balance
         balance_resp = bybit_session.get_wallet_balance(accountType="UNIFIED")
         if balance_resp["retCode"] != 0:
             raise ValueError(f"Balance API error: {balance_resp['retMsg']}")
@@ -144,14 +133,12 @@ async def get_trade_qty(symbol: str) -> str:
         if not result["list"]:
             raise ValueError("No account data in response")
         account = result["list"][0]
-        # Correct field for available trading balance in Unified account
         total_avail_usd_str = account.get("totalAvailableBalance", "0")
         total_avail_usd = float(total_avail_usd_str)
         if total_avail_usd <= 0:
             print(f"No available balance detected ({total_avail_usd}) for {symbol} — check demo funding")
             min_qty, _ = await get_instrument_constraints(symbol)
             return f"{min_qty:.6f}".rstrip('0').rstrip('.')
-        # Get current price
         _, current_price, _ = await get_trend_and_ema(symbol)
         if current_price is None or current_price <= 0:
             print(f"Invalid price for {symbol}")
@@ -159,14 +146,11 @@ async def get_trade_qty(symbol: str) -> str:
             return f"{min_qty:.6f}".rstrip('0').rstrip('.')
         risk_amount_usd = total_avail_usd * 0.20
         raw_qty = risk_amount_usd / current_price
-        # Get constraints
         min_qty, qty_step = await get_instrument_constraints(symbol)
-        # Round DOWN to nearest valid step (conservative – never exceed intended risk)
         if qty_step > 0:
             adjusted_qty = max(min_qty, (raw_qty // qty_step) * qty_step)
         else:
             adjusted_qty = max(min_qty, raw_qty)
-        # Format nicely
         precision = 6 if adjusted_qty < 10 else 3
         qty_str = f"{adjusted_qty:.{precision}f}".rstrip('0').rstrip('.')
         print(f"Calculated qty for {symbol}: {qty_str} "
@@ -225,8 +209,7 @@ async def place_trade(symbol: str, side: str = "Buy") -> Optional[dict]:
 
 
 async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Periodic job: check trend change for a specific symbol → notify + trade (demo)."""
-    symbol = context.job.data  # Symbol passed via job.data
+    symbol = context.job.data
     previous_trend = symbol_trends.get(symbol, None)
 
     trend, price, ema = await get_trend_and_ema(symbol)
@@ -239,7 +222,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
             )
         return
 
-    chat_id = context.job.chat_id if context.job else CHAT_ID  # fallback
+    chat_id = context.job.chat_id if context.job else CHAT_ID
 
     if trend != previous_trend:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -249,28 +232,23 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
 
-        # Close opposite position if exists, then open new
         close_result = None
         if trend == "upward":
-            # Close any short (Sell side position)
             close_result = await close_position(symbol=symbol, side_to_close="Sell")
             if close_result:
                 await context.bot.send_message(
                     chat_id=chat_id,
                     text=f"✅ Closed Short position for {symbol} successfully\nOrder ID: {close_result.get('orderId', '—')}"
                 )
-            # Then open Long (Buy)
             result = await place_trade(symbol=symbol, side="Buy")
             side_text = "Long (Buy)"
         else:
-            # Close any long (Buy side position)
             close_result = await close_position(symbol=symbol, side_to_close="Buy")
             if close_result:
                 await context.bot.send_message(
                     chat_id=chat_id,
                     text=f"✅ Closed Long position for {symbol} successfully\nOrder ID: {close_result.get('orderId', '—')}"
                 )
-            # Then open Short (Sell)
             result = await place_trade(symbol=symbol, side="Sell")
             side_text = "Short (Sell)"
 
@@ -292,7 +270,6 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Command: /add_symbol BTCUSDT — add a symbol to monitor."""
     if not context.args:
         await update.message.reply_text("Usage: /add_symbol <symbol> e.g. /add_symbol BTCUSDT")
         return
@@ -303,7 +280,7 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     monitored_symbols.append(symbol)
-    symbol_trends[symbol] = None  # Initialize trend
+    symbol_trends[symbol] = None
 
     chat_id = update.effective_chat.id
     await update.message.reply_text(
@@ -313,7 +290,6 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         "Trend changes → notification + demo trade"
     )
 
-    # Schedule a separate job for this symbol
     if context.job_queue:
         context.job_queue.run_repeating(
             callback=monitor_symbol,
@@ -321,12 +297,11 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             first=5,
             chat_id=chat_id,
             name=f"{symbol}_monitor",
-            data=symbol,  # Pass symbol via data
+            data=symbol,
         )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/start — basic welcome; use /add_symbol to start monitoring."""
     await update.message.reply_text(
         "Bot ready! Use /add_symbol <symbol> to start monitoring a cryptocurrency.\n"
         "Example: /add_symbol BTCUSDT\n"
@@ -335,7 +310,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Global error handler — log & notify admin chat."""
     print(f"Exception while handling update: {context.error}")
     if CHAT_ID:
         await context.bot.send_message(
@@ -344,61 +318,12 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
         )
 
 
-def main() -> None:
-    """Entry point — build & run modern Application."""
-    application = (
-        Application.builder()
-        .token(TELEGRAM_TOKEN)
-        .get_updates_read_timeout(30)   # optional tuning
-        .build()
-    )
-
-    # Handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("add_symbol", add_symbol))
-
-    # Global error handler
-    application.add_error_handler(error_handler)
-
-    print("Bot starting... Press Ctrl+C to stop.")
-    # Run polling (non-blocking)
-    application.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,   # clean old updates on start
-    )
-
-
-
-# ... (your existing code above)
-
-async def run_flask():
-    """Run Flask using asyncio server (compatible with async loop)."""
-    from aiohttp import web
-    app = Flask(__name__)
-
-    @app.route('/health')
-    def health():
-        return "OK", 200
-
-    # Use aiohttp to serve Flask (simple wrapper)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', int(os.environ.get("PORT", 10000)))
-    await site.start()
-    print(f"Flask health server running on port {os.environ.get('PORT', 10000)}")
-
-def main() -> None:
-    """Sync wrapper for async startup."""
-    loop = asyncio.get_event_loop()
-    
+async def run_bot():
     print("=== Render startup: Initializing ===")
-    print(f"Starting Flask on port {os.environ.get('PORT', 10000)}...")
-    loop.create_task(run_flask())  # Run Flask in async task
-    
-    print("Flask task scheduled. Loading Telegram bot...")
     print(f"TELEGRAM_TOKEN loaded (length: {len(TELEGRAM_TOKEN)} chars)")
     print(f"CHAT_ID loaded: {CHAT_ID}")
-    
+
+    # Build Telegram application
     application = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
@@ -411,53 +336,29 @@ def main() -> None:
     application.add_error_handler(error_handler)
 
     print("Telegram application built. Starting polling...")
-    application.run_polling(
+
+    # Async health endpoint using aiohttp
+    async def health(request):
+        return web.Response(text="OK")
+
+    aio_app = web.Application()
+    aio_app.router.add_get('/health', health)
+
+    runner = web.AppRunner(aio_app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', int(os.environ.get("PORT", 10000)))
+    await site.start()
+    print(f"Async health server running on port {os.environ.get('PORT', 10000)}")
+
+    # Start Telegram polling in the same loop
+    await application.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
+        poll_interval=0.0,
     )
 
+
 if __name__ == "__main__":
-    async def run_bot():
-        print("=== Render startup: Initializing ===")
-        print(f"TELEGRAM_TOKEN loaded (length: {len(TELEGRAM_TOKEN)} chars)")
-        print(f"CHAT_ID loaded: {CHAT_ID}")
-        
-        # Build Telegram application
-        application = (
-            Application.builder()
-            .token(TELEGRAM_TOKEN)
-            .get_updates_read_timeout(30)
-            .build()
-        )
-        
-        application.add_handler(CommandHandler("start", start))
-        application.add_handler(CommandHandler("add_symbol", add_symbol))
-        application.add_error_handler(error_handler)
-        
-        print("Telegram application built. Starting polling...")
-        
-        # Start Flask as an async server (using aiohttp for compatibility)
-        from aiohttp import web
-        
-        async def health(request):
-            return web.Response(text="OK")
-        
-        aio_app = web.Application()
-        aio_app.router.add_get('/health', health)
-        
-        runner = web.AppRunner(aio_app)
-        await runner.setup()
-        site = web.TCPSite(runner, '0.0.0.0', int(os.environ.get("PORT", 10000)))
-        await site.start()
-        print(f"Async Flask health server running on port {os.environ.get('PORT', 10000)}")
-        
-        # Run polling in the same event loop
-        await application.run_polling(
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True,
-            poll_interval=0.0,  # default polling
-        )
-    
     print("Entering main block...")
     try:
         asyncio.run(run_bot())
