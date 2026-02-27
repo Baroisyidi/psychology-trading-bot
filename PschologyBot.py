@@ -334,14 +334,15 @@ async def run_bot():
     polling_task = asyncio.create_task(
         updater.start_polling(
             poll_interval=0.0,
-            timeout=10,
+            timeout=20,
             bootstrap_retries=-1,
-            read_timeout=30,
-            write_timeout=30,
-            connect_timeout=30,
-            pool_timeout=30,
+            read_timeout=60,
+            write_timeout=60,
+            connect_timeout=60,
+            pool_timeout=60,
             drop_pending_updates=True,
         )
+        
     )
     print("Polling task started.")
 
@@ -357,6 +358,8 @@ async def run_bot():
     site = web.TCPSite(runner, '0.0.0.0', int(os.environ.get("PORT", 10000)))
     await site.start()
     print(f"Async health server running on port {os.environ.get('PORT', 10000)}")
+    print("Health endpoint active — bot fully initialized!")
+    
 
     print("Bot is fully running... Waiting for messages and jobs.")
 
