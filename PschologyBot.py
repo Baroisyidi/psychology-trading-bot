@@ -3,6 +3,7 @@ from flask import Flask
 from threading import Thread
 import os
 import asyncio
+import asyncio
 from datetime import datetime
 from typing import Optional, Tuple
 
@@ -416,9 +417,50 @@ def main() -> None:
     )
 
 if __name__ == "__main__":
+    async def run_bot():
+        print("=== Render startup: Initializing ===")
+        print(f"TELEGRAM_TOKEN loaded (length: {len(TELEGRAM_TOKEN)} chars)")
+        print(f"CHAT_ID loaded: {CHAT_ID}")
+        
+        # Build Telegram application
+        application = (
+            Application.builder()
+            .token(TELEGRAM_TOKEN)
+            .get_updates_read_timeout(30)
+            .build()
+        )
+        
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("add_symbol", add_symbol))
+        application.add_error_handler(error_handler)
+        
+        print("Telegram application built. Starting polling...")
+        
+        # Start Flask as an async server (using aiohttp for compatibility)
+        from aiohttp import web
+        
+        async def health(request):
+            return web.Response(text="OK")
+        
+        aio_app = web.Application()
+        aio_app.router.add_get('/health', health)
+        
+        runner = web.AppRunner(aio_app)
+        await runner.setup()
+        site = web.TCPSite(runner, '0.0.0.0', int(os.environ.get("PORT", 10000)))
+        await site.start()
+        print(f"Async Flask health server running on port {os.environ.get('PORT', 10000)}")
+        
+        # Run polling in the same event loop
+        await application.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+            poll_interval=0.0,  # default polling
+        )
+    
     print("Entering main block...")
     try:
-        main()
+        asyncio.run(run_bot())
     except KeyboardInterrupt:
         print("\nBot stopped by user.")
     except Exception as exc:
