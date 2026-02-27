@@ -15,12 +15,8 @@ from telegram.ext import (
     JobQueue,
 )
 
-# Async HTTP server for health check (Render requirement)
 from aiohttp import web
 
-# ────────────────────────────────────────────────
-#  Load environment variables
-# ────────────────────────────────────────────────
 load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -36,9 +32,6 @@ try:
 except ValueError:
     raise ValueError(f"CHAT_ID must be an integer, got: {CHAT_ID_STR}")
 
-# ────────────────────────────────────────────────
-#  Bybit demo session
-# ────────────────────────────────────────────────
 bybit_session = HTTP(
     demo=True,
     api_key=BYBIT_API_KEY,
@@ -46,9 +39,6 @@ bybit_session = HTTP(
     recv_window=60000
 )
 
-# ────────────────────────────────────────────────
-#  TEMPORARY DEBUG: Check time difference
-# ────────────────────────────────────────────────
 try:
     resp = bybit_session.get_server_time()
     server_ms = int(resp['time'])
@@ -60,7 +50,6 @@ except Exception as e:
     print(f"Debug failed: {e}")
     print("Full server time response:", resp)
 
-# Global state
 symbol_trends: dict[str, Optional[str]] = {}
 monitored_symbols: list[str] = []
 
@@ -105,7 +94,6 @@ async def get_trend_and_ema(
 
 
 async def get_instrument_constraints(symbol: str) -> Tuple[float, float]:
-    """Fetch minOrderQty and qtyStep for the symbol."""
     try:
         info = bybit_session.get_instruments_info(category="linear", symbol=symbol)
         if info["retCode"] != 0:
@@ -124,7 +112,6 @@ async def get_instrument_constraints(symbol: str) -> Tuple[float, float]:
 
 
 async def get_trade_qty(symbol: str) -> str:
-    """Calculate qty = 20% of totalAvailableBalance / price + round to valid step."""
     try:
         balance_resp = bybit_session.get_wallet_balance(accountType="UNIFIED")
         if balance_resp["retCode"] != 0:
@@ -323,7 +310,6 @@ async def run_bot():
     print(f"TELEGRAM_TOKEN loaded (length: {len(TELEGRAM_TOKEN)} chars)")
     print(f"CHAT_ID loaded: {CHAT_ID}")
 
-    # Build Telegram application
     application = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
@@ -337,7 +323,7 @@ async def run_bot():
 
     print("Telegram application built. Initializing...")
 
-    # Start Telegram components
+    # Manually initialize Telegram components
     await application.initialize()
     print("Telegram application initialized.")
 
@@ -357,7 +343,7 @@ async def run_bot():
     )
     print("Polling task started.")
 
-    # Async health endpoint with aiohttp
+    # Async health endpoint
     async def health(request):
         return web.Response(text="OK")
 
