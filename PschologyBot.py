@@ -1,3 +1,6 @@
+# Add at the top
+from flask import Flask
+from threading import Thread
 import os
 import asyncio
 from datetime import datetime
@@ -14,6 +17,14 @@ from telegram.ext import (
     ContextTypes,
     JobQueue,
 )
+
+# Create a minimal Flask app for the /health endpoint
+app = Flask(__name__)
+
+@app.route('/health')
+def health():
+    return "OK", 200
+
 
 # Run python "New BOT\PschologyBot.py"
 # ────────────────────────────────────────────────
@@ -355,8 +366,21 @@ def main() -> None:
         drop_pending_updates=True,   # clean old updates on start
     )
 
+# Create a minimal Flask app for the /health endpoint
+app = Flask(__name__)
+
+@app.route('/health')
+def health():
+    return "OK", 200
+
+# Your existing main() function here...
 
 if __name__ == "__main__":
+    # Start Flask in a background thread (Render expects something listening on $PORT)
+    port = int(os.environ.get("PORT", 10000))  # Render sets PORT env var
+    Thread(target=app.run, kwargs={"host": "0.0.0.0", "port": port, "debug": False, "use_reloader": False}).start()
+    
+    # Then start your Telegram bot as usual
     try:
         main()
     except KeyboardInterrupt:
