@@ -367,28 +367,61 @@ def main() -> None:
     )
 
 
-if __name__ == "__main__":
-    print("=== Render startup: Initializing ===")
-    port = int(os.environ.get("PORT", 10000))
-    print(f"Starting Flask on port {port}...")
-    Thread(target=app.run, kwargs={
-        "host": "0.0.0.0",
-        "port": port,
-        "debug": False,
-        "use_reloader": False
-    }).start()
+
+# ... (your existing code above)
+
+async def run_flask():
+    """Run Flask using asyncio server (compatible with async loop)."""
+    from aiohttp import web
+    app = Flask(__name__)
+
+    @app.route('/health')
+    def health():
+        return "OK", 200
+
+    # Use aiohttp to serve Flask (simple wrapper)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', int(os.environ.get("PORT", 10000)))
+    await site.start()
+    print(f"Flask health server running on port {os.environ.get('PORT', 10000)}")
+
+def main() -> None:
+    """Sync wrapper for async startup."""
+    loop = asyncio.get_event_loop()
     
-    print("Flask thread launched. Loading Telegram bot...")
+    print("=== Render startup: Initializing ===")
+    print(f"Starting Flask on port {os.environ.get('PORT', 10000)}...")
+    loop.create_task(run_flask())  # Run Flask in async task
+    
+    print("Flask task scheduled. Loading Telegram bot...")
     print(f"TELEGRAM_TOKEN loaded (length: {len(TELEGRAM_TOKEN)} chars)")
     print(f"CHAT_ID loaded: {CHAT_ID}")
     
+    application = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .get_updates_read_timeout(30)
+        .build()
+    )
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("add_symbol", add_symbol))
+    application.add_error_handler(error_handler)
+
+    print("Telegram application built. Starting polling...")
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+    )
+
+if __name__ == "__main__":
+    print("Entering main block...")
     try:
-        print("Calling main()...")
         main()
-        print("main() completed (should not reach here with polling)")
     except KeyboardInterrupt:
         print("\nBot stopped by user.")
     except Exception as exc:
-        print(f"Fatal startup error in main(): {exc}")
+        print(f"Fatal startup error: {exc}")
         import traceback
-        traceback.print_exc()  # Full stack trace
+        traceback.print_exc()
