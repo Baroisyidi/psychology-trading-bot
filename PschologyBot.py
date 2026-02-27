@@ -305,6 +305,8 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
         )
 
 
+# ... (all your code from imports to error_handler remains EXACTLY the same)
+
 async def run_bot():
     print("=== Render startup: Initializing ===")
     print(f"TELEGRAM_TOKEN loaded (length: {len(TELEGRAM_TOKEN)} chars)")
@@ -321,13 +323,13 @@ async def run_bot():
     application.add_handler(CommandHandler("add_symbol", add_symbol))
     application.add_error_handler(error_handler)
 
-    print("Telegram application built. Initializing...")
+    print("Telegram application built.")
 
-    # Manually initialize Telegram components
+    # Manual initialization (required when not using run_polling blocking)
     await application.initialize()
     print("Telegram application initialized.")
 
-    # Start polling as a non-blocking task
+    # Start updater polling in background task
     updater = application.updater
     polling_task = asyncio.create_task(
         updater.start_polling(
