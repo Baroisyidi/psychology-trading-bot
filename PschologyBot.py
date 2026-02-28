@@ -1,368 +1,233 @@
 import os
 import asyncio
+import time
 from datetime import datetime
 from typing import Optional, Tuple
 
-import time
 import pandas as pd
 from dotenv import load_dotenv
 from pybit.unified_trading import HTTP
+
 from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
     ContextTypes,
-    JobQueue,
 )
 
-# Async HTTP server for health + webhook
-from aiohttp import web
-
+# ────────────────────────────────────────────────
+# Load environment variables
+# ────────────────────────────────────────────────
 load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 BYBIT_API_KEY = os.getenv("BYBIT_API_KEY")
 BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET")
-CHAT_ID_STR = os.getenv("CHAT_ID")
+CHAT_ID = int(os.getenv("CHAT_ID", "0"))
 
-if not all([TELEGRAM_TOKEN, BYBIT_API_KEY, BYBIT_API_SECRET, CHAT_ID_STR]):
-    raise ValueError("Missing required environment variables! Check .env or Render Environment Variables.")
+if not all([TELEGRAM_TOKEN, BYBIT_API_KEY, BYBIT_API_SECRET]):
+    raise RuntimeError("Missing required environment variables")
 
-try:
-    CHAT_ID = int(CHAT_ID_STR)
-except ValueError:
-    raise ValueError(f"CHAT_ID must be an integer, got: {CHAT_ID_STR}")
-
-bybit_session = HTTP(
+# ────────────────────────────────────────────────
+# Bybit demo session
+# ────────────────────────────────────────────────
+bybit = HTTP(
     demo=True,
     api_key=BYBIT_API_KEY,
     api_secret=BYBIT_API_SECRET,
     recv_window=60000
 )
 
+# ────────────────────────────────────────────────
 # Global state
+# ────────────────────────────────────────────────
 symbol_trends: dict[str, Optional[str]] = {}
-monitored_symbols: list[str] = []
-
+monitored_symbols: set[str] = set()
 
 # ────────────────────────────────────────────────
-#  Your trading functions (unchanged)
+# Market analysis
 # ────────────────────────────────────────────────
-
 async def get_trend_and_ema(
     symbol: str,
     interval: str = "30",
     limit: int = 300,
 ) -> Tuple[Optional[str], Optional[float], Optional[float]]:
+
     try:
-        resp = bybit_session.get_kline(
+        resp = bybit.get_kline(
             category="linear",
             symbol=symbol,
             interval=interval,
             limit=limit,
         )
+
         klines = resp["result"]["list"]
         if not klines:
-            raise ValueError("No klines returned")
+            return None, None, None
 
         df = pd.DataFrame(
             klines,
-            columns=["timestamp", "open", "high", "low", "close", "volume", "turnover"],
-        ).iloc[::-1].reset_index(drop=True)
-        df["close"] = pd.to_numeric(df["close"], errors="coerce")
+            columns=["ts", "open", "high", "low", "close", "vol", "turnover"],
+        ).iloc[::-1]
 
-        if df["close"].isna().any():
-            raise ValueError("Invalid close prices")
-
+        df["close"] = pd.to_numeric(df["close"])
         df["ema200"] = df["close"].ewm(span=200, adjust=False).mean()
+
         ema200 = float(df["ema200"].iloc[-1])
 
-        ticker = bybit_session.get_tickers(category="linear", symbol=symbol)["result"]["list"][0]
-        current_price = float(ticker["lastPrice"])
+        ticker = bybit.get_tickers(
+            category="linear",
+            symbol=symbol
+        )["result"]["list"][0]
 
-        trend = "upward" if current_price > ema200 else "downward"
-        return trend, current_price, ema200
+        price = float(ticker["lastPrice"])
+        trend = "upward" if price > ema200 else "downward"
 
-    except Exception as exc:
-        print(f"Error in get_trend_and_ema for {symbol}: {exc}")
+        return trend, price, ema200
+
+    except Exception as e:
+        print(f"[EMA ERROR] {symbol}: {e}")
         return None, None, None
 
-
+# ────────────────────────────────────────────────
+# Instrument constraints
+# ────────────────────────────────────────────────
 async def get_instrument_constraints(symbol: str) -> Tuple[float, float]:
-    try:
-        info = bybit_session.get_instruments_info(category="linear", symbol=symbol)
-        if info["retCode"] != 0:
-            raise ValueError(info["retMsg"])
-        
-        lot_filter = info["result"]["list"][0]["lotSizeFilter"]
-        min_qty = float(lot_filter["minOrderQty"])
-        qty_step = float(lot_filter["qtyStep"])
-        
-        print(f"[{symbol}] Min qty: {min_qty}, Qty step: {qty_step}")
-        return min_qty, qty_step
-    
-    except Exception as e:
-        print(f"Failed to get constraints for {symbol}: {e}")
-        return 0.001, 0.001
+    info = bybit.get_instruments_info(category="linear", symbol=symbol)
+    lot = info["result"]["list"][0]["lotSizeFilter"]
+    return float(lot["minOrderQty"]), float(lot["qtyStep"])
 
-
+# ────────────────────────────────────────────────
+# Position sizing (20% risk)
+# ────────────────────────────────────────────────
 async def get_trade_qty(symbol: str) -> str:
-    try:
-        balance_resp = bybit_session.get_wallet_balance(accountType="UNIFIED")
-        if balance_resp["retCode"] != 0:
-            raise ValueError(f"Balance API error: {balance_resp['retMsg']}")
-        result = balance_resp["result"]
-        if not result["list"]:
-            raise ValueError("No account data in response")
-        account = result["list"][0]
-        total_avail_usd_str = account.get("totalAvailableBalance", "0")
-        total_avail_usd = float(total_avail_usd_str)
-        if total_avail_usd <= 0:
-            print(f"No available balance detected ({total_avail_usd}) for {symbol} — check demo funding")
-            min_qty, _ = await get_instrument_constraints(symbol)
-            return f"{min_qty:.6f}".rstrip('0').rstrip('.')
-        _, current_price, _ = await get_trend_and_ema(symbol)
-        if current_price is None or current_price <= 0:
-            print(f"Invalid price for {symbol}")
-            min_qty, _ = await get_instrument_constraints(symbol)
-            return f"{min_qty:.6f}".rstrip('0').rstrip('.')
-        risk_amount_usd = total_avail_usd * 0.20
-        raw_qty = risk_amount_usd / current_price
-        min_qty, qty_step = await get_instrument_constraints(symbol)
-        if qty_step > 0:
-            adjusted_qty = max(min_qty, (raw_qty // qty_step) * qty_step)
-        else:
-            adjusted_qty = max(min_qty, raw_qty)
-        precision = 6 if adjusted_qty < 10 else 3
-        qty_str = f"{adjusted_qty:.{precision}f}".rstrip('0').rstrip('.')
-        print(f"Calculated qty for {symbol}: {qty_str} "
-              f"(raw: {raw_qty:.6f}, risk: ${risk_amount_usd:.2f}, "
-              f"price: ${current_price:.2f}, avail USD: ${total_avail_usd:.2f}, "
-              f"min: {min_qty}, step: {qty_step})")
-        return qty_str
-    except Exception as exc:
-        print(f"Failed to calculate qty for {symbol}: {exc}")
+    balance = bybit.get_wallet_balance(accountType="UNIFIED")
+    usd = float(balance["result"]["list"][0]["totalAvailableBalance"])
+
+    _, price, _ = await get_trend_and_ema(symbol)
+    if not price or usd <= 0:
         min_qty, _ = await get_instrument_constraints(symbol)
-        return f"{min_qty:.6f}".rstrip('0').rstrip('.')
+        return str(min_qty)
 
+    risk_usd = usd * 0.20
+    raw_qty = risk_usd / price
 
-async def close_position(symbol: str, side_to_close: str = "Buy") -> Optional[dict]:
-    try:
-        positions_resp = bybit_session.get_positions(category="linear", symbol=symbol)
-        positions = positions_resp["result"]["list"]
+    min_qty, step = await get_instrument_constraints(symbol)
+    qty = max(min_qty, (raw_qty // step) * step)
 
-        for pos in positions:
-            if pos["side"] == side_to_close and float(pos["size"]) > 0:
-                close_side = "Sell" if side_to_close == "Buy" else "Buy"
-                qty = pos["size"]
+    return f"{qty:.6f}".rstrip("0").rstrip(".")
 
-                order = bybit_session.place_order(
-                    category="linear",
-                    symbol=symbol,
-                    side=close_side,
-                    orderType="Market",
-                    qty=qty,
-                    reduceOnly=True,
-                )
-                return order.get("result")
+# ────────────────────────────────────────────────
+# Trade execution
+# ────────────────────────────────────────────────
+async def close_position(symbol: str, side: str):
+    positions = bybit.get_positions(category="linear", symbol=symbol)["result"]["list"]
+    for pos in positions:
+        if pos["side"] == side and float(pos["size"]) > 0:
+            bybit.place_order(
+                category="linear",
+                symbol=symbol,
+                side="Sell" if side == "Buy" else "Buy",
+                orderType="Market",
+                qty=pos["size"],
+                reduceOnly=True
+            )
 
-        print(f"No {side_to_close} position to close for {symbol}.")
-        return None
-    except Exception as exc:
-        print(f"Position close failed for {symbol}: {exc}")
-        return None
-
-
-async def place_trade(symbol: str, side: str = "Buy") -> Optional[dict]:
+async def place_trade(symbol: str, side: str):
     qty = await get_trade_qty(symbol)
-    print(f"Attempting {side} order for {symbol} with qty = {qty}")
-    try:
-        order = bybit_session.place_order(
-            category="linear",
-            symbol=symbol,
-            side=side,
-            orderType="Market",
-            qty=qty,
-        )
-        return order.get("result")
-    except Exception as exc:
-        print(f"Trade placement failed for {symbol} (qty={qty}): {exc}")
-        return None
+    return bybit.place_order(
+        category="linear",
+        symbol=symbol,
+        side=side,
+        orderType="Market",
+        qty=qty
+    )
 
-
-async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
+# ────────────────────────────────────────────────
+# Job: monitor symbol
+# ────────────────────────────────────────────────
+async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE):
     symbol = context.job.data
-    previous_trend = symbol_trends.get(symbol, None)
+    prev_trend = symbol_trends.get(symbol)
 
     trend, price, ema = await get_trend_and_ema(symbol)
-
-    if trend is None:
-        if context.job:
-            await context.bot.send_message(
-                chat_id=context.job.chat_id,
-                text=f"Error fetching Bybit data for {symbol} (trend check failed)."
-            )
+    if not trend:
         return
 
-    chat_id = context.job.chat_id if context.job else CHAT_ID
-
-    if trend != previous_trend:
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        msg = (
-            f"{ts} — {symbol} trend changed to **{trend.upper()}**!\n"
-            f"Price: {price:.2f} | 200 EMA: {ema:.2f}"
-        )
-        await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
-
-        close_result = None
-        if trend == "upward":
-            close_result = await close_position(symbol=symbol, side_to_close="Sell")
-            if close_result:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"✅ Closed Short position for {symbol} successfully\nOrder ID: {close_result.get('orderId', '—')}"
-                )
-            result = await place_trade(symbol=symbol, side="Buy")
-            side_text = "Long (Buy)"
-        else:
-            close_result = await close_position(symbol=symbol, side_to_close="Buy")
-            if close_result:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"✅ Closed Long position for {symbol} successfully\nOrder ID: {close_result.get('orderId', '—')}"
-                )
-            result = await place_trade(symbol=symbol, side="Sell")
-            side_text = "Short (Sell)"
-
-        if result:
-            order_id = result.get("orderId", "—")
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"✅ {side_text} order placed for {symbol} successfully\nOrder ID: {order_id}"
-            )
-        else:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"❌ Failed to place {side_text} order for {symbol}"
-            )
-
+    if trend != prev_trend:
         symbol_trends[symbol] = trend
-    else:
-        print(f"[{datetime.now():%H:%M:%S}] No trend change for {symbol} — still {trend}")
+        ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
+        await context.bot.send_message(
+            chat_id=context.job.chat_id,
+            text=(
+                f"📊 *{symbol} Trend Change*\n"
+                f"{ts}\n\n"
+                f"Trend: *{trend.upper()}*\n"
+                f"Price: `{price:.2f}`\n"
+                f"EMA200: `{ema:.2f}`"
+            ),
+            parse_mode="Markdown"
+        )
 
-async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if trend == "upward":
+            await close_position(symbol, "Sell")
+            await place_trade(symbol, "Buy")
+        else:
+            await close_position(symbol, "Buy")
+            await place_trade(symbol, "Sell")
+
+# ────────────────────────────────────────────────
+# Commands
+# ────────────────────────────────────────────────
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🤖 Psychology Trading Bot\n\n"
+        "Commands:\n"
+        "/add_symbol BTCUSDT"
+    )
+
+async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Usage: /add_symbol <symbol> e.g. /add_symbol BTCUSDT")
+        await update.message.reply_text("Usage: /add_symbol BTCUSDT")
         return
 
     symbol = context.args[0].upper()
     if symbol in monitored_symbols:
-        await update.message.reply_text(f"{symbol} is already being monitored.")
+        await update.message.reply_text(f"{symbol} already monitored.")
         return
 
-    monitored_symbols.append(symbol)
+    monitored_symbols.add(symbol)
     symbol_trends[symbol] = None
 
-    chat_id = update.effective_chat.id
-    await update.message.reply_text(
-        f"Added {symbol} to monitoring!\n"
-        "• Timeframe: 30 minutes 200 EMA\n"
-        "• Checks every 5 minutes\n"
-        "Trend changes → notification + demo trade"
+    context.job_queue.run_repeating(
+        monitor_symbol,
+        interval=300,
+        first=10,
+        chat_id=update.effective_chat.id,
+        data=symbol,
+        name=f"{symbol}_monitor",
     )
 
-    if context.job_queue:
-        context.job_queue.run_repeating(
-            callback=monitor_symbol,
-            interval=300,
-            first=5,
-            chat_id=chat_id,
-            name=f"{symbol}_monitor",
-            data=symbol,
-        )
+    await update.message.reply_text(f"✅ Monitoring {symbol}")
 
+# ────────────────────────────────────────────────
+# Main
+# ────────────────────────────────────────────────
+async def main():
+    print("🚀 Bot starting (Polling mode)")
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "Bot ready! Use /add_symbol <symbol> to start monitoring a cryptocurrency.\n"
-        "Example: /add_symbol BTCUSDT\n"
-        "Supports multiple symbols. Trades use 20% of available USDT balance."
-    )
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
 
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("add_symbol", add_symbol))
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    print(f"Exception while handling update: {context.error}")
-    if CHAT_ID:
-        await context.bot.send_message(
-            chat_id=CHAT_ID,
-            text=f"⚠️ Bot encountered an error:\n{context.error}"
-        )
+    await app.initialize()
+    await app.bot.delete_webhook(drop_pending_updates=True)
+    await app.start()
 
-
-async def run_bot():
-    print("=== Render startup: Initializing ===")
-    print(f"TELEGRAM_TOKEN loaded (length: {len(TELEGRAM_TOKEN)} chars)")
-    print(f"CHAT_ID loaded: {CHAT_ID}")
-
-    application = (
-        Application.builder()
-        .token(TELEGRAM_TOKEN)
-        .build()
-    )
-
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("add_symbol", add_symbol))
-    application.add_error_handler(error_handler)
-
-    print("Telegram application built.")
-
-    # Set webhook URL (Render provides RENDER_EXTERNAL_HOSTNAME or fallback to known domain)
-    base_url = os.environ.get("RENDER_EXTERNAL_HOSTNAME", "psychology-trading-bot.onrender.com")
-    webhook_url = f"https://{base_url}/webhook"
-
-    await application.bot.set_webhook(url=webhook_url, drop_pending_updates=True)
-    print(f"Webhook successfully set to: {webhook_url}")
-
-    # Async server for health check + webhook endpoint
-    async def health(request):
-        return web.Response(text="OK")
-
-    async def webhook(request):
-        try:
-            update_dict = await request.json()
-            update = Update.de_json(update_dict, application.bot)
-            if update:
-                await application.process_update(update)
-            return web.Response(text="OK")
-        except Exception as e:
-            print(f"Webhook processing error: {e}")
-            return web.Response(text="Error", status=500)
-
-    aio_app = web.Application()
-    aio_app.router.add_get('/health', health)
-    aio_app.router.add_post('/webhook', webhook)
-
-    runner = web.AppRunner(aio_app)
-    await runner.setup()
-    port = int(os.environ.get("PORT", 10000))
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
-    print(f"Async server running on port {port} (health + webhook)")
-
-    print("Bot is fully running with webhook... Waiting for Telegram updates.")
-
-    # Keep the event loop alive forever
-    await asyncio.Event().wait()
-
+    print("✅ Bot is live and responding")
+    await app.run_polling()
 
 if __name__ == "__main__":
-    print("Entering main block...")
-    try:
-        asyncio.run(run_bot())
-    except KeyboardInterrupt:
-        print("\nBot stopped by user.")
-    except Exception as exc:
-        print(f"Fatal startup error: {exc}")
-        import traceback
-        traceback.print_exc()
+    asyncio.run(main())
