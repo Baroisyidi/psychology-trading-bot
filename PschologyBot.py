@@ -6,6 +6,7 @@ from typing import Optional, Tuple
 
 import time
 import pandas as pd
+import random
 from dotenv import load_dotenv
 from pybit.unified_trading import HTTP
 from telegram import Update
@@ -60,6 +61,36 @@ except Exception as e:
 # Global state
 symbol_trends: dict[str, Optional[str]] = {}
 monitored_symbols: list[str] = []
+symbol_open_trade_side: dict[str, Optional[str]] = {}
+
+MOTIVATIONAL_QUOTES = [
+    "“The market doesn’t reward intelligence 🧠 — it rewards discipline 🧱.\nSmart traders survive, disciplined traders compound.”",
+    "“Consistency 🔁 beats luck 🎲 every single time.\nWhat you repeat daily becomes your edge.”",
+    "“Your greatest edge isn’t your strategy 📊 — it’s your psychology 🧠.\nMaster your mind, and the market follows.”",
+    "“Every loss is tuition 🎓.\nEvery lesson learned compounds into future strength 📈.”",
+    "“Control your emotions 🎭, and you control your outcomes 🎯.\nLose emotional control, and the market decides for you.”",
+    "“Trading is a marathon 🏃‍♂️, not a sprint ⚡.\nPatience is the fuel that finishes the race.”",
+    "“Survive first 🛡️. Profit later 💰.\nWinners are simply those who stayed long enough to win.”",
+    "“The market tests your discipline 🧪 before it rewards your skill 🏆.\nPass the test, earn the payout.”",
+    "“You don’t need to predict the market 🔮 —\nYou need to react correctly ⚙️ when it reveals itself.”",
+    "“Missed trades cost nothing 🚫.\nBad trades drain capital, confidence, and clarity 💥.”",
+    "“Boring, repeatable execution 🔄 is where real money is made 💎.\nExcitement is expensive.”",
+    "“Your job isn’t to win today 🗓️ —\nIt’s to still be profitable next year 📆.”",
+    "“Emotional trading feels good short-term 😌\nand destroys accounts long-term 💣.”",
+    "“The best traders think in probabilities 🎯, not predictions 🎲.\nCertainty is an illusion.”",
+    "“Capital preservation 🛡️ is the first form of profit 💰.\nProtect the account, and growth follows.”",
+    "“Discipline means doing the right thing 🧱\neven when every emotion tells you not to 😤.”",
+    "“The market rewards patience ⏳ more than bravery 🦁.\nWaiting is a position.”",
+    "“One good system ⚙️ executed flawlessly\nbeats ten impulsive ideas 💭 every time.”",
+    "“If you can wait ⏸️, you can win 🏆.\nTime favors the disciplined.”",
+    "“Professionals focus on process 🛠️.\nAmateurs obsess over outcomes 🎭.”"
+]
+
+async def send_motivational_quote(context: ContextTypes.DEFAULT_TYPE) -> None:
+    quote = random.choice(MOTIVATIONAL_QUOTES)
+    chat_id = context.job.chat_id if context.job else CHAT_ID
+    await context.bot.send_message(chat_id=chat_id, text=quote)
+symbol_open_trade_side: dict[str, Optional[str]] = {}
 
 
 async def get_trend_and_ema(
@@ -99,6 +130,18 @@ async def get_trend_and_ema(
     except Exception as exc:
         print(f"Error in get_trend_and_ema for {symbol}: {exc}")
         return None, None, None
+
+async def get_open_position_side(symbol: str) -> Optional[str]:
+    try:
+        positions_resp = bybit_session.get_positions(category="linear", symbol=symbol)
+        positions = positions_resp["result"]["list"]
+        for pos in positions:
+            if float(pos["size"]) > 0:
+                return pos["side"]
+        return None
+    except Exception as e:
+        print(f"Error getting open position for {symbol}: {e}")
+        return None
 
 
 async def get_instrument_constraints(symbol: str) -> Tuple[float, float]:
@@ -205,8 +248,10 @@ async def place_trade(symbol: str, side: str = "Buy") -> Optional[dict]:
 
 
 async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
-    symbol = context.job.data
+    symbol = context.job.data["symbol"]
     previous_trend = symbol_trends.get(symbol, None)
+    current_open_trade_side = await get_open_position_side(symbol)
+    symbol_open_trade_side[symbol] = current_open_trade_side
 
     trend, price, ema = await get_trend_and_ema(symbol)
 
@@ -219,6 +264,89 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     chat_id = context.job.chat_id if context.job else CHAT_ID
+
+    # Check for trend reversal on existing trades
+    if current_open_trade_side == "Buy" and trend == "downward":
+        await context.bot.send_message(chat_id=chat_id, text=f"🔄 Trend reversal detected for {symbol}! Closing Long and opening Short.")
+        await close_position(symbol, side_to_close="Buy")
+        result = await place_trade(symbol, side="Sell")
+        side_text = "Short (Sell)"
+        if result:
+            order_id = result.get("orderId", "—")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"✅ {side_text} order placed for {symbol}\nOrder ID: <code>{order_id}</code>",
+                parse_mode="HTML"
+            )
+        else:
+            await context.bot.send_message(chat_id=chat_id, text=f"❌ Failed to place {side_text} order for {symbol}")
+        symbol_trends[symbol] = trend
+        symbol_open_trade_side[symbol] = "Sell"
+        return
+    elif current_open_trade_side == "Sell" and trend == "upward":
+        await context.bot.send_message(chat_id=chat_id, text=f"🔄 Trend reversal detected for {symbol}! Closing Short and opening Long.")
+        await close_position(symbol, side_to_close="Sell")
+        result = await place_trade(symbol, side="Buy")
+        side_text = "Long (Buy)"
+        if result:
+            order_id = result.get("orderId", "—")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"✅ {side_text} order placed for {symbol}\nOrder ID: <code>{order_id}</code>",
+                parse_mode="HTML"
+            )
+        else:
+            await context.bot.send_message(chat_id=chat_id, text=f"❌ Failed to place {side_text} order for {symbol}")
+        symbol_trends[symbol] = trend
+        symbol_open_trade_side[symbol] = "Buy"
+        return
+
+    # Original trend change logic
+    if trend != previous_trend:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        msg = f"{ts} — {symbol} trend changed to <b>{trend.upper()}</b>!\nPrice: {price:.2f} | 200 EMA: {ema:.2f}"
+        await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
+
+        if trend == "upward":
+            await close_position(symbol, side_to_close="Sell")
+            result = await place_trade(symbol, side="Buy")
+            side_text = "Long (Buy)"
+        else:
+            await close_position(symbol, side_to_close="Buy")
+            result = await place_trade(symbol, side="Sell")
+            side_text = "Short (Sell)"
+
+        if result:
+            order_id = result.get("orderId", "—")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"✅ {side_text} order placed for {symbol}\nOrder ID: <code>{order_id}</code>",
+                parse_mode="HTML"
+            )
+        else:
+            await context.bot.send_message(chat_id=chat_id, text=f"❌ Failed to place {side_text} order for {symbol}")
+
+        symbol_trends[symbol] = trend
+        symbol_open_trade_side[symbol] = await get_open_position_side(symbol) # Update open trade side after new trade
+    else:
+        # 30-minute status report
+        if context.job.data.get("report_counter", 0) % 6 == 0: # 6 * 5 minutes = 30 minutes
+            trade_status = "No open trade" # Default
+            if current_open_trade_side:
+                trade_status = f"✅ {symbol} still on {current_open_trade_side} order trade"
+            else:
+                trade_status = f"❌ {symbol} has no open trade"
+
+            report_msg = (
+                f"Still monitoring {symbol}\n"
+                f"• Timeframe: 30 minutes 200 EMA\n"
+                f"• Checks every 5 minutes\n"
+                f"• {symbol} still on {trend.upper()} TREND\n"
+                f"• {trade_status}"
+            )
+            await context.bot.send_message(chat_id=chat_id, text=report_msg)
+        context.job.data["report_counter"] = context.job.data.get("report_counter", 0) + 1
+        print(f"[{datetime.now():%H:%M:%S}] No trend change for {symbol} — still {trend}")
 
     if trend != previous_trend:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -277,7 +405,7 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             first=5,
             chat_id=chat_id,
             name=f"{symbol}_monitor",
-            data=symbol,
+            data={"symbol": symbol, "report_counter": 0},
         )
 
 async def remove_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -331,6 +459,16 @@ async def main():
     application.add_handler(CommandHandler("add_symbol", add_symbol))
     application.add_handler(CommandHandler("remove_symbol", remove_symbol))
     application.add_error_handler(error_handler)
+
+    # Schedule motivational quotes
+    if application.job_queue:
+        application.job_queue.run_repeating(
+            callback=send_motivational_quote,
+            interval=12 * 3600,  # Every 12 hours
+            first=0, # Run immediately on startup
+            chat_id=CHAT_ID,
+            name="motivational_quote_sender",
+        )
     print("Telegram application built.")
 
     port = int(os.environ.get("PORT", 10000))
