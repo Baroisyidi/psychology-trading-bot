@@ -18,9 +18,6 @@ from telegram.ext import (
 # Async HTTP server for health + webhook
 from aiohttp import web
 
-# ────────────────────────────────────────────────
-#  Load environment variables
-# ────────────────────────────────────────────────
 load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -36,9 +33,6 @@ try:
 except ValueError:
     raise ValueError(f"CHAT_ID must be an integer, got: {CHAT_ID_STR}")
 
-# ────────────────────────────────────────────────
-#  Bybit demo session
-# ────────────────────────────────────────────────
 bybit_session = HTTP(
     demo=True,
     api_key=BYBIT_API_KEY,
@@ -46,23 +40,14 @@ bybit_session = HTTP(
     recv_window=60000
 )
 
-# ────────────────────────────────────────────────
-#  TEMPORARY DEBUG: Check time difference
-# ────────────────────────────────────────────────
-try:
-    resp = bybit_session.get_server_time()
-    server_ms = int(resp['time'])
-    local_ms = int(time.time() * 1000)
-    diff = abs(local_ms - server_ms) / 1000
-    print(f"Time diff: {diff:.2f} seconds")
-    print("Time sync looks good" if diff <= 5 else "WARNING: Possible drift/latency (>5 seconds)")
-except Exception as e:
-    print(f"Debug failed: {e}")
-
 # Global state
 symbol_trends: dict[str, Optional[str]] = {}
 monitored_symbols: list[str] = []
 
+
+# ────────────────────────────────────────────────
+#  Your trading functions (unchanged)
+# ────────────────────────────────────────────────
 
 async def get_trend_and_ema(
     symbol: str,
@@ -132,18 +117,15 @@ async def get_trade_qty(symbol: str) -> str:
         account = result["list"][0]
         total_avail_usd_str = account.get("totalAvailableBalance", "0")
         total_avail_usd = float(total_avail_usd_str)
-
         if total_avail_usd <= 0:
             print(f"No available balance detected ({total_avail_usd}) for {symbol} — check demo funding")
             min_qty, _ = await get_instrument_constraints(symbol)
             return f"{min_qty:.6f}".rstrip('0').rstrip('.')
-
         _, current_price, _ = await get_trend_and_ema(symbol)
         if current_price is None or current_price <= 0:
             print(f"Invalid price for {symbol}")
             min_qty, _ = await get_instrument_constraints(symbol)
             return f"{min_qty:.6f}".rstrip('0').rstrip('.')
-
         risk_amount_usd = total_avail_usd * 0.20
         raw_qty = risk_amount_usd / current_price
         min_qty, qty_step = await get_instrument_constraints(symbol)
@@ -154,7 +136,9 @@ async def get_trade_qty(symbol: str) -> str:
         precision = 6 if adjusted_qty < 10 else 3
         qty_str = f"{adjusted_qty:.{precision}f}".rstrip('0').rstrip('.')
         print(f"Calculated qty for {symbol}: {qty_str} "
-              f"(risk: ${risk_amount_usd:.2f}, price: ${current_price:.2f}, avail USD: ${total_avail_usd:.2f})")
+              f"(raw: {raw_qty:.6f}, risk: ${risk_amount_usd:.2f}, "
+              f"price: ${current_price:.2f}, avail USD: ${total_avail_usd:.2f}, "
+              f"min: {min_qty}, step: {qty_step})")
         return qty_str
     except Exception as exc:
         print(f"Failed to calculate qty for {symbol}: {exc}")
@@ -216,7 +200,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
         if context.job:
             await context.bot.send_message(
                 chat_id=context.job.chat_id,
-                text=f"Error fetching Bybit data for {symbol}."
+                text=f"Error fetching Bybit data for {symbol} (trend check failed)."
             )
         return
 
@@ -224,26 +208,43 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if trend != previous_trend:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        msg = f"{ts} — {symbol} trend changed to **{trend.upper()}**!\nPrice: {price:.2f} | 200 EMA: {ema:.2f}"
+        msg = (
+            f"{ts} — {symbol} trend changed to **{trend.upper()}**!\n"
+            f"Price: {price:.2f} | 200 EMA: {ema:.2f}"
+        )
         await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
 
+        close_result = None
         if trend == "upward":
-            await close_position(symbol, side_to_close="Sell")
-            result = await place_trade(symbol, side="Buy")
+            close_result = await close_position(symbol=symbol, side_to_close="Sell")
+            if close_result:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"✅ Closed Short position for {symbol} successfully\nOrder ID: {close_result.get('orderId', '—')}"
+                )
+            result = await place_trade(symbol=symbol, side="Buy")
             side_text = "Long (Buy)"
         else:
-            await close_position(symbol, side_to_close="Buy")
-            result = await place_trade(symbol, side="Sell")
+            close_result = await close_position(symbol=symbol, side_to_close="Buy")
+            if close_result:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"✅ Closed Long position for {symbol} successfully\nOrder ID: {close_result.get('orderId', '—')}"
+                )
+            result = await place_trade(symbol=symbol, side="Sell")
             side_text = "Short (Sell)"
 
         if result:
             order_id = result.get("orderId", "—")
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=f"✅ {side_text} order placed for {symbol}\nOrder ID: {order_id}"
+                text=f"✅ {side_text} order placed for {symbol} successfully\nOrder ID: {order_id}"
             )
         else:
-            await context.bot.send_message(chat_id=chat_id, text=f"❌ Failed to place {side_text} order for {symbol}")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"❌ Failed to place {side_text} order for {symbol}"
+            )
 
         symbol_trends[symbol] = trend
     else:
@@ -284,8 +285,8 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Bot ready!\n"
-        "Use /add_symbol <symbol> to start monitoring (e.g. /add_symbol BTCUSDT)\n"
+        "Bot ready! Use /add_symbol <symbol> to start monitoring a cryptocurrency.\n"
+        "Example: /add_symbol BTCUSDT\n"
         "Supports multiple symbols. Trades use 20% of available USDT balance."
     )
 
@@ -316,23 +317,26 @@ async def run_bot():
 
     print("Telegram application built.")
 
-    # Set webhook (this replaces polling)
+    # Set webhook URL (Render provides RENDER_EXTERNAL_HOSTNAME or fallback to known domain)
     base_url = os.environ.get("RENDER_EXTERNAL_HOSTNAME", "psychology-trading-bot.onrender.com")
     webhook_url = f"https://{base_url}/webhook"
-    await application.bot.set_webhook(url=webhook_url, drop_pending_updates=True)
-    print(f"Webhook set to: {webhook_url}")
 
-    # Async server for health + webhook
+    await application.bot.set_webhook(url=webhook_url, drop_pending_updates=True)
+    print(f"Webhook successfully set to: {webhook_url}")
+
+    # Async server for health check + webhook endpoint
     async def health(request):
         return web.Response(text="OK")
 
     async def webhook(request):
         try:
-            update = Update.de_json(await request.json(), application.bot)
-            await application.process_update(update)
+            update_dict = await request.json()
+            update = Update.de_json(update_dict, application.bot)
+            if update:
+                await application.process_update(update)
             return web.Response(text="OK")
         except Exception as e:
-            print(f"Webhook error: {e}")
+            print(f"Webhook processing error: {e}")
             return web.Response(text="Error", status=500)
 
     aio_app = web.Application()
@@ -346,9 +350,10 @@ async def run_bot():
     await site.start()
     print(f"Async server running on port {port} (health + webhook)")
 
-    print("Bot is fully running with webhook... Waiting for updates.")
+    print("Bot is fully running with webhook... Waiting for Telegram updates.")
 
-    await asyncio.Event().wait()  # Keep alive
+    # Keep the event loop alive forever
+    await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
