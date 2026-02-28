@@ -1,9 +1,9 @@
 import os
 import asyncio
-import time
 from datetime import datetime
 from typing import Optional, Tuple
 
+import time
 import pandas as pd
 from dotenv import load_dotenv
 from pybit.unified_trading import HTTP
@@ -12,10 +12,14 @@ from telegram.ext import (
     Application,
     CommandHandler,
     ContextTypes,
+    JobQueue,
 )
 
+# Async HTTP server for health + webhook
+from aiohttp import web
+
 # ────────────────────────────────────────────────
-# Load environment variables
+#  Load environment variables
 # ────────────────────────────────────────────────
 load_dotenv()
 
@@ -33,7 +37,7 @@ except ValueError:
     raise ValueError(f"CHAT_ID must be an integer, got: {CHAT_ID_STR}")
 
 # ────────────────────────────────────────────────
-# Bybit demo session
+#  Bybit demo session
 # ────────────────────────────────────────────────
 bybit_session = HTTP(
     demo=True,
@@ -42,7 +46,9 @@ bybit_session = HTTP(
     recv_window=60000
 )
 
-# TEMPORARY DEBUG: Check time difference
+# ────────────────────────────────────────────────
+#  TEMPORARY DEBUG: Check time difference
+# ────────────────────────────────────────────────
 try:
     resp = bybit_session.get_server_time()
     server_ms = int(resp['time'])
@@ -102,14 +108,14 @@ async def get_instrument_constraints(symbol: str) -> Tuple[float, float]:
         info = bybit_session.get_instruments_info(category="linear", symbol=symbol)
         if info["retCode"] != 0:
             raise ValueError(info["retMsg"])
-
+        
         lot_filter = info["result"]["list"][0]["lotSizeFilter"]
         min_qty = float(lot_filter["minOrderQty"])
         qty_step = float(lot_filter["qtyStep"])
-
+        
         print(f"[{symbol}] Min qty: {min_qty}, Qty step: {qty_step}")
         return min_qty, qty_step
-
+    
     except Exception as e:
         print(f"Failed to get constraints for {symbol}: {e}")
         return 0.001, 0.001
@@ -147,10 +153,8 @@ async def get_trade_qty(symbol: str) -> str:
             adjusted_qty = max(min_qty, raw_qty)
         precision = 6 if adjusted_qty < 10 else 3
         qty_str = f"{adjusted_qty:.{precision}f}".rstrip('0').rstrip('.')
-        print(
-            f"Calculated qty for {symbol}: {qty_str} "
-            f"(risk: ${risk_amount_usd:.2f}, price: ${current_price:.2f}, avail USD: ${total_avail_usd:.2f})"
-        )
+        print(f"Calculated qty for {symbol}: {qty_str} "
+              f"(risk: ${risk_amount_usd:.2f}, price: ${current_price:.2f}, avail USD: ${total_avail_usd:.2f})")
         return qty_str
     except Exception as exc:
         print(f"Failed to calculate qty for {symbol}: {exc}")
@@ -220,10 +224,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if trend != previous_trend:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        msg = (
-            f"{ts} — {symbol} trend changed to *{trend.upper()}*!\n"
-            f"Price: {price:.2f} | 200 EMA: {ema:.2f}"
-        )
+        msg = f"{ts} — {symbol} trend changed to **{trend.upper()}**!\nPrice: {price:.2f} | 200 EMA: {ema:.2f}"
         await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
 
         if trend == "upward":
@@ -242,10 +243,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                 text=f"✅ {side_text} order placed for {symbol}\nOrder ID: {order_id}"
             )
         else:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"❌ Failed to place {side_text} order for {symbol}"
-            )
+            await context.bot.send_message(chat_id=chat_id, text=f"❌ Failed to place {side_text} order for {symbol}")
 
         symbol_trends[symbol] = trend
     else:
@@ -284,8 +282,7 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
 
 
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    print(f"/start from chat {update.effective_chat.id}")
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Bot ready!\n"
         "Use /add_symbol <symbol> to start monitoring (e.g. /add_symbol BTCUSDT)\n"
@@ -295,47 +292,69 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     print(f"Exception while handling update: {context.error}")
-    try:
+    if CHAT_ID:
         await context.bot.send_message(
             chat_id=CHAT_ID,
             text=f"⚠️ Bot encountered an error:\n{context.error}"
         )
-    except Exception as e:
-        print(f"Failed to send error to admin: {e}")
 
 
-async def main() -> None:
+async def run_bot():
     print("=== Render startup: Initializing ===")
-    print(f"TELEGRAM_TOKEN length: {len(TELEGRAM_TOKEN)}")
-    print(f"CHAT_ID: {CHAT_ID}")
+    print(f"TELEGRAM_TOKEN loaded (length: {len(TELEGRAM_TOKEN)} chars)")
+    print(f"CHAT_ID loaded: {CHAT_ID}")
 
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    application = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .build()
+    )
 
-    application.add_handler(CommandHandler("start", start_cmd))
+    application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("add_symbol", add_symbol))
     application.add_error_handler(error_handler)
 
-    # Render gives you PORT env var
-    port = int(os.environ.get("PORT", "10000"))
-    base_host = os.environ.get("RENDER_EXTERNAL_HOSTNAME", "psychology-trading-bot.onrender.com")
-    webhook_url = f"https://{base_host}/telegram"
+    print("Telegram application built.")
 
-    print(f"Starting webhook server on 0.0.0.0:{port}")
-    print(f"Setting webhook_url to: {webhook_url}")
+    # Set webhook (this replaces polling)
+    base_url = os.environ.get("RENDER_EXTERNAL_HOSTNAME", "psychology-trading-bot.onrender.com")
+    webhook_url = f"https://{base_url}/webhook"
+    await application.bot.set_webhook(url=webhook_url, drop_pending_updates=True)
+    print(f"Webhook set to: {webhook_url}")
 
-    # This single call both starts the webserver and registers the webhook
-    await application.run_webhook(
-        listen="0.0.0.0",
-        port=port,
-        url_path="telegram",
-        webhook_url=webhook_url,
-        drop_pending_updates=True,
-    )
+    # Async server for health + webhook
+    async def health(request):
+        return web.Response(text="OK")
+
+    async def webhook(request):
+        try:
+            update = Update.de_json(await request.json(), application.bot)
+            await application.process_update(update)
+            return web.Response(text="OK")
+        except Exception as e:
+            print(f"Webhook error: {e}")
+            return web.Response(text="Error", status=500)
+
+    aio_app = web.Application()
+    aio_app.router.add_get('/health', health)
+    aio_app.router.add_post('/webhook', webhook)
+
+    runner = web.AppRunner(aio_app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 10000))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    print(f"Async server running on port {port} (health + webhook)")
+
+    print("Bot is fully running with webhook... Waiting for updates.")
+
+    await asyncio.Event().wait()  # Keep alive
+
 
 if __name__ == "__main__":
     print("Entering main block...")
     try:
-        asyncio.run(main())
+        asyncio.run(run_bot())
     except KeyboardInterrupt:
         print("\nBot stopped by user.")
     except Exception as exc:
