@@ -262,6 +262,19 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     monitored_symbols.append(symbol)
     symbol_trends[symbol] = None
 
+    if context.job_queue:
+        context.job_queue.run_repeating(
+            callback=monitor_symbol,
+            interval=300,
+            first=5,
+            chat_id=chat_id,
+            name=f"{symbol}_monitor",
+            data=symbol,
+        )
+    else:
+        # This will warn you right in Telegram if the scheduler library is missing
+        await update.message.reply_text("⚠️ ERROR: JobQueue is not running! Please add 'python-telegram-bot[job-queue]' to requirements.txt.")
+
     chat_id = update.effective_chat.id
     await update.message.reply_text(
         f"Added {symbol} to monitoring!\n"
