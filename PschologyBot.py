@@ -1,12 +1,11 @@
 
 import os
 import asyncio
-from datetime import datetime
-from typing import Optional, Tuple
-
+import random
 import time
 import pandas as pd
-import random
+from datetime import datetime
+from typing import Optional, Tuple
 from dotenv import load_dotenv
 from pybit.unified_trading import HTTP
 from telegram import Update
@@ -42,7 +41,7 @@ bybit_session = HTTP(
     demo=True,
     api_key=BYBIT_API_KEY,
     api_secret=BYBIT_API_SECRET,
-    recv_window=5000  # Corrected recv_window
+    recv_window=5000
 )
 
 # ────────────────────────────────────────────────
@@ -90,13 +89,11 @@ async def send_motivational_quote(context: ContextTypes.DEFAULT_TYPE) -> None:
     quote = random.choice(MOTIVATIONAL_QUOTES)
     chat_id = context.job.chat_id if context.job else CHAT_ID
     await context.bot.send_message(chat_id=chat_id, text=quote)
-symbol_open_trade_side: dict[str, Optional[str]] = {}
-
 
 async def get_trend_and_ema(
     symbol: str,
     interval: str = "30",
-    limit: int = 300,
+    limit: int = 100,
 ) -> Tuple[Optional[str], Optional[float], Optional[float]]:
     try:
         resp = bybit_session.get_kline(
@@ -118,14 +115,15 @@ async def get_trend_and_ema(
         if df["close"].isna().any():
             raise ValueError("Invalid close prices")
 
-        df["ema200"] = df["close"].ewm(span=200, adjust=False).mean()
-        ema200 = float(df["ema200"].iloc[-1])
+        # Changed from 200 EMA to 20 EMA
+        df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
+        ema20 = float(df["ema20"].iloc[-1])
 
         ticker = bybit_session.get_tickers(category="linear", symbol=symbol)["result"]["list"][0]
         current_price = float(ticker["lastPrice"])
 
-        trend = "upward" if current_price > ema200 else "downward"
-        return trend, current_price, ema200
+        trend = "upward" if current_price > ema20 else "downward"
+        return trend, current_price, ema20
 
     except Exception as exc:
         print(f"Error in get_trend_and_ema for {symbol}: {exc}")
@@ -142,7 +140,6 @@ async def get_open_position_side(symbol: str) -> Optional[str]:
     except Exception as e:
         print(f"Error getting open position for {symbol}: {e}")
         return None
-
 
 async def get_instrument_constraints(symbol: str) -> Tuple[float, float]:
     try:
@@ -161,12 +158,11 @@ async def get_instrument_constraints(symbol: str) -> Tuple[float, float]:
         print(f"Failed to get constraints for {symbol}: {e}")
         return 0.001, 0.001
 
-
 async def get_trade_qty(symbol: str) -> str:
     try:
         balance_resp = bybit_session.get_wallet_balance(accountType="UNIFIED")
         if balance_resp["retCode"] != 0:
-            raise ValueError(f"Balance API error: {balance_resp["retMsg"]}")
+            raise ValueError(f"Balance API error: {balance_resp['retMsg']}")
         result = balance_resp["result"]
         if not result["list"]:
             raise ValueError("No account data in response")
@@ -202,7 +198,6 @@ async def get_trade_qty(symbol: str) -> str:
         min_qty, _ = await get_instrument_constraints(symbol)
         return f"{min_qty:.6f}".rstrip("0").rstrip(".")
 
-
 async def close_position(symbol: str, side_to_close: str = "Buy") -> Optional[dict]:
     try:
         positions_resp = bybit_session.get_positions(category="linear", symbol=symbol)
@@ -229,7 +224,6 @@ async def close_position(symbol: str, side_to_close: str = "Buy") -> Optional[di
         print(f"Position close failed for {symbol}: {exc}")
         return None
 
-
 async def place_trade(symbol: str, side: str = "Buy") -> Optional[dict]:
     qty = await get_trade_qty(symbol)
     print(f"Attempting {side} order for {symbol} with qty = {qty}")
@@ -245,7 +239,6 @@ async def place_trade(symbol: str, side: str = "Buy") -> Optional[dict]:
     except Exception as exc:
         print(f"Trade placement failed for {symbol} (qty={qty}): {exc}")
         return None
-
 
 async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
     symbol = context.job.data["symbol"]
@@ -304,7 +297,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
     # Original trend change logic
     if trend != previous_trend:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        msg = f"{ts} — {symbol} trend changed to <b>{trend.upper()}</b>!\nPrice: {price:.2f} | 200 EMA: {ema:.2f}"
+        msg = f"{ts} — {symbol} trend changed to <b>{trend.upper()}</b>!\nPrice: {price:.2f} | 20 EMA: {ema:.2f}"
         await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
 
         if trend == "upward":
@@ -327,11 +320,11 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
             await context.bot.send_message(chat_id=chat_id, text=f"❌ Failed to place {side_text} order for {symbol}")
 
         symbol_trends[symbol] = trend
-        symbol_open_trade_side[symbol] = await get_open_position_side(symbol) # Update open trade side after new trade
+        symbol_open_trade_side[symbol] = await get_open_position_side(symbol)
     else:
         # 30-minute status report
         if context.job.data.get("report_counter", 0) % 6 == 0: # 6 * 5 minutes = 30 minutes
-            trade_status = "No open trade" # Default
+            trade_status = "No open trade"
             if current_open_trade_side:
                 trade_status = f"✅ {symbol} still on {current_open_trade_side} order trade"
             else:
@@ -339,7 +332,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
 
             report_msg = (
                 f"Still monitoring {symbol}\n"
-                f"• Timeframe: 30 minutes 200 EMA\n"
+                f"• Timeframe: 30 minutes 20 EMA\n"
                 f"• Checks every 5 minutes\n"
                 f"• {symbol} still on {trend.upper()} TREND\n"
                 f"• {trade_status}"
@@ -347,35 +340,6 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
             await context.bot.send_message(chat_id=chat_id, text=report_msg)
         context.job.data["report_counter"] = context.job.data.get("report_counter", 0) + 1
         print(f"[{datetime.now():%H:%M:%S}] No trend change for {symbol} — still {trend}")
-
-    if trend != previous_trend:
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        msg = f"{ts} — {symbol} trend changed to <b>{trend.upper()}</b>!\nPrice: {price:.2f} | 200 EMA: {ema:.2f}"
-        await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
-
-        if trend == "upward":
-            await close_position(symbol, side_to_close="Sell")
-            result = await place_trade(symbol, side="Buy")
-            side_text = "Long (Buy)"
-        else:
-            await close_position(symbol, side_to_close="Buy")
-            result = await place_trade(symbol, side="Sell")
-            side_text = "Short (Sell)"
-
-        if result:
-            order_id = result.get("orderId", "—")
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"✅ {side_text} order placed for {symbol}\nOrder ID: <code>{order_id}</code>",
-                parse_mode="HTML"
-            )
-        else:
-            await context.bot.send_message(chat_id=chat_id, text=f"❌ Failed to place {side_text} order for {symbol}")
-
-        symbol_trends[symbol] = trend
-    else:
-        print(f"[{datetime.now():%H:%M:%S}] No trend change for {symbol} — still {trend}")
-
 
 async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
@@ -393,7 +357,7 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     chat_id = update.effective_chat.id
     await update.message.reply_text(
         f"Added {symbol} to monitoring!\n"
-        "• Timeframe: 30 minutes 200 EMA\n"
+        "• Timeframe: 30 minutes 20 EMA\n"
         "• Checks every 5 minutes\n"
         "Trend changes → notification + demo trade"
     )
@@ -437,7 +401,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Supports multiple symbols. Trades use 20% of available USDT balance."
     )
 
-
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     print(f"Exception while handling update: {context.error}")
     if CHAT_ID:
@@ -446,7 +409,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
             text=f"⚠️ Bot encountered an error:\n<code>{context.error}</code>",
             parse_mode="HTML"
         )
-
 
 async def main():
     print("=== Render startup: Initializing ===")
@@ -460,12 +422,11 @@ async def main():
     application.add_handler(CommandHandler("remove_symbol", remove_symbol))
     application.add_error_handler(error_handler)
 
-    # Schedule motivational quotes
     if application.job_queue:
         application.job_queue.run_repeating(
             callback=send_motivational_quote,
-            interval=12 * 3600,  # Every 12 hours
-            first=0, # Run immediately on startup
+            interval=12 * 3600,
+            first=0,
             chat_id=CHAT_ID,
             name="motivational_quote_sender",
         )
@@ -513,7 +474,6 @@ async def main():
         await application.stop()
         await application.shutdown()
         await runner.cleanup()
-
 
 if __name__ == "__main__":
     print("Entering main block...")
