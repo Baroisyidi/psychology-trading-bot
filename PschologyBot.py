@@ -298,8 +298,11 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
         symbol_open_trade_side[symbol] = await get_open_position_side(symbol)
     
     # 3. 30-Minute Status Report Logic
-    # Since this function runs every 1 second, 30 minutes = 1800 seconds
-    if context.job.data.get("report_counter", 0) % 1800 == 0:
+    # We use a timestamp-based check to ensure it's sent every 30 minutes regardless of execution timing
+    current_time = time.time()
+    last_report_time = context.job.data.get("last_report_time", 0)
+    
+    if current_time - last_report_time >= 1800: # 1800 seconds = 30 minutes
         trade_status = "No open trade"
         if current_open_trade_side:
             trade_status = f"✅ {symbol} still on {current_open_trade_side} order trade"
@@ -314,8 +317,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
             f"• {trade_status}"
         )
         await context.bot.send_message(chat_id=chat_id, text=report_msg)
-    
-    context.job.data["report_counter"] = context.job.data.get("report_counter", 0) + 1
+        context.job.data["last_report_time"] = current_time
 
 async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
@@ -342,11 +344,11 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if context.job_queue:
         context.job_queue.run_repeating(
             callback=monitor_symbol,
-            interval=1, # Changed to 1 second for instant monitoring
+            interval=1,
             first=1,
             chat_id=chat_id,
             name=f"{symbol}_monitor",
-            data={"symbol": symbol, "report_counter": 0},
+            data={"symbol": symbol, "last_report_time": time.time()},
         )
 
 async def remove_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
