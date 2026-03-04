@@ -96,7 +96,9 @@ async def get_trend_and_conversion_line(
     limit: int = 100,
 ) -> Tuple[Optional[str], Optional[float], Optional[float]]:
     try:
-        resp = bybit_session.get_kline(
+        # Offload blocking API call to a thread
+        resp = await asyncio.to_thread(
+            bybit_session.get_kline,
             category="linear",
             symbol=symbol,
             interval=interval,
@@ -118,14 +120,19 @@ async def get_trend_and_conversion_line(
             raise ValueError("Invalid prices")
 
         # Calculate Ichimoku Conversion Line (Tenkan-sen)
-        # Formula: (9-period high + 9-period low) / 2
         nine_period_high = df["high"].rolling(window=9).max()
         nine_period_low = df["low"].rolling(window=9).min()
         df["tenkan_sen"] = (nine_period_high + nine_period_low) / 2
         
         conversion_line = float(df["tenkan_sen"].iloc[-1])
 
-        ticker = bybit_session.get_tickers(category="linear", symbol=symbol)["result"]["list"][0]
+        # Offload blocking API call to a thread
+        ticker_resp = await asyncio.to_thread(
+            bybit_session.get_tickers,
+            category="linear",
+            symbol=symbol
+        )
+        ticker = ticker_resp["result"]["list"][0]
         current_price = float(ticker["lastPrice"])
 
         trend = "upward" if current_price > conversion_line else "downward"
@@ -137,7 +144,12 @@ async def get_trend_and_conversion_line(
 
 async def get_open_position_side(symbol: str) -> Optional[str]:
     try:
-        positions_resp = bybit_session.get_positions(category="linear", symbol=symbol)
+        # Offload blocking API call to a thread
+        positions_resp = await asyncio.to_thread(
+            bybit_session.get_positions,
+            category="linear",
+            symbol=symbol
+        )
         positions = positions_resp["result"]["list"]
         for pos in positions:
             if float(pos["size"]) > 0:
@@ -149,7 +161,12 @@ async def get_open_position_side(symbol: str) -> Optional[str]:
 
 async def get_instrument_constraints(symbol: str) -> Tuple[float, float]:
     try:
-        info = bybit_session.get_instruments_info(category="linear", symbol=symbol)
+        # Offload blocking API call to a thread
+        info = await asyncio.to_thread(
+            bybit_session.get_instruments_info,
+            category="linear",
+            symbol=symbol
+        )
         if info["retCode"] != 0:
             raise ValueError(info["retMsg"])
         
@@ -166,7 +183,11 @@ async def get_instrument_constraints(symbol: str) -> Tuple[float, float]:
 
 async def get_trade_qty(symbol: str) -> str:
     try:
-        balance_resp = bybit_session.get_wallet_balance(accountType="UNIFIED")
+        # Offload blocking API call to a thread
+        balance_resp = await asyncio.to_thread(
+            bybit_session.get_wallet_balance,
+            accountType="UNIFIED"
+        )
         if balance_resp["retCode"] != 0:
             raise ValueError(f"Balance API error: {balance_resp['retMsg']}")
         result = balance_resp["result"]
@@ -206,7 +227,12 @@ async def get_trade_qty(symbol: str) -> str:
 
 async def close_position(symbol: str, side_to_close: str = "Buy") -> Optional[dict]:
     try:
-        positions_resp = bybit_session.get_positions(category="linear", symbol=symbol)
+        # Offload blocking API call to a thread
+        positions_resp = await asyncio.to_thread(
+            bybit_session.get_positions,
+            category="linear",
+            symbol=symbol
+        )
         positions = positions_resp["result"]["list"]
 
         for pos in positions:
@@ -214,7 +240,9 @@ async def close_position(symbol: str, side_to_close: str = "Buy") -> Optional[di
                 close_side = "Sell" if side_to_close == "Buy" else "Buy"
                 qty = pos["size"]
 
-                order = bybit_session.place_order(
+                # Offload blocking API call to a thread
+                order = await asyncio.to_thread(
+                    bybit_session.place_order,
                     category="linear",
                     symbol=symbol,
                     side=close_side,
@@ -234,7 +262,9 @@ async def place_trade(symbol: str, side: str = "Buy") -> Optional[dict]:
     qty = await get_trade_qty(symbol)
     print(f"Attempting {side} order for {symbol} with qty = {qty}")
     try:
-        order = bybit_session.place_order(
+        # Offload blocking API call to a thread
+        order = await asyncio.to_thread(
+            bybit_session.place_order,
             category="linear",
             symbol=symbol,
             side=side,
