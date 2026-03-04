@@ -115,7 +115,7 @@ async def get_trend_and_ema(
         if df["close"].isna().any():
             raise ValueError("Invalid close prices")
 
-        # Changed from 200 EMA to 20 EMA
+        # Calculate 20 EMA on 30-minute chart
         df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
         ema20 = float(df["ema20"].iloc[-1])
 
@@ -249,52 +249,33 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
     trend, price, ema = await get_trend_and_ema(symbol)
 
     if trend is None:
-        if context.job:
-            await context.bot.send_message(
-                chat_id=context.job.chat_id,
-                text=f"Error fetching Bybit data for {symbol}."
-            )
         return
 
     chat_id = context.job.chat_id if context.job else CHAT_ID
 
-    # Check for trend reversal on existing trades
+    # 1. Instant Trend Reversal Logic (Runs every second)
     if current_open_trade_side == "Buy" and trend == "downward":
-        await context.bot.send_message(chat_id=chat_id, text=f"🔄 Trend reversal detected for {symbol}! Closing Long and opening Short.")
+        await context.bot.send_message(chat_id=chat_id, text=f"⚡ INSTANT REVERSAL: {symbol} crossed below 20 EMA! Closing Long, opening Short.")
         await close_position(symbol, side_to_close="Buy")
         result = await place_trade(symbol, side="Sell")
-        side_text = "Short (Sell)"
         if result:
             order_id = result.get("orderId", "—")
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"✅ {side_text} order placed for {symbol}\nOrder ID: <code>{order_id}</code>",
-                parse_mode="HTML"
-            )
-        else:
-            await context.bot.send_message(chat_id=chat_id, text=f"❌ Failed to place {side_text} order for {symbol}")
+            await context.bot.send_message(chat_id=chat_id, text=f"✅ Short order placed for {symbol}\nOrder ID: <code>{order_id}</code>", parse_mode="HTML")
         symbol_trends[symbol] = trend
         symbol_open_trade_side[symbol] = "Sell"
         return
     elif current_open_trade_side == "Sell" and trend == "upward":
-        await context.bot.send_message(chat_id=chat_id, text=f"🔄 Trend reversal detected for {symbol}! Closing Short and opening Long.")
+        await context.bot.send_message(chat_id=chat_id, text=f"⚡ INSTANT REVERSAL: {symbol} crossed above 20 EMA! Closing Short, opening Long.")
         await close_position(symbol, side_to_close="Sell")
         result = await place_trade(symbol, side="Buy")
-        side_text = "Long (Buy)"
         if result:
             order_id = result.get("orderId", "—")
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"✅ {side_text} order placed for {symbol}\nOrder ID: <code>{order_id}</code>",
-                parse_mode="HTML"
-            )
-        else:
-            await context.bot.send_message(chat_id=chat_id, text=f"❌ Failed to place {side_text} order for {symbol}")
+            await context.bot.send_message(chat_id=chat_id, text=f"✅ Long order placed for {symbol}\nOrder ID: <code>{order_id}</code>", parse_mode="HTML")
         symbol_trends[symbol] = trend
         symbol_open_trade_side[symbol] = "Buy"
         return
 
-    # Original trend change logic
+    # 2. Initial Trend Change Logic (If no trade is open)
     if trend != previous_trend:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         msg = f"{ts} — {symbol} trend changed to <b>{trend.upper()}</b>!\nPrice: {price:.2f} | 20 EMA: {ema:.2f}"
@@ -311,35 +292,30 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
 
         if result:
             order_id = result.get("orderId", "—")
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"✅ {side_text} order placed for {symbol}\nOrder ID: <code>{order_id}</code>",
-                parse_mode="HTML"
-            )
-        else:
-            await context.bot.send_message(chat_id=chat_id, text=f"❌ Failed to place {side_text} order for {symbol}")
-
+            await context.bot.send_message(chat_id=chat_id, text=f"✅ {side_text} order placed for {symbol}\nOrder ID: <code>{order_id}</code>", parse_mode="HTML")
+        
         symbol_trends[symbol] = trend
         symbol_open_trade_side[symbol] = await get_open_position_side(symbol)
-    else:
-        # 30-minute status report
-        if context.job.data.get("report_counter", 0) % 6 == 0: # 6 * 5 minutes = 30 minutes
-            trade_status = "No open trade"
-            if current_open_trade_side:
-                trade_status = f"✅ {symbol} still on {current_open_trade_side} order trade"
-            else:
-                trade_status = f"❌ {symbol} has no open trade"
+    
+    # 3. 30-Minute Status Report Logic
+    # Since this function runs every 1 second, 30 minutes = 1800 seconds
+    if context.job.data.get("report_counter", 0) % 1800 == 0:
+        trade_status = "No open trade"
+        if current_open_trade_side:
+            trade_status = f"✅ {symbol} still on {current_open_trade_side} order trade"
+        else:
+            trade_status = f"❌ {symbol} has no open trade"
 
-            report_msg = (
-                f"Still monitoring {symbol}\n"
-                f"• Timeframe: 30 minutes 20 EMA\n"
-                f"• Checks every 5 minutes\n"
-                f"• {symbol} still on {trend.upper()} TREND\n"
-                f"• {trade_status}"
-            )
-            await context.bot.send_message(chat_id=chat_id, text=report_msg)
-        context.job.data["report_counter"] = context.job.data.get("report_counter", 0) + 1
-        print(f"[{datetime.now():%H:%M:%S}] No trend change for {symbol} — still {trend}")
+        report_msg = (
+            f"Still monitoring {symbol}\n"
+            f"• Timeframe: 30 minutes 20 EMA\n"
+            f"• Monitoring every 1 second\n"
+            f"• {symbol} still on {trend.upper()} TREND\n"
+            f"• {trade_status}"
+        )
+        await context.bot.send_message(chat_id=chat_id, text=report_msg)
+    
+    context.job.data["report_counter"] = context.job.data.get("report_counter", 0) + 1
 
 async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
@@ -358,15 +334,16 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(
         f"Added {symbol} to monitoring!\n"
         "• Timeframe: 30 minutes 20 EMA\n"
-        "• Checks every 5 minutes\n"
-        "Trend changes → notification + demo trade"
+        "• Monitoring every 1 second\n"
+        "• Status report every 30 minutes\n"
+        "Trend changes → instant notification + demo trade"
     )
 
     if context.job_queue:
         context.job_queue.run_repeating(
             callback=monitor_symbol,
-            interval=300,
-            first=5,
+            interval=1, # Changed to 1 second for instant monitoring
+            first=1,
             chat_id=chat_id,
             name=f"{symbol}_monitor",
             data={"symbol": symbol, "report_counter": 0},
