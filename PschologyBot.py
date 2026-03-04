@@ -90,7 +90,7 @@ async def send_motivational_quote(context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = context.job.chat_id if context.job else CHAT_ID
     await context.bot.send_message(chat_id=chat_id, text=quote)
 
-async def get_trend_and_ema(
+async def get_trend_and_conversion_line(
     symbol: str,
     interval: str = "30",
     limit: int = 100,
@@ -110,23 +110,29 @@ async def get_trend_and_ema(
             klines,
             columns=["timestamp", "open", "high", "low", "close", "volume", "turnover"],
         ).iloc[::-1].reset_index(drop=True)
+        df["high"] = pd.to_numeric(df["high"], errors="coerce")
+        df["low"] = pd.to_numeric(df["low"], errors="coerce")
         df["close"] = pd.to_numeric(df["close"], errors="coerce")
 
         if df["close"].isna().any():
-            raise ValueError("Invalid close prices")
+            raise ValueError("Invalid prices")
 
-        # Calculate 20 EMA on 30-minute chart
-        df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
-        ema20 = float(df["ema20"].iloc[-1])
+        # Calculate Ichimoku Conversion Line (Tenkan-sen)
+        # Formula: (9-period high + 9-period low) / 2
+        nine_period_high = df["high"].rolling(window=9).max()
+        nine_period_low = df["low"].rolling(window=9).min()
+        df["tenkan_sen"] = (nine_period_high + nine_period_low) / 2
+        
+        conversion_line = float(df["tenkan_sen"].iloc[-1])
 
         ticker = bybit_session.get_tickers(category="linear", symbol=symbol)["result"]["list"][0]
         current_price = float(ticker["lastPrice"])
 
-        trend = "upward" if current_price > ema20 else "downward"
-        return trend, current_price, ema20
+        trend = "upward" if current_price > conversion_line else "downward"
+        return trend, current_price, conversion_line
 
     except Exception as exc:
-        print(f"Error in get_trend_and_ema for {symbol}: {exc}")
+        print(f"Error in get_trend_and_conversion_line for {symbol}: {exc}")
         return None, None, None
 
 async def get_open_position_side(symbol: str) -> Optional[str]:
@@ -175,7 +181,7 @@ async def get_trade_qty(symbol: str) -> str:
             min_qty, _ = await get_instrument_constraints(symbol)
             return f"{min_qty:.6f}".rstrip("0").rstrip(".")
 
-        _, current_price, _ = await get_trend_and_ema(symbol)
+        _, current_price, _ = await get_trend_and_conversion_line(symbol)
         if current_price is None or current_price <= 0:
             print(f"Invalid price for {symbol}")
             min_qty, _ = await get_instrument_constraints(symbol)
@@ -246,7 +252,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
     current_open_trade_side = await get_open_position_side(symbol)
     symbol_open_trade_side[symbol] = current_open_trade_side
 
-    trend, price, ema = await get_trend_and_ema(symbol)
+    trend, price, conversion_line = await get_trend_and_conversion_line(symbol)
 
     if trend is None:
         return
@@ -255,7 +261,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     # 1. Instant Trend Reversal Logic (Runs every second)
     if current_open_trade_side == "Buy" and trend == "downward":
-        await context.bot.send_message(chat_id=chat_id, text=f"⚡ INSTANT REVERSAL: {symbol} crossed below 20 EMA! Closing Long, opening Short.")
+        await context.bot.send_message(chat_id=chat_id, text=f"⚡ INSTANT REVERSAL: {symbol} crossed below Ichimoku Conversion Line! Closing Long, opening Short.")
         await close_position(symbol, side_to_close="Buy")
         result = await place_trade(symbol, side="Sell")
         if result:
@@ -265,7 +271,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
         symbol_open_trade_side[symbol] = "Sell"
         return
     elif current_open_trade_side == "Sell" and trend == "upward":
-        await context.bot.send_message(chat_id=chat_id, text=f"⚡ INSTANT REVERSAL: {symbol} crossed above 20 EMA! Closing Short, opening Long.")
+        await context.bot.send_message(chat_id=chat_id, text=f"⚡ INSTANT REVERSAL: {symbol} crossed above Ichimoku Conversion Line! Closing Short, opening Long.")
         await close_position(symbol, side_to_close="Sell")
         result = await place_trade(symbol, side="Buy")
         if result:
@@ -278,7 +284,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
     # 2. Initial Trend Change Logic (If no trade is open)
     if trend != previous_trend:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        msg = f"{ts} — {symbol} trend changed to <b>{trend.upper()}</b>!\nPrice: {price:.2f} | 20 EMA: {ema:.2f}"
+        msg = f"{ts} — {symbol} trend changed to <b>{trend.upper()}</b>!\nPrice: {price:.2f} | Conversion Line: {conversion_line:.2f}"
         await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
 
         if trend == "upward":
@@ -298,7 +304,6 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
         symbol_open_trade_side[symbol] = await get_open_position_side(symbol)
     
     # 3. 30-Minute Status Report Logic
-    # We use a timestamp-based check to ensure it's sent every 30 minutes regardless of execution timing
     current_time = time.time()
     last_report_time = context.job.data.get("last_report_time", 0)
     
@@ -311,7 +316,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
 
         report_msg = (
             f"Still monitoring {symbol}\n"
-            f"• Timeframe: 30 minutes 20 EMA\n"
+            f"• Timeframe: 30 minutes Ichimoku Conversion Line\n"
             f"• Monitoring every 1 second\n"
             f"• {symbol} still on {trend.upper()} TREND\n"
             f"• {trade_status}"
@@ -335,7 +340,7 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     chat_id = update.effective_chat.id
     await update.message.reply_text(
         f"Added {symbol} to monitoring!\n"
-        "• Timeframe: 30 minutes 20 EMA\n"
+        "• Timeframe: 30 minutes Ichimoku Conversion Line\n"
         "• Monitoring every 1 second\n"
         "• Status report every 30 minutes\n"
         "Trend changes → instant notification + demo trade"
