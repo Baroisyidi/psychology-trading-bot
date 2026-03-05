@@ -62,6 +62,9 @@ symbol_trends: dict[str, Optional[str]] = {}
 monitored_symbols: list[str] = []
 symbol_open_trade_side: dict[str, Optional[str]] = {}
 
+# ATR Multiplier for the buffer zone (0.5 means half an ATR)
+ATR_MULTIPLIER = 0.5
+
 MOTIVATIONAL_QUOTES = [
     "“The market doesn’t reward intelligence 🧠 — it rewards discipline 🧱.\nSmart traders survive, disciplined traders compound.”",
     "“Consistency 🔁 beats luck 🎲 every single time.\nWhat you repeat daily becomes your edge.”",
@@ -90,11 +93,14 @@ async def send_motivational_quote(context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = context.job.chat_id if context.job else CHAT_ID
     await context.bot.send_message(chat_id=chat_id, text=quote)
 
-async def get_trend_and_conversion_line(
+async def get_ichimoku_and_atr(
     symbol: str,
     interval: str = "30",
     limit: int = 100,
-) -> Tuple[Optional[str], Optional[float], Optional[float]]:
+) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+    """
+    Returns: (conversion_line, atr, last_close, current_price)
+    """
     try:
         # Offload blocking API call to a thread
         resp = await asyncio.to_thread(
@@ -119,14 +125,25 @@ async def get_trend_and_conversion_line(
         if df["close"].isna().any():
             raise ValueError("Invalid prices")
 
-        # Calculate Ichimoku Conversion Line (Tenkan-sen)
+        # 1. Calculate Ichimoku Conversion Line (Tenkan-sen)
         nine_period_high = df["high"].rolling(window=9).max()
         nine_period_low = df["low"].rolling(window=9).min()
         df["tenkan_sen"] = (nine_period_high + nine_period_low) / 2
-        
         conversion_line = float(df["tenkan_sen"].iloc[-1])
 
-        # Offload blocking API call to a thread
+        # 2. Calculate ATR (14)
+        df["prev_close"] = df["close"].shift(1)
+        df["tr1"] = df["high"] - df["low"]
+        df["tr2"] = (df["high"] - df["prev_close"]).abs()
+        df["tr3"] = (df["low"] - df["prev_close"]).abs()
+        df["tr"] = df[["tr1", "tr2", "tr3"]].max(axis=1)
+        df["atr"] = df["tr"].rolling(window=14).mean()
+        atr = float(df["atr"].iloc[-1])
+
+        # 3. Get Last Candle Close (for confirmation)
+        last_close = float(df["close"].iloc[-1])
+
+        # 4. Get Current Price
         ticker_resp = await asyncio.to_thread(
             bybit_session.get_tickers,
             category="linear",
@@ -135,12 +152,11 @@ async def get_trend_and_conversion_line(
         ticker = ticker_resp["result"]["list"][0]
         current_price = float(ticker["lastPrice"])
 
-        trend = "upward" if current_price > conversion_line else "downward"
-        return trend, current_price, conversion_line
+        return conversion_line, atr, last_close, current_price
 
     except Exception as exc:
-        print(f"Error in get_trend_and_conversion_line for {symbol}: {exc}")
-        return None, None, None
+        print(f"Error in get_ichimoku_and_atr for {symbol}: {exc}")
+        return None, None, None, None
 
 async def get_open_position_side(symbol: str) -> Optional[str]:
     try:
@@ -174,7 +190,6 @@ async def get_instrument_constraints(symbol: str) -> Tuple[float, float]:
         min_qty = float(lot_filter["minOrderQty"])
         qty_step = float(lot_filter["qtyStep"])
         
-        print(f"[{symbol}] Min qty: {min_qty}, Qty step: {qty_step}")
         return min_qty, qty_step
     
     except Exception as e:
@@ -198,13 +213,12 @@ async def get_trade_qty(symbol: str) -> str:
         total_avail_usd = float(total_avail_usd_str)
 
         if total_avail_usd <= 0:
-            print(f"No available balance detected ({total_avail_usd}) for {symbol} — check demo funding")
             min_qty, _ = await get_instrument_constraints(symbol)
             return f"{min_qty:.6f}".rstrip("0").rstrip(".")
 
-        _, current_price, _ = await get_trend_and_conversion_line(symbol)
+        # Get current price for qty calculation
+        _, _, _, current_price = await get_ichimoku_and_atr(symbol)
         if current_price is None or current_price <= 0:
-            print(f"Invalid price for {symbol}")
             min_qty, _ = await get_instrument_constraints(symbol)
             return f"{min_qty:.6f}".rstrip("0").rstrip(".")
 
@@ -217,8 +231,6 @@ async def get_trade_qty(symbol: str) -> str:
             adjusted_qty = max(min_qty, raw_qty)
         precision = 6 if adjusted_qty < 10 else 3
         qty_str = f"{adjusted_qty:.{precision}f}".rstrip("0").rstrip(".")
-        print(f"Calculated qty for {symbol}: {qty_str} "
-              f"(risk: ${risk_amount_usd:.2f}, price: ${current_price:.2f}, avail USD: ${total_avail_usd:.2f})")
         return qty_str
     except Exception as exc:
         print(f"Failed to calculate qty for {symbol}: {exc}")
@@ -252,7 +264,6 @@ async def close_position(symbol: str, side_to_close: str = "Buy") -> Optional[di
                 )
                 return order.get("result")
 
-        print(f"No {side_to_close} position to close for {symbol}.")
         return None
     except Exception as exc:
         print(f"Position close failed for {symbol}: {exc}")
@@ -260,7 +271,6 @@ async def close_position(symbol: str, side_to_close: str = "Buy") -> Optional[di
 
 async def place_trade(symbol: str, side: str = "Buy") -> Optional[dict]:
     qty = await get_trade_qty(symbol)
-    print(f"Attempting {side} order for {symbol} with qty = {qty}")
     try:
         # Offload blocking API call to a thread
         order = await asyncio.to_thread(
@@ -282,47 +292,64 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
     current_open_trade_side = await get_open_position_side(symbol)
     symbol_open_trade_side[symbol] = current_open_trade_side
 
-    trend, price, conversion_line = await get_trend_and_conversion_line(symbol)
+    conversion_line, atr, last_close, current_price = await get_ichimoku_and_atr(symbol)
 
-    if trend is None:
+    if conversion_line is None or atr is None:
         return
+
+    # Define the Buffer Zone using ATR
+    upper_buffer = conversion_line + (ATR_MULTIPLIER * atr)
+    lower_buffer = conversion_line - (ATR_MULTIPLIER * atr)
+
+    # Determine the trend based on current price relative to the buffer zone
+    if current_price > upper_buffer:
+        current_trend = "upward"
+    elif current_price < lower_buffer:
+        current_trend = "downward"
+    else:
+        # Inside the buffer zone, we consider it "neutral" or "choppy"
+        current_trend = "neutral"
 
     chat_id = context.job.chat_id if context.job else CHAT_ID
 
     # 1. Instant Trend Reversal Logic (Runs every second)
-    if current_open_trade_side == "Buy" and trend == "downward":
-        await context.bot.send_message(chat_id=chat_id, text=f"⚡ INSTANT REVERSAL: {symbol} crossed below Ichimoku Conversion Line! Closing Long, opening Short.")
+    # We only reverse if the price has clearly broken out of the buffer zone in the opposite direction
+    if current_open_trade_side == "Buy" and current_trend == "downward":
+        await context.bot.send_message(chat_id=chat_id, text=f"⚡ INSTANT REVERSAL: {symbol} broke below the ATR Buffer Zone! Closing Long, opening Short.")
         await close_position(symbol, side_to_close="Buy")
         result = await place_trade(symbol, side="Sell")
         if result:
             order_id = result.get("orderId", "—")
             await context.bot.send_message(chat_id=chat_id, text=f"✅ Short order placed for {symbol}\nOrder ID: <code>{order_id}</code>", parse_mode="HTML")
-        symbol_trends[symbol] = trend
+        symbol_trends[symbol] = current_trend
         symbol_open_trade_side[symbol] = "Sell"
         return
-    elif current_open_trade_side == "Sell" and trend == "upward":
-        await context.bot.send_message(chat_id=chat_id, text=f"⚡ INSTANT REVERSAL: {symbol} crossed above Ichimoku Conversion Line! Closing Short, opening Long.")
+    elif current_open_trade_side == "Sell" and current_trend == "upward":
+        await context.bot.send_message(chat_id=chat_id, text=f"⚡ INSTANT REVERSAL: {symbol} broke above the ATR Buffer Zone! Closing Short, opening Long.")
         await close_position(symbol, side_to_close="Sell")
         result = await place_trade(symbol, side="Buy")
         if result:
             order_id = result.get("orderId", "—")
             await context.bot.send_message(chat_id=chat_id, text=f"✅ Long order placed for {symbol}\nOrder ID: <code>{order_id}</code>", parse_mode="HTML")
-        symbol_trends[symbol] = trend
+        symbol_trends[symbol] = current_trend
         symbol_open_trade_side[symbol] = "Buy"
         return
 
     # 2. Initial Trend Change Logic (If no trade is open)
-    if trend != previous_trend:
+    # We only enter if the trend is clear (not neutral) and has changed from the previous state
+    if current_trend != "neutral" and current_trend != previous_trend and current_open_trade_side is None:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        msg = f"{ts} — {symbol} trend changed to <b>{trend.upper()}</b>!\nPrice: {price:.2f} | Conversion Line: {conversion_line:.2f}"
+        msg = (
+            f"{ts} — {symbol} trend confirmed <b>{current_trend.upper()}</b>!\n"
+            f"Price: {current_price:.2f} | Conversion Line: {conversion_line:.2f}\n"
+            f"ATR Buffer: {ATR_MULTIPLIER * atr:.2f}"
+        )
         await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
 
-        if trend == "upward":
-            await close_position(symbol, side_to_close="Sell")
+        if current_trend == "upward":
             result = await place_trade(symbol, side="Buy")
             side_text = "Long (Buy)"
         else:
-            await close_position(symbol, side_to_close="Buy")
             result = await place_trade(symbol, side="Sell")
             side_text = "Short (Sell)"
 
@@ -330,7 +357,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
             order_id = result.get("orderId", "—")
             await context.bot.send_message(chat_id=chat_id, text=f"✅ {side_text} order placed for {symbol}\nOrder ID: <code>{order_id}</code>", parse_mode="HTML")
         
-        symbol_trends[symbol] = trend
+        symbol_trends[symbol] = current_trend
         symbol_open_trade_side[symbol] = await get_open_position_side(symbol)
     
     # 3. 30-Minute Status Report Logic
@@ -347,8 +374,9 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
         report_msg = (
             f"Still monitoring {symbol}\n"
             f"• Timeframe: 30 minutes Ichimoku Conversion Line\n"
+            f"• Filter: ATR-based Buffer Zone ({ATR_MULTIPLIER}x ATR)\n"
             f"• Monitoring every 1 second\n"
-            f"• {symbol} still on {trend.upper()} TREND\n"
+            f"• {symbol} current trend: {current_trend.upper()}\n"
             f"• {trade_status}"
         )
         await context.bot.send_message(chat_id=chat_id, text=report_msg)
@@ -371,6 +399,7 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(
         f"Added {symbol} to monitoring!\n"
         "• Timeframe: 30 minutes Ichimoku Conversion Line\n"
+        f"• Filter: ATR-based Buffer Zone ({ATR_MULTIPLIER}x ATR)\n"
         "• Monitoring every 1 second\n"
         "• Status report every 30 minutes\n"
         "Trend changes → instant notification + demo trade"
@@ -480,7 +509,7 @@ async def main():
     print("Bot is fully running with webhook... Waiting for updates.")
     
     try:
-        await asyncio.Event().wait()
+        await asyncio.event().wait()
     except asyncio.CancelledError:
         pass
     finally:
