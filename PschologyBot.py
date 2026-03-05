@@ -63,7 +63,7 @@ monitored_symbols: list[str] = []
 symbol_open_trade_side: dict[str, Optional[str]] = {}
 
 # ATR Multiplier for the buffer zone (0.5 means half an ATR)
-ATR_MULTIPLIER = 0.5
+ATR_MULTIPLIER = 1.5
 
 MOTIVATIONAL_QUOTES = [
     "“The market doesn’t reward intelligence 🧠 — it rewards discipline 🧱.\nSmart traders survive, disciplined traders compound.”",
