@@ -63,7 +63,7 @@ monitored_symbols: list[str] = []
 symbol_open_trade_side: dict[str, Optional[str]] = {}
 
 # ATR Multiplier for the buffer zone (0.5 means half an ATR)
-ATR_MULTIPLIER = 0.5
+ATR_MULTIPLIER = 1.0
 
 MOTIVATIONAL_QUOTES = [
     "“The market doesn’t reward intelligence 🧠 — it rewards discipline 🧱.\nSmart traders survive, disciplined traders compound.”",
@@ -368,9 +368,9 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
     if current_time - last_report_time >= 1800: # 1800 seconds = 30 minutes
         trade_status = "No open trade"
         if current_open_trade_side:
-            trade_status = f"✅ {symbol} still on {current_open_trade_side} order trade"
+            trade_status = f"✅ {current_open_trade_side} trade open for {symbol}"
         else:
-            trade_status = f"❌ {symbol} has no open trade"
+            trade_status = f"❌ No open trade for {symbol}"
 
         report_msg = (
             f"Still monitoring {symbol}\n"
