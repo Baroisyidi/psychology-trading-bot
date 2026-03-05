@@ -63,7 +63,7 @@ monitored_symbols: list[str] = []
 symbol_open_trade_side: dict[str, Optional[str]] = {}
 
 # ATR Multiplier for the buffer zone (0.5 means half an ATR)
-ATR_MULTIPLIER = 1.0
+ATR_MULTIPLIER = 0.5
 
 MOTIVATIONAL_QUOTES = [
     "“The market doesn’t reward intelligence 🧠 — it rewards discipline 🧱.\nSmart traders survive, disciplined traders compound.”",
@@ -302,65 +302,74 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
     upper_buffer = conversion_line + (ATR_MULTIPLIER * atr)
     lower_buffer = conversion_line - (ATR_MULTIPLIER * atr)
 
-    # Determine the trend based on current price relative to the buffer zone
+    # Determine the current market state relative to the buffer zone
     if current_price > upper_buffer:
-        current_trend = "upward"
+        current_market_state = "upward"
     elif current_price < lower_buffer:
-        current_trend = "downward"
+        current_market_state = "downward"
     else:
-        # Inside the buffer zone, we consider it "neutral" or "choppy"
-        current_trend = "neutral"
+        current_market_state = "neutral" # Inside the buffer zone
 
     chat_id = context.job.chat_id if context.job else CHAT_ID
 
-    # 1. Instant Trend Reversal Logic (Runs every second)
-    # We only reverse if the price has clearly broken out of the buffer zone in the opposite direction
-    if current_open_trade_side == "Buy" and current_trend == "downward":
-        await context.bot.send_message(chat_id=chat_id, text=f"⚡ INSTANT REVERSAL: {symbol} broke below the ATR Buffer Zone! Closing Long, opening Short.")
-        await close_position(symbol, side_to_close="Buy")
-        result = await place_trade(symbol, side="Sell")
-        if result:
-            order_id = result.get("orderId", "—")
-            await context.bot.send_message(chat_id=chat_id, text=f"✅ Short order placed for {symbol}\nOrder ID: <code>{order_id}</code>", parse_mode="HTML")
-        symbol_trends[symbol] = current_trend
-        symbol_open_trade_side[symbol] = "Sell"
-        return
-    elif current_open_trade_side == "Sell" and current_trend == "upward":
-        await context.bot.send_message(chat_id=chat_id, text=f"⚡ INSTANT REVERSAL: {symbol} broke above the ATR Buffer Zone! Closing Short, opening Long.")
-        await close_position(symbol, side_to_close="Sell")
-        result = await place_trade(symbol, side="Buy")
-        if result:
-            order_id = result.get("orderId", "—")
-            await context.bot.send_message(chat_id=chat_id, text=f"✅ Long order placed for {symbol}\nOrder ID: <code>{order_id}</code>", parse_mode="HTML")
-        symbol_trends[symbol] = current_trend
-        symbol_open_trade_side[symbol] = "Buy"
-        return
-
-    # 2. Initial Trend Change Logic (If no trade is open or first run for symbol)
-    # Trigger if trend is clear (not neutral) AND (it's the first time we see a trend OR trend has changed)
-    if current_trend != "neutral" and current_open_trade_side is None and (previous_trend is None or current_trend != previous_trend):
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        msg = (
-            f"{ts} — {symbol} trend confirmed <b>{current_trend.upper()}</b>!\n"
-            f"Price: {current_price:.2f} | Conversion Line: {conversion_line:.2f}\n"
-            f"ATR Buffer: {ATR_MULTIPLIER * atr:.2f}"
-        )
-        await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
-
-        if current_trend == "upward":
-            result = await place_trade(symbol, side="Buy")
-            side_text = "Long (Buy)"
-        else:
+    # 1. Handle Reversals (Buffer-to-Buffer Logic)
+    if current_open_trade_side == "Buy":
+        # If Long is open, only reverse to Short if price breaks BELOW the lower buffer
+        if current_price < lower_buffer:
+            await context.bot.send_message(chat_id=chat_id, text=f"⚡ INSTANT REVERSAL: {symbol} broke below the LOWER ATR Buffer Zone! Closing Long, opening Short.")
+            await close_position(symbol, side_to_close="Buy")
             result = await place_trade(symbol, side="Sell")
-            side_text = "Short (Sell)"
+            if result:
+                order_id = result.get("orderId", "—")
+                await context.bot.send_message(chat_id=chat_id, text=f"✅ Short order placed for {symbol}\nOrder ID: <code>{order_id}</code>", parse_mode="HTML")
+            symbol_trends[symbol] = "downward" # Update trend to reflect new position
+            symbol_open_trade_side[symbol] = "Sell"
+            return # Exit to avoid further processing for this second
+    elif current_open_trade_side == "Sell":
+        # If Short is open, only reverse to Long if price breaks ABOVE the upper buffer
+        if current_price > upper_buffer:
+            await context.bot.send_message(chat_id=chat_id, text=f"⚡ INSTANT REVERSAL: {symbol} broke above the UPPER ATR Buffer Zone! Closing Short, opening Long.")
+            await close_position(symbol, side_to_close="Sell")
+            result = await place_trade(symbol, side="Buy")
+            if result:
+                order_id = result.get("orderId", "—")
+                await context.bot.send_message(chat_id=chat_id, text=f"✅ Long order placed for {symbol}\nOrder ID: <code>{order_id}</code>", parse_mode="HTML")
+            symbol_trends[symbol] = "upward" # Update trend to reflect new position
+            symbol_open_trade_side[symbol] = "Buy"
+            return # Exit to avoid further processing for this second
 
-        if result:
-            order_id = result.get("orderId", "—")
-            await context.bot.send_message(chat_id=chat_id, text=f"✅ {side_text} order placed for {symbol}\nOrder ID: <code>{order_id}</code>", parse_mode="HTML")
+    # 2. Initial Trade Logic (If no trade is open AND it's a new symbol or trend changed)
+    # For initial trade, use Conversion Line directly, not the buffer
+    if current_open_trade_side is None:
+        new_trend = None
+        if current_price > conversion_line:
+            new_trend = "upward"
+        elif current_price < conversion_line:
+            new_trend = "downward"
         
-        symbol_trends[symbol] = current_trend
-        symbol_open_trade_side[symbol] = await get_open_position_side(symbol)
-    
+        # Only act if a clear trend is detected and it's either the first run or trend has changed
+        if new_trend and (previous_trend is None or new_trend != previous_trend):
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            msg = (
+                f"{ts} — {symbol} initial trend detected: <b>{new_trend.upper()}</b>!\n"
+                f"Price: {current_price:.2f} | Conversion Line: {conversion_line:.2f}"
+            )
+            await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
+
+            if new_trend == "upward":
+                result = await place_trade(symbol, side="Buy")
+                side_text = "Long (Buy)"
+            else:
+                result = await place_trade(symbol, side="Sell")
+                side_text = "Short (Sell)"
+
+            if result:
+                order_id = result.get("orderId", "—")
+                await context.bot.send_message(chat_id=chat_id, text=f"✅ {side_text} order placed for {symbol}\nOrder ID: <code>{order_id}</code>", parse_mode="HTML")
+            
+            symbol_trends[symbol] = new_trend
+            symbol_open_trade_side[symbol] = await get_open_position_side(symbol)
+
     # 3. 30-Minute Status Report Logic
     current_time = time.time()
     last_report_time = context.job.data.get("last_report_time", 0)
@@ -377,7 +386,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
             f"• Timeframe: 30 minutes Ichimoku Conversion Line\n"
             f"• Filter: ATR-based Buffer Zone ({ATR_MULTIPLIER}x ATR)\n"
             f"• Monitoring every 1 second\n"
-            f"• {symbol} current trend: {current_trend.upper()}\n"
+            f"• {symbol} current market state: {current_market_state.upper()}\n"
             f"• {trade_status}"
         )
         await context.bot.send_message(chat_id=chat_id, text=report_msg)
@@ -403,7 +412,7 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"• Filter: ATR-based Buffer Zone ({ATR_MULTIPLIER}x ATR)\n"
         "• Monitoring every 1 second\n"
         "• Status report every 30 minutes\n"
-        "Trend changes → instant notification + demo trade"
+        "Initial trade based on Conversion Line. Reversals use full ATR Buffer."
     )
 
     if context.job_queue:
