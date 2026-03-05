@@ -204,7 +204,7 @@ async def get_trade_qty(symbol: str) -> str:
             accountType="UNIFIED"
         )
         if balance_resp["retCode"] != 0:
-            raise ValueError(f"Balance API error: {balance_resp['retMsg']}")
+            raise ValueError(f"Balance API error: {balance_resp["retMsg"]}")
         result = balance_resp["result"]
         if not result["list"]:
             raise ValueError("No account data in response")
@@ -294,7 +294,8 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     conversion_line, atr, last_close, current_price = await get_ichimoku_and_atr(symbol)
 
-    if conversion_line is None or atr is None:
+    if conversion_line is None or atr is None or current_price is None:
+        print(f"Skipping monitoring for {symbol}: Incomplete data (CL: {conversion_line}, ATR: {atr}, Price: {current_price})")
         return
 
     # Define the Buffer Zone using ATR
@@ -335,9 +336,9 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
         symbol_open_trade_side[symbol] = "Buy"
         return
 
-    # 2. Initial Trend Change Logic (If no trade is open)
-    # We only enter if the trend is clear (not neutral) and has changed from the previous state
-    if current_trend != "neutral" and current_trend != previous_trend and current_open_trade_side is None:
+    # 2. Initial Trend Change Logic (If no trade is open or first run for symbol)
+    # Trigger if trend is clear (not neutral) AND (it's the first time we see a trend OR trend has changed)
+    if current_trend != "neutral" and current_open_trade_side is None and (previous_trend is None or current_trend != previous_trend):
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         msg = (
             f"{ts} — {symbol} trend confirmed <b>{current_trend.upper()}</b>!\n"
@@ -393,7 +394,7 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     monitored_symbols.append(symbol)
-    symbol_trends[symbol] = None
+    symbol_trends[symbol] = None # Initialize previous trend as None
 
     chat_id = update.effective_chat.id
     await update.message.reply_text(
