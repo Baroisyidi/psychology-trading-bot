@@ -1,6 +1,5 @@
-python-telegram-bot==21.5
-python-telegram-bot[job-queue]
-APScheduler
+python-telegram-bot[job-queue]==21.5
+APScheduler==3.10.4
 pybit==5.14.0
 pandas==2.2.3
 python-dotenv==1.0.1

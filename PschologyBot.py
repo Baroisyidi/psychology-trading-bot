@@ -509,7 +509,7 @@ async def main():
     print("Bot is fully running with webhook... Waiting for updates.")
     
     try:
-        await asyncio.event().wait()
+        await asyncio.Event().wait()
     except asyncio.CancelledError:
         pass
     finally:
