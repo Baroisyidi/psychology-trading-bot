@@ -4,6 +4,7 @@ import asyncio
 import random
 import time
 import pandas as pd
+import math
 from datetime import datetime
 from typing import Optional, Tuple
 from dotenv import load_dotenv
@@ -257,10 +258,15 @@ async def get_trade_qty(symbol: str) -> str:
 
         # Determine precision based on qty_step
         if qty_step > 0:
-            import math
             precision = max(0, int(-math.log10(qty_step)))
         else:
             precision = 6 if adjusted_qty < 10 else 3
+            
+        # Final, aggressive clamping to ensure no floating point errors push it over
+        # We use a small epsilon to stay safely below the limit
+        safe_max_qty = max_qty * 0.999999
+        if adjusted_qty > safe_max_qty:
+            adjusted_qty = (safe_max_qty // qty_step) * qty_step if qty_step > 0 else safe_max_qty
             
         qty_str = f"{adjusted_qty:.{precision}f}".rstrip("0").rstrip(".")
         return qty_str
