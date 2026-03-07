@@ -5,6 +5,7 @@ import random
 import time
 import pandas as pd
 import math
+import re
 from datetime import datetime
 from typing import Optional, Tuple
 from dotenv import load_dotenv
@@ -202,8 +203,9 @@ async def get_instrument_constraints(symbol: str) -> Tuple[float, float, float, 
         print(f"Failed to get constraints for {symbol}: {e}")
         return 0.001, 1000000.0, 0.001, 5.0
 
-async def get_trade_qty(symbol: str) -> str:
+async def get_trade_qty(symbol: str, override_max_qty: Optional[float] = None) -> str:
     try:
+        print(f"[DEBUG {symbol}] Starting get_trade_qty...")
         # Offload blocking API call to a thread
         balance_resp = await asyncio.to_thread(
             bybit_session.get_wallet_balance,
@@ -217,61 +219,86 @@ async def get_trade_qty(symbol: str) -> str:
         account = result["list"][0]
         total_avail_usd_str = account.get("totalAvailableBalance", "0")
         total_avail_usd = float(total_avail_usd_str)
+        print(f"[DEBUG {symbol}] Total Available USD: {total_avail_usd}")
 
         # Get current price for qty calculation
         _, _, _, current_price = await get_ichimoku_and_atr(symbol)
         min_qty, max_qty, qty_step, min_notional = await get_instrument_constraints(symbol)
+        
+        # Use override_max_qty if provided (from error response)
+        if override_max_qty is not None:
+            print(f"[DEBUG {symbol}] Using override_max_qty: {override_max_qty}")
+            max_qty = override_max_qty
+            
+        print(f"[DEBUG {symbol}] Constraints: min_qty={min_qty}, max_qty={max_qty}, qty_step={qty_step}, min_notional={min_notional}")
 
         if current_price is None or current_price <= 0:
+            print(f"[DEBUG {symbol}] Current price is invalid: {current_price}. Returning min_qty.")
             return f"{min_qty:.6f}".rstrip("0").rstrip(".")
 
         # Calculate quantity based on 20% risk
         risk_amount_usd = total_avail_usd * 0.20
+        print(f"[DEBUG {symbol}] Risk Amount USD (20% of balance): {risk_amount_usd}")
         
         # Ensure risk amount meets minimum notional requirement
-        risk_amount_usd = max(risk_amount_usd, min_notional + 1.0) # Add 1 USDT buffer
+        # Add a small buffer to min_notional to avoid being exactly on the edge
+        risk_amount_usd = max(risk_amount_usd, min_notional * 1.05) # 5% buffer over min_notional
+        print(f"[DEBUG {symbol}] Risk Amount USD (after min_notional adjustment): {risk_amount_usd}")
         
         raw_qty = risk_amount_usd / current_price
+        print(f"[DEBUG {symbol}] Raw Qty (risk_amount_usd / current_price): {raw_qty}")
         
         # 1. ABSOLUTE CAP: Ensure raw_qty does not exceed max_qty
-        # We do this BEFORE applying qty_step to ensure we don't round UP above max_qty
-        raw_qty = min(raw_qty, max_qty)
+        # This is the first and most important clamp
+        clamped_qty = min(raw_qty, max_qty)
+        print(f"[DEBUG {symbol}] Qty after initial max_qty clamp: {clamped_qty}")
         
-        # 2. Adjust for qty_step
+        # 2. Adjust for qty_step by rounding DOWN to the nearest step
         if qty_step > 0:
-            # Use floor to ensure we don't exceed max_qty after rounding
-            adjusted_qty = (raw_qty // qty_step) * qty_step
+            # Use floor division to ensure we never round up above max_qty
+            adjusted_qty_by_step = (clamped_qty // qty_step) * qty_step
         else:
-            adjusted_qty = raw_qty
+            adjusted_qty_by_step = clamped_qty
+        print(f"[DEBUG {symbol}] Qty after qty_step adjustment (rounded down): {adjusted_qty_by_step}")
             
-        # 3. Final Clamp between min and max
-        adjusted_qty = max(min_qty, min(max_qty, adjusted_qty))
+        # 3. Ensure it meets min_qty and doesn't exceed max_qty again after step adjustment
+        final_qty = max(min_qty, min(max_qty, adjusted_qty_by_step))
+        print(f"[DEBUG {symbol}] Final Qty after min/max clamp: {final_qty}")
             
-        # 4. Final check: ensure adjusted_qty * current_price >= min_notional
+        # 4. Final check: ensure final_qty * current_price >= min_notional
         # If it's below min_notional, we try to increase it, but NEVER above max_qty
-        if adjusted_qty * current_price < min_notional:
-            needed_qty = (min_notional / current_price) + qty_step
+        if final_qty * current_price < min_notional:
+            print(f"[DEBUG {symbol}] Final Qty {final_qty} * Price {current_price} < Min Notional {min_notional}. Adjusting...")
+            # Calculate the minimum quantity needed to meet min_notional
+            needed_qty_for_notional = min_notional / current_price
+            
+            # Round up to the nearest qty_step if necessary
             if qty_step > 0:
-                needed_qty = (needed_qty // qty_step) * qty_step
-            # Final safety check against max_qty
-            adjusted_qty = max(min_qty, min(max_qty, needed_qty))
+                needed_qty_for_notional = math.ceil(needed_qty_for_notional / qty_step) * qty_step
+            
+            # Take the minimum of this needed quantity and the max_qty
+            final_qty = min(max_qty, needed_qty_for_notional)
+            
+            # Ensure it still meets min_qty
+            final_qty = max(min_qty, final_qty)
+            print(f"[DEBUG {symbol}] Final Qty after min_notional adjustment: {final_qty}")
 
         # Determine precision based on qty_step
         if qty_step > 0:
             precision = max(0, int(-math.log10(qty_step)))
         else:
-            precision = 6 if adjusted_qty < 10 else 3
+            precision = 6 # Default precision
             
         # Final, aggressive clamping to ensure no floating point errors push it over
-        # We use a small epsilon to stay safely below the limit
-        safe_max_qty = max_qty * 0.999999
-        if adjusted_qty > safe_max_qty:
-            adjusted_qty = (safe_max_qty // qty_step) * qty_step if qty_step > 0 else safe_max_qty
-            
-        qty_str = f"{adjusted_qty:.{precision}f}".rstrip("0").rstrip(".")
+        # This is the ultimate safeguard. If it's still too high, it's capped here.
+        final_qty = min(final_qty, max_qty)
+        print(f"[DEBUG {symbol}] Final Qty before formatting (ultimate clamp): {final_qty}")
+
+        qty_str = f"{final_qty:.{precision}f}".rstrip("0").rstrip(".")
+        print(f"[DEBUG {symbol}] Final Qty String: {qty_str}")
         return qty_str
     except Exception as exc:
-        print(f"Failed to calculate qty for {symbol}: {exc}")
+        print(f"[DEBUG {symbol}] Failed to calculate qty: {exc}")
         min_qty, _, _, _ = await get_instrument_constraints(symbol)
         return f"{min_qty:.6f}".rstrip("0").rstrip(".")
 
@@ -308,7 +335,7 @@ async def close_position(symbol: str, side_to_close: str = "Buy") -> Optional[di
         print(f"Position close failed for {symbol}: {exc}")
         return None
 
-async def place_trade(symbol: str, side: str = "Buy") -> Optional[dict]:
+async def place_trade(symbol: str, side: str = "Buy", retry_with_max_qty: bool = True) -> Optional[dict]:
     qty = await get_trade_qty(symbol)
     try:
         # Offload blocking API call to a thread
@@ -320,9 +347,54 @@ async def place_trade(symbol: str, side: str = "Buy") -> Optional[dict]:
             orderType="Market",
             qty=qty,
         )
+        
         if order.get("retCode") != 0:
-            print(f"Trade order rejected for {symbol} (qty={qty}): {order.get('retMsg')}")
-            return {"error": order.get("retMsg")}
+            error_msg = order.get("retMsg", "Unknown error")
+            print(f"Trade order rejected for {symbol} (qty={qty}): {error_msg}")
+            
+            # Check for "exceeds maximum limit allowed" error
+            if retry_with_max_qty and "exceeds maximum limit allowed" in error_msg:
+                print(f"[DEBUG {symbol}] Detected 'too large' error. Attempting to parse real max_qty...")
+                # Extract max_qty from error message: "too large, order_qty:45663100000000 > max_qty:9510000000000"
+                match = re.search(r"max_qty:(\d+)", error_msg)
+                if match:
+                    real_max_qty_raw = float(match.group(1))
+                    # Bybit error messages for qty often use a very large integer (e.g., 9510000000000)
+                    # We need to scale this back to the actual contract count.
+                    # Usually, this means dividing by 10^8 or similar, but we can also just use the ratio.
+                    # A safer way is to use the ratio between our requested qty and the order_qty in the error.
+                    
+                    requested_qty_match = re.search(r"order_qty:(\d+)", error_msg)
+                    if requested_qty_match:
+                        requested_qty_raw = float(requested_qty_match.group(1))
+                        # Calculate the scaling factor
+                        scaling_factor = float(qty) / requested_qty_raw
+                        real_max_qty = real_max_qty_raw * scaling_factor
+                        
+                        print(f"[DEBUG {symbol}] Parsed real_max_qty: {real_max_qty}. Retrying trade...")
+                        
+                        # Recalculate qty with the new override
+                        new_qty = await get_trade_qty(symbol, override_max_qty=real_max_qty)
+                        
+                        # Retry the trade once
+                        retry_order = await asyncio.to_thread(
+                            bybit_session.place_order,
+                            category="linear",
+                            symbol=symbol,
+                            side=side,
+                            orderType="Market",
+                            qty=new_qty,
+                        )
+                        
+                        if retry_order.get("retCode") == 0:
+                            print(f"✅ Retry successful for {symbol} with qty={new_qty}")
+                            return retry_order.get("result")
+                        else:
+                            error_msg = f"Retry failed: {retry_order.get('retMsg', 'Unknown error')}"
+                            print(f"❌ {error_msg}")
+                
+            return {"error": error_msg}
+            
         return order.get("result")
     except Exception as exc:
         print(f"Trade placement failed for {symbol} (qty={qty}): {exc}")
