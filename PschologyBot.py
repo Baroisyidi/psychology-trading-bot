@@ -175,7 +175,7 @@ async def get_open_position_side(symbol: str) -> Optional[str]:
         print(f"Error getting open position for {symbol}: {e}")
         return None
 
-async def get_instrument_constraints(symbol: str) -> Tuple[float, float, float]:
+async def get_instrument_constraints(symbol: str) -> Tuple[float, float, float, float]:
     try:
         # Offload blocking API call to a thread
         info = await asyncio.to_thread(
@@ -189,16 +189,17 @@ async def get_instrument_constraints(symbol: str) -> Tuple[float, float, float]:
         instrument = info["result"]["list"][0]
         lot_filter = instrument["lotSizeFilter"]
         min_qty = float(lot_filter["minOrderQty"])
+        max_qty = float(lot_filter["maxOrderQty"])
         qty_step = float(lot_filter["qtyStep"])
         
         # Also get min notional value if available
         min_notional = float(lot_filter.get("minNotionalValue", 5.0)) # Default to 5 USDT if not specified
         
-        return min_qty, qty_step, min_notional
+        return min_qty, max_qty, qty_step, min_notional
     
     except Exception as e:
         print(f"Failed to get constraints for {symbol}: {e}")
-        return 0.001, 0.001, 5.0
+        return 0.001, 1000000.0, 0.001, 5.0
 
 async def get_trade_qty(symbol: str) -> str:
     try:
@@ -218,7 +219,7 @@ async def get_trade_qty(symbol: str) -> str:
 
         # Get current price for qty calculation
         _, _, _, current_price = await get_ichimoku_and_atr(symbol)
-        min_qty, qty_step, min_notional = await get_instrument_constraints(symbol)
+        min_qty, max_qty, qty_step, min_notional = await get_instrument_constraints(symbol)
 
         if current_price is None or current_price <= 0:
             return f"{min_qty:.6f}".rstrip("0").rstrip(".")
@@ -231,25 +232,28 @@ async def get_trade_qty(symbol: str) -> str:
         
         raw_qty = risk_amount_usd / current_price
         
-        # Adjust for min_qty and qty_step
+        # Adjust for min_qty, max_qty, and qty_step
         if qty_step > 0:
-            adjusted_qty = max(min_qty, (raw_qty // qty_step) * qty_step)
+            adjusted_qty = (raw_qty // qty_step) * qty_step
         else:
-            adjusted_qty = max(min_qty, raw_qty)
+            adjusted_qty = raw_qty
+            
+        # Clamp between min and max
+        adjusted_qty = max(min_qty, min(max_qty, adjusted_qty))
             
         # Final check: ensure adjusted_qty * current_price >= min_notional
         if adjusted_qty * current_price < min_notional:
             adjusted_qty = (min_notional / current_price) + qty_step
             if qty_step > 0:
                 adjusted_qty = (adjusted_qty // qty_step) * qty_step
-            adjusted_qty = max(min_qty, adjusted_qty)
+            adjusted_qty = max(min_qty, min(max_qty, adjusted_qty))
 
         precision = 6 if adjusted_qty < 10 else 3
         qty_str = f"{adjusted_qty:.{precision}f}".rstrip("0").rstrip(".")
         return qty_str
     except Exception as exc:
         print(f"Failed to calculate qty for {symbol}: {exc}")
-        min_qty, _, _ = await get_instrument_constraints(symbol)
+        min_qty, _, _, _ = await get_instrument_constraints(symbol)
         return f"{min_qty:.6f}".rstrip("0").rstrip(".")
 
 async def close_position(symbol: str, side_to_close: str = "Buy") -> Optional[dict]:
