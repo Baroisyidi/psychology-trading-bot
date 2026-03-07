@@ -279,8 +279,7 @@ async def close_position(symbol: str, side_to_close: str = "Buy") -> Optional[di
                 )
                 if order.get("retCode") != 0:
                     print(f"Close order rejected for {symbol}: {order.get('retMsg')}")
-                return order.get("result")
-
+                return order
         return None
     except Exception as exc:
         print(f"Position close failed for {symbol}: {exc}")
@@ -300,12 +299,11 @@ async def place_trade(symbol: str, side: str = "Buy") -> Optional[dict]:
         )
         if order.get("retCode") != 0:
             print(f"Trade order rejected for {symbol} (qty={qty}): {order.get('retMsg')}")
-            # Try to report the error back to Telegram if possible
             return {"error": order.get("retMsg")}
         return order.get("result")
     except Exception as exc:
         print(f"Trade placement failed for {symbol} (qty={qty}): {exc}")
-        return None
+        return {"error": str(exc)}
 
 async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
     symbol = context.job.data["symbol"]
@@ -373,6 +371,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
         elif current_price < conversion_line:
             new_trend = "downward"
         
+        # We act if it's the first run (previous_trend is None) OR if the trend has flipped
         if new_trend and (previous_trend is None or new_trend != previous_trend):
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             msg = (
@@ -393,8 +392,11 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                 await context.bot.send_message(chat_id=chat_id, text=f"✅ {side_text} order placed for {symbol}\nOrder ID: <code>{order_id}</code>", parse_mode="HTML")
             elif result and "error" in result:
                 await context.bot.send_message(chat_id=chat_id, text=f"❌ Failed to place {side_text} for {symbol}: {result['error']}")
+            else:
+                await context.bot.send_message(chat_id=chat_id, text=f"⚠️ {side_text} attempt for {symbol} returned no result or error.")
             
             symbol_trends[symbol] = new_trend
+            # Re-check position side after attempt
             symbol_open_trade_side[symbol] = await get_open_position_side(symbol)
 
     # 3. 30-Minute Status Report Logic
