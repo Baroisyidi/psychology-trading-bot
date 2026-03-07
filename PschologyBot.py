@@ -62,7 +62,7 @@ symbol_trends: dict[str, Optional[str]] = {}
 monitored_symbols: list[str] = []
 symbol_open_trade_side: dict[str, Optional[str]] = {}
 
-# ATR Multiplier for the buffer zone (0.5 means half an ATR)
+# ATR Multiplier for the buffer zone
 ATR_MULTIPLIER = 1.5
 
 MOTIVATIONAL_QUOTES = [
@@ -175,7 +175,7 @@ async def get_open_position_side(symbol: str) -> Optional[str]:
         print(f"Error getting open position for {symbol}: {e}")
         return None
 
-async def get_instrument_constraints(symbol: str) -> Tuple[float, float]:
+async def get_instrument_constraints(symbol: str) -> Tuple[float, float, float]:
     try:
         # Offload blocking API call to a thread
         info = await asyncio.to_thread(
@@ -186,15 +186,19 @@ async def get_instrument_constraints(symbol: str) -> Tuple[float, float]:
         if info["retCode"] != 0:
             raise ValueError(info["retMsg"])
         
-        lot_filter = info["result"]["list"][0]["lotSizeFilter"]
+        instrument = info["result"]["list"][0]
+        lot_filter = instrument["lotSizeFilter"]
         min_qty = float(lot_filter["minOrderQty"])
         qty_step = float(lot_filter["qtyStep"])
         
-        return min_qty, qty_step
+        # Also get min notional value if available
+        min_notional = float(lot_filter.get("minNotionalValue", 5.0)) # Default to 5 USDT if not specified
+        
+        return min_qty, qty_step, min_notional
     
     except Exception as e:
         print(f"Failed to get constraints for {symbol}: {e}")
-        return 0.001, 0.001
+        return 0.001, 0.001, 5.0
 
 async def get_trade_qty(symbol: str) -> str:
     try:
@@ -204,7 +208,7 @@ async def get_trade_qty(symbol: str) -> str:
             accountType="UNIFIED"
         )
         if balance_resp["retCode"] != 0:
-            raise ValueError(f"Balance API error: {balance_resp["retMsg"]}")
+            raise ValueError(f"Balance API error: {balance_resp['retMsg']}")
         result = balance_resp["result"]
         if not result["list"]:
             raise ValueError("No account data in response")
@@ -212,29 +216,40 @@ async def get_trade_qty(symbol: str) -> str:
         total_avail_usd_str = account.get("totalAvailableBalance", "0")
         total_avail_usd = float(total_avail_usd_str)
 
-        if total_avail_usd <= 0:
-            min_qty, _ = await get_instrument_constraints(symbol)
-            return f"{min_qty:.6f}".rstrip("0").rstrip(".")
-
         # Get current price for qty calculation
         _, _, _, current_price = await get_ichimoku_and_atr(symbol)
+        min_qty, qty_step, min_notional = await get_instrument_constraints(symbol)
+
         if current_price is None or current_price <= 0:
-            min_qty, _ = await get_instrument_constraints(symbol)
             return f"{min_qty:.6f}".rstrip("0").rstrip(".")
 
+        # Calculate quantity based on 20% risk
         risk_amount_usd = total_avail_usd * 0.20
+        
+        # Ensure risk amount meets minimum notional requirement
+        risk_amount_usd = max(risk_amount_usd, min_notional + 1.0) # Add 1 USDT buffer
+        
         raw_qty = risk_amount_usd / current_price
-        min_qty, qty_step = await get_instrument_constraints(symbol)
+        
+        # Adjust for min_qty and qty_step
         if qty_step > 0:
             adjusted_qty = max(min_qty, (raw_qty // qty_step) * qty_step)
         else:
             adjusted_qty = max(min_qty, raw_qty)
+            
+        # Final check: ensure adjusted_qty * current_price >= min_notional
+        if adjusted_qty * current_price < min_notional:
+            adjusted_qty = (min_notional / current_price) + qty_step
+            if qty_step > 0:
+                adjusted_qty = (adjusted_qty // qty_step) * qty_step
+            adjusted_qty = max(min_qty, adjusted_qty)
+
         precision = 6 if adjusted_qty < 10 else 3
         qty_str = f"{adjusted_qty:.{precision}f}".rstrip("0").rstrip(".")
         return qty_str
     except Exception as exc:
         print(f"Failed to calculate qty for {symbol}: {exc}")
-        min_qty, _ = await get_instrument_constraints(symbol)
+        min_qty, _, _ = await get_instrument_constraints(symbol)
         return f"{min_qty:.6f}".rstrip("0").rstrip(".")
 
 async def close_position(symbol: str, side_to_close: str = "Buy") -> Optional[dict]:
@@ -262,6 +277,8 @@ async def close_position(symbol: str, side_to_close: str = "Buy") -> Optional[di
                     qty=qty,
                     reduceOnly=True,
                 )
+                if order.get("retCode") != 0:
+                    print(f"Close order rejected for {symbol}: {order.get('retMsg')}")
                 return order.get("result")
 
         return None
@@ -281,6 +298,10 @@ async def place_trade(symbol: str, side: str = "Buy") -> Optional[dict]:
             orderType="Market",
             qty=qty,
         )
+        if order.get("retCode") != 0:
+            print(f"Trade order rejected for {symbol} (qty={qty}): {order.get('retMsg')}")
+            # Try to report the error back to Telegram if possible
+            return {"error": order.get("retMsg")}
         return order.get("result")
     except Exception as exc:
         print(f"Trade placement failed for {symbol} (qty={qty}): {exc}")
@@ -319,27 +340,32 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
             await context.bot.send_message(chat_id=chat_id, text=f"⚡ INSTANT REVERSAL: {symbol} broke below the LOWER ATR Buffer Zone! Closing Long, opening Short.")
             await close_position(symbol, side_to_close="Buy")
             result = await place_trade(symbol, side="Sell")
-            if result:
+            if result and "error" not in result:
                 order_id = result.get("orderId", "—")
                 await context.bot.send_message(chat_id=chat_id, text=f"✅ Short order placed for {symbol}\nOrder ID: <code>{order_id}</code>", parse_mode="HTML")
-            symbol_trends[symbol] = "downward" # Update trend to reflect new position
+            elif result and "error" in result:
+                await context.bot.send_message(chat_id=chat_id, text=f"❌ Failed to place Short for {symbol}: {result['error']}")
+            
+            symbol_trends[symbol] = "downward"
             symbol_open_trade_side[symbol] = "Sell"
-            return # Exit to avoid further processing for this second
+            return
     elif current_open_trade_side == "Sell":
         # If Short is open, only reverse to Long if price breaks ABOVE the upper buffer
         if current_price > upper_buffer:
             await context.bot.send_message(chat_id=chat_id, text=f"⚡ INSTANT REVERSAL: {symbol} broke above the UPPER ATR Buffer Zone! Closing Short, opening Long.")
             await close_position(symbol, side_to_close="Sell")
             result = await place_trade(symbol, side="Buy")
-            if result:
+            if result and "error" not in result:
                 order_id = result.get("orderId", "—")
                 await context.bot.send_message(chat_id=chat_id, text=f"✅ Long order placed for {symbol}\nOrder ID: <code>{order_id}</code>", parse_mode="HTML")
-            symbol_trends[symbol] = "upward" # Update trend to reflect new position
+            elif result and "error" in result:
+                await context.bot.send_message(chat_id=chat_id, text=f"❌ Failed to place Long for {symbol}: {result['error']}")
+            
+            symbol_trends[symbol] = "upward"
             symbol_open_trade_side[symbol] = "Buy"
-            return # Exit to avoid further processing for this second
+            return
 
-    # 2. Initial Trade Logic (If no trade is open AND it's a new symbol or trend changed)
-    # For initial trade, use Conversion Line directly, not the buffer
+    # 2. Initial Trade Logic
     if current_open_trade_side is None:
         new_trend = None
         if current_price > conversion_line:
@@ -347,7 +373,6 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
         elif current_price < conversion_line:
             new_trend = "downward"
         
-        # Only act if a clear trend is detected and it's either the first run or trend has changed
         if new_trend and (previous_trend is None or new_trend != previous_trend):
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             msg = (
@@ -363,9 +388,11 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                 result = await place_trade(symbol, side="Sell")
                 side_text = "Short (Sell)"
 
-            if result:
+            if result and "error" not in result:
                 order_id = result.get("orderId", "—")
                 await context.bot.send_message(chat_id=chat_id, text=f"✅ {side_text} order placed for {symbol}\nOrder ID: <code>{order_id}</code>", parse_mode="HTML")
+            elif result and "error" in result:
+                await context.bot.send_message(chat_id=chat_id, text=f"❌ Failed to place {side_text} for {symbol}: {result['error']}")
             
             symbol_trends[symbol] = new_trend
             symbol_open_trade_side[symbol] = await get_open_position_side(symbol)
@@ -374,7 +401,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
     current_time = time.time()
     last_report_time = context.job.data.get("last_report_time", 0)
     
-    if current_time - last_report_time >= 1800: # 1800 seconds = 30 minutes
+    if current_time - last_report_time >= 1800:
         trade_status = "No open trade"
         if current_open_trade_side:
             trade_status = f"✅ {current_open_trade_side} trade open for {symbol}"
@@ -403,7 +430,7 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     monitored_symbols.append(symbol)
-    symbol_trends[symbol] = None # Initialize previous trend as None
+    symbol_trends[symbol] = None
 
     chat_id = update.effective_chat.id
     await update.message.reply_text(
