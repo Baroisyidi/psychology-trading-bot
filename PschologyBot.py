@@ -107,24 +107,24 @@ async def get_ichimoku_and_atr(
             klines,
             columns=["timestamp", "open", "high", "low", "close", "volume", "turnover"],
         ).iloc[::-1].reset_index(drop=True)
-        df["high"] = pd.to_numeric(df["high"], errors="coerce")
-        df["low"] = pd.to_numeric(df["low"], errors="coerce")
-        df["close"] = pd.to_numeric(df["close"], errors="coerce")
+        df.loc[:, "high"] = pd.to_numeric(df["high"], errors="coerce")
+        df.loc[:, "low"] = pd.to_numeric(df["low"], errors="coerce")
+        df.loc[:, "close"] = pd.to_numeric(df["close"], errors="coerce")
 
         if df["close"].isna().any():
             raise ValueError("Invalid prices")
 
         nine_period_high = df["high"].rolling(window=9).max()
         nine_period_low = df["low"].rolling(window=9).min()
-        df["tenkan_sen"] = (nine_period_high + nine_period_low) / 2
+        df.loc[:, "tenkan_sen"] = (nine_period_high + nine_period_low) / 2
         conversion_line = float(df["tenkan_sen"].iloc[-1])
 
-        df["prev_close"] = df["close"].shift(1)
-        df["tr1"] = df["high"] - df["low"]
-        df["tr2"] = (df["high"] - df["prev_close"]).abs()
-        df["tr3"] = (df["low"] - df["prev_close"]).abs()
-        df["tr"] = df[["tr1", "tr2", "tr3"]].max(axis=1)
-        df["atr"] = df["tr"].rolling(window=14).mean()
+        df.loc[:, "prev_close"] = df["close"].shift(1)
+        df.loc[:, "tr1"] = df["high"] - df["low"]
+        df.loc[:, "tr2"] = (df["high"] - df["prev_close"]).abs()
+        df.loc[:, "tr3"] = (df["low"] - df["prev_close"]).abs()
+        df.loc[:, "tr"] = df[["tr1", "tr2", "tr3"]].max(axis=1)
+        df.loc[:, "atr"] = df["tr"].rolling(window=14).mean()
         atr = float(df["atr"].iloc[-1])
 
         last_close = float(df["close"].iloc[-1])
