@@ -232,23 +232,36 @@ async def get_trade_qty(symbol: str) -> str:
         
         raw_qty = risk_amount_usd / current_price
         
-        # Adjust for min_qty, max_qty, and qty_step
+        # 1. ABSOLUTE CAP: Ensure raw_qty does not exceed max_qty
+        # We do this BEFORE applying qty_step to ensure we don't round UP above max_qty
+        raw_qty = min(raw_qty, max_qty)
+        
+        # 2. Adjust for qty_step
         if qty_step > 0:
+            # Use floor to ensure we don't exceed max_qty after rounding
             adjusted_qty = (raw_qty // qty_step) * qty_step
         else:
             adjusted_qty = raw_qty
             
-        # Clamp between min and max
+        # 3. Final Clamp between min and max
         adjusted_qty = max(min_qty, min(max_qty, adjusted_qty))
             
-        # Final check: ensure adjusted_qty * current_price >= min_notional
+        # 4. Final check: ensure adjusted_qty * current_price >= min_notional
+        # If it's below min_notional, we try to increase it, but NEVER above max_qty
         if adjusted_qty * current_price < min_notional:
-            adjusted_qty = (min_notional / current_price) + qty_step
+            needed_qty = (min_notional / current_price) + qty_step
             if qty_step > 0:
-                adjusted_qty = (adjusted_qty // qty_step) * qty_step
-            adjusted_qty = max(min_qty, min(max_qty, adjusted_qty))
+                needed_qty = (needed_qty // qty_step) * qty_step
+            # Final safety check against max_qty
+            adjusted_qty = max(min_qty, min(max_qty, needed_qty))
 
-        precision = 6 if adjusted_qty < 10 else 3
+        # Determine precision based on qty_step
+        if qty_step > 0:
+            import math
+            precision = max(0, int(-math.log10(qty_step)))
+        else:
+            precision = 6 if adjusted_qty < 10 else 3
+            
         qty_str = f"{adjusted_qty:.{precision}f}".rstrip("0").rstrip(".")
         return qty_str
     except Exception as exc:
