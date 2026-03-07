@@ -1,265 +1,259 @@
+
 import os
-import time
-import hmac
-import hashlib
-import logging
 import asyncio
+import random
+import time
 import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
+import math
+import re
+import logging
+from datetime import datetime
+from typing import Optional, Tuple, Union
 from dotenv import load_dotenv
 from pybit.unified_trading import HTTP
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-import random
-import re
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+)
 
-# Load environment variables
+# ────────────────────────────────────────────────
+#  Load environment variables
+# ────────────────────────────────────────────────
 load_dotenv()
 
-# Configuration
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 BYBIT_API_KEY = os.getenv("BYBIT_API_KEY")
 BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET")
-CHAT_ID = os.getenv("CHAT_ID")
+CHAT_ID_STR = os.getenv("CHAT_ID")
 
-# Trading Parameters
-TIMEFRAME = "30"  # 30 minutes
-CHECK_INTERVAL = 1  # Check every 1 second
-REPORT_INTERVAL = 1800  # Report every 30 minutes (1800 seconds)
-ATR_PERIOD = 14
-ATR_MULTIPLIER = 1.5  # As requested in v12
-RISK_PERCENT = 0.20  # 20% of balance per trade
-MAX_RETRIES = 3 # Maximum retries for "too large" quantity errors
+if not all([TELEGRAM_TOKEN, BYBIT_API_KEY, BYBIT_API_SECRET, CHAT_ID_STR]):
+    raise ValueError("Missing required environment variables! Check .env or Render Environment Variables.")
 
-# Global State
-monitored_symbols = set()
-symbol_trends = {}  # symbol -> "upward" or "downward"
-symbol_open_trade_side = {} # symbol -> "Buy", "Sell", or None
-symbol_last_report_time = {} # symbol -> timestamp of last report
+try:
+    CHAT_ID = int(CHAT_ID_STR)
+except ValueError:
+    raise ValueError(f"CHAT_ID must be an integer, got: {CHAT_ID_STR}")
 
-# Motivational Quotes
-MOTIVATIONAL_QUOTES = [
-    "Trading is not about being right, it's about making money when you're right and losing little when you're wrong.",
-    "The goal of a successful trader is to make the best trades. Money is secondary.",
-    "Don't focus on the money; focus on the execution. If you execute well, the money will follow.",
-    "Discipline is doing what needs to be done, even if you don't want to do it.",
-    "The market is a device for transferring money from the impatient to the patient.",
-    "Your edge is in your discipline, not your indicators.",
-    "A loss is only a failure if you didn't follow your plan.",
-    "Consistency is the hallmark of a professional trader.",
-    "The best traders have no ego. They accept when they are wrong and move on.",
-    "Risk management is the only way to survive in the long run.",
-    "Plan your trade and trade your plan.",
-    "The market doesn't care about your feelings. Stay objective.",
-    "Patience is the key to catching the big moves.",
-    "Don't overtrade. Quality over quantity.",
-    "Every trade is just one of the next thousand trades. Don't get attached.",
-    "Learn to love the process, not just the results.",
-    "The trend is your friend until the end when it bends.",
-    "Successful trading is 90% psychology and 10% strategy.",
-    "Keep your losses small and your winners big.",
-    "Trading is a marathon, not a sprint. Stay focused."
-]
-
-# Logging setup
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+# Configure logging
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Bybit Session
+# ────────────────────────────────────────────────
+#  Bybit demo session
+# ────────────────────────────────────────────────
 bybit_session = HTTP(
-    testnet=True,  # Set to False for mainnet
+    demo=True,
     api_key=BYBIT_API_KEY,
     api_secret=BYBIT_API_SECRET,
-    recv_window=5000,
+    recv_window=5000
 )
 
-def get_ichimoku_conversion_line(df):
-    """Calculate Ichimoku Conversion Line (Tenkan-sen): (9-period high + 9-period low) / 2"""
-    nine_period_high = df['high'].rolling(window=9).max()
-    nine_period_low = df['low'].rolling(window=9).min()
-    return (nine_period_high + nine_period_low) / 2
+# Global state
+symbol_trends: dict[str, Optional[str]] = {}
+monitored_symbols: list[str] = []
+symbol_open_trade_side: dict[str, Optional[str]] = {}
 
-def get_atr(df, period=14):
-    """Calculate Average True Range (ATR)"""
-    high_low = df['high'] - df['low']
-    high_close = np.abs(df['high'] - df['close'].shift())
-    low_close = np.abs(df['low'] - df['close'].shift())
-    ranges = pd.concat([high_low, high_close, low_close], axis=1)
-    true_range = np.max(ranges, axis=1)
-    return true_range.rolling(window=period).mean()
+# ATR Multiplier for the buffer zone
+ATR_MULTIPLIER = 1.5
 
-async def get_data(symbol):
-    """Fetch kline data and calculate indicators"""
+MOTIVATIONAL_QUOTES = [
+    "“The market doesn’t reward intelligence 🧠 — it rewards discipline 🧱.\nSmart traders survive, disciplined traders compound.”",
+    "“Consistency 🔁 beats luck 🎲 every single time.\nWhat you repeat daily becomes your edge.”",
+    "“Your greatest edge isn’t your strategy 📊 — it’s your psychology 🧠.\nMaster your mind, and the market follows.”",
+    "“Every loss is tuition 🎓.\nEvery lesson learned compounds into future strength 📈.”",
+    "“Control your emotions 🎭, and you control your outcomes 🎯.\nLose emotional control, and the market decides for you.”",
+    "“Trading is a marathon 🏃‍♂️, not a sprint ⚡.\nPatience is the fuel that finishes the race.”",
+    "“Survive first 🛡️. Profit later 💰.\nWinners are simply those who stayed long enough to win.”",
+    "“The market tests your discipline 🧪 before it rewards your skill 🏆.\nPass the test, earn the payout.”",
+    "“You don’t need to predict the market 🔮 —\nYou need to react correctly ⚙️ when it reveals itself.”",
+    "“Missed trades cost nothing 🚫.\nBad trades drain capital, confidence, and clarity 💥.”",
+    "“Boring, repeatable execution 🔄 is where real money is made 💎.\nExcitement is expensive.”",
+    "“Your job isn’t to win today 🗓️ —\nIt’s to still be profitable next year 📆.”",
+    "“Emotional trading feels good short-term 😌\nand destroys accounts long-term 💣.”",
+    "“The best traders think in probabilities 🎯, not predictions 🎲.\nCertainty is an illusion.”",
+    "“Capital preservation 🛡️ is the first form of profit 💰.\nProtect the account, and growth follows.”",
+    "“Discipline means doing the right thing 🧱\neven when every emotion tells you not to 😤.”",
+    "“The market rewards patience ⏳ more than bravery 🦁.\nWaiting is a position.”",
+    "“One good system ⚙️ executed flawlessly\nbeats ten impulsive ideas 💭 every time.”",
+    "“If you can wait ⏸️, you can win 🏆.\nTime favors the disciplined.”",
+    "“Professionals focus on process 🛠️.\nAmateurs obsess over outcomes 🎭.”"
+]
+
+async def send_motivational_quote(context: ContextTypes.DEFAULT_TYPE) -> None:
+    quote = random.choice(MOTIVATIONAL_QUOTES)
+    chat_id = context.job.chat_id if context.job else CHAT_ID
+    await context.bot.send_message(chat_id=chat_id, text=quote)
+
+async def get_ichimoku_and_atr(
+    symbol: str,
+    interval: str = "30",
+    limit: int = 100,
+) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
     try:
         resp = await asyncio.to_thread(
             bybit_session.get_kline,
             category="linear",
             symbol=symbol,
-            interval=TIMEFRAME,
-            limit=100
+            interval=interval,
+            limit=limit,
         )
-        if resp["retCode"] != 0:
-            logger.error(f"Error fetching data for {symbol}: {resp['retMsg']}")
-            return None
+        klines = resp["result"]["list"]
+        if not klines:
+            raise ValueError("No klines returned")
 
-        data = resp["result"]["list"]
-        df = pd.DataFrame(data, columns=["timestamp", "open", "high", "low", "close", "volume", "turnover"])
-        df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]].apply(pd.to_numeric)
-        df = df.iloc[::-1].reset_index(drop=True)
+        df = pd.DataFrame(
+            klines,
+            columns=["timestamp", "open", "high", "low", "close", "volume", "turnover"],
+        ).iloc[::-1].reset_index(drop=True)
+        df["high"] = pd.to_numeric(df["high"], errors="coerce")
+        df["low"] = pd.to_numeric(df["low"], errors="coerce")
+        df["close"] = pd.to_numeric(df["close"], errors="coerce")
 
-        df['conversion_line'] = get_ichimoku_conversion_line(df)
-        df['atr'] = get_atr(df, ATR_PERIOD)
-        
-        return df
+        if df["close"].isna().any():
+            raise ValueError("Invalid prices")
+
+        nine_period_high = df["high"].rolling(window=9).max()
+        nine_period_low = df["low"].rolling(window=9).min()
+        df["tenkan_sen"] = (nine_period_high + nine_period_low) / 2
+        conversion_line = float(df["tenkan_sen"].iloc[-1])
+
+        df["prev_close"] = df["close"].shift(1)
+        df["tr1"] = df["high"] - df["low"]
+        df["tr2"] = (df["high"] - df["prev_close"]).abs()
+        df["tr3"] = (df["low"] - df["prev_close"]).abs()
+        df["tr"] = df[["tr1", "tr2", "tr3"]].max(axis=1)
+        df["atr"] = df["tr"].rolling(window=14).mean()
+        atr = float(df["atr"].iloc[-1])
+
+        last_close = float(df["close"].iloc[-1])
+
+        ticker_resp = await asyncio.to_thread(
+            bybit_session.get_tickers,
+            category="linear",
+            symbol=symbol
+        )
+        ticker = ticker_resp["result"]["list"][0]
+        current_price = float(ticker["lastPrice"])
+
+        return conversion_line, atr, last_close, current_price
+
+    except Exception as exc:
+        logger.error(f"Error in get_ichimoku_and_atr for {symbol}: {exc}")
+        return None, None, None, None
+
+async def get_open_position_side(symbol: str) -> Optional[str]:
+    try:
+        positions_resp = await asyncio.to_thread(
+            bybit_session.get_positions,
+            category="linear",
+            symbol=symbol
+        )
+        positions = positions_resp["result"]["list"]
+        for pos in positions:
+            if float(pos["size"]) > 0:
+                return pos["side"]
+        return None
     except Exception as e:
-        logger.error(f"Exception in get_data for {symbol}: {e}")
+        logger.error(f"Error getting open position for {symbol}: {e}")
         return None
 
-async def get_instrument_constraints(symbol):
-    """Fetch min/max order quantity and step for a symbol"""
+async def get_instrument_constraints(symbol: str) -> Tuple[float, float, float, float]:
     try:
-        resp = await asyncio.to_thread(
+        info = await asyncio.to_thread(
             bybit_session.get_instruments_info,
             category="linear",
             symbol=symbol
         )
-        if resp["retCode"] == 0:
-            instr = resp["result"]["list"][0]
-            lot_size = instr["lotSizeFilter"]
-            return {
-                "min_qty": float(lot_size["minOrderQty"]),
-                "max_qty": float(lot_size["maxOrderQty"]),
-                "qty_step": float(lot_size["qtyStep"]),
-                "min_notional": float(lot_size.get("minNotionalValue", 5.0))
-            }
+        if info["retCode"] != 0:
+            raise ValueError(info["retMsg"])
+        
+        instrument = info["result"]["list"][0]
+        lot_filter = instrument["lotSizeFilter"]
+        min_qty = float(lot_filter["minOrderQty"])
+        max_qty = float(lot_filter["maxOrderQty"])
+        qty_step = float(lot_filter["qtyStep"])
+        
+        min_notional = float(lot_filter.get("minNotionalValue", 5.0))
+        
+        return min_qty, max_qty, qty_step, min_notional
+    
     except Exception as e:
-        logger.error(f"Error getting constraints for {symbol}: {e}")
-    return None
+        logger.error(f"Failed to get constraints for {symbol}: {e}")
+        return 0.001, 1000000.0, 0.001, 5.0
 
-async def get_trade_qty(symbol, price):
-    """Calculate trade quantity based on 20% of balance and instrument constraints"""
+async def get_trade_qty(symbol: str, max_qty_override: Optional[float] = None) -> str:
+    """Calculates the trade quantity based on 20% risk and instrument constraints."""
     try:
-        constraints = await get_instrument_constraints(symbol)
-        if not constraints:
-            return None
-
         balance_resp = await asyncio.to_thread(
             bybit_session.get_wallet_balance,
             accountType="UNIFIED"
         )
         if balance_resp["retCode"] != 0:
-            return None
+            raise ValueError(f"Balance API error: {balance_resp['retMsg']}")
+        result = balance_resp["result"]
+        if not result["list"]:
+            raise ValueError("No account data in response")
+        account = result["list"][0]
+        total_avail_usd = float(account.get("totalAvailableBalance", "0"))
+
+        _, _, _, current_price = await get_ichimoku_and_atr(symbol)
+        min_qty, max_qty, qty_step, min_notional = await get_instrument_constraints(symbol)
+
+        # Apply override if provided (from self-healing)
+        if max_qty_override is not None:
+            max_qty = min(max_qty, max_qty_override)
+            logger.info(f"Using max_qty override for {symbol}: {max_qty}")
+
+        if current_price is None or current_price <= 0:
+            return f"{min_qty:.6f}".rstrip("0").rstrip(".")
+
+        risk_amount_usd = total_avail_usd * 0.20
+        risk_amount_usd = max(risk_amount_usd, min_notional + 1.0)
+        
+        raw_qty = risk_amount_usd / current_price
+        
+        # 1. ABSOLUTE CAP: Ensure raw_qty does not exceed max_qty
+        raw_qty = min(raw_qty, max_qty)
+        
+        # 2. Adjust for qty_step
+        if qty_step > 0:
+            adjusted_qty = (raw_qty // qty_step) * qty_step
+        else:
+            adjusted_qty = raw_qty
             
-        # Get available balance (USDT)
-        balance = 0
-        for coin in balance_resp["result"]["list"][0]["coin"]:
-            if coin["coin"] == "USDT":
-                balance = float(coin["walletBalance"])
-                break
-        
-        if balance <= 0:
-            logger.warning("Insufficient balance for trading.")
-            return None
-
-        # Calculate raw quantity based on risk
-        usdt_to_risk = balance * RISK_PERCENT
-        raw_qty = usdt_to_risk / price
-        
-        # 1. Apply absolute max_qty clamp first
-        max_qty = constraints["max_qty"]
-        qty = min(raw_qty, max_qty)
-        
-        # 2. Adjust for qty_step (round down to avoid exceeding limits)
-        step = constraints["qty_step"]
-        qty = (qty // step) * step
-        
-        # 3. Ensure it meets min_notional (minimum USDT value)
-        min_notional = constraints["min_notional"]
-        if (qty * price) < min_notional:
-            qty = (min_notional / price)
-            qty = (qty // step + 1) * step # Round up to meet minimum
+        # 3. Final Clamp between min and max
+        adjusted_qty = max(min_qty, min(max_qty, adjusted_qty))
             
-        # 4. Final safety checks
-        qty = max(qty, constraints["min_qty"])
-        
-        # AGGRESSIVE FINAL CLAMP: Ensure we never exceed max_qty even after adjustments
-        # Use a tiny safety margin (0.999999) to avoid floating point precision issues
-        qty = min(qty, max_qty * 0.999999)
-        
-        # Format to correct precision based on step
-        precision = 0
-        if step < 1:
-            precision = len(str(step).split(".")[1])
-        
-        return f"{qty:.{precision}f}"
-    except Exception as e:
-        logger.error(f"Error calculating quantity for {symbol}: {e}")
-        return None
+        # 4. Final check: ensure adjusted_qty * current_price >= min_notional
+        if adjusted_qty * current_price < min_notional:
+            needed_qty = (min_notional / current_price) + qty_step
+            if qty_step > 0:
+                needed_qty = (needed_qty // qty_step) * qty_step
+            adjusted_qty = min(needed_qty, max_qty)
 
-async def get_open_position(symbol):
-    """Check if there's an open position for the symbol"""
-    try:
-        resp = await asyncio.to_thread(
-            bybit_session.get_positions,
-            category="linear",
-            symbol=symbol
-        )
-        if resp["retCode"] == 0 and resp["result"]["list"]:
-            pos = resp["result"]["list"][0]
-            size = float(pos["size"])
-            if size > 0:
-                return pos["side"] # "Buy" or "Sell"
-    except Exception as e:
-        logger.error(f"Error checking position for {symbol}: {e}")
-    return None
-
-async def close_position(symbol):
-    """Close any open position for the symbol"""
-    try:
-        pos_side = await get_open_position(symbol)
-        if pos_side:
-            resp = await asyncio.to_thread(
-                bybit_session.get_positions,
-                category="linear",
-                symbol=symbol
-            )
-            if resp["retCode"] == 0 and resp["result"]["list"]:
-                pos = resp["result"]["list"][0]
-                qty = pos["size"]
-                side = "Sell" if pos_side == "Buy" else "Buy"
-                
-                order = await asyncio.to_thread(
-                    bybit_session.place_order,
-                    category="linear",
-                    symbol=symbol,
-                    side=side,
-                    orderType="Market",
-                    qty=qty,
-                    reduceOnly=True,
-                )
-                return order
-        return None
-    except Exception as e:
-        logger.error(f"Error closing position for {symbol}: {e}")
-        return None
-
-async def place_trade(symbol, side, retry_count=0):
-    """Place a market order with dynamic error-response clamping and retry"""
-    try:
-        # Get current price for quantity calculation
-        ticker = await asyncio.to_thread(bybit_session.get_tickers, category="linear", symbol=symbol)
-        if ticker["retCode"] != 0:
-            return {"error": f"Ticker error: {ticker['retMsg']}"}
-        price = float(ticker["result"]["list"][0]["lastPrice"])
-        
-        qty = await get_trade_qty(symbol, price)
-        if not qty:
-            return {"error": "Could not calculate valid quantity."}
+        # Determine precision based on qty_step
+        if qty_step > 0:
+            precision = max(0, int(-math.log10(qty_step)))
+        else:
+            precision = 6 if adjusted_qty < 10 else 3
             
+        # Final safety clamp
+        safe_max_qty = max_qty * 0.999999
+        if adjusted_qty > safe_max_qty:
+            adjusted_qty = (safe_max_qty // qty_step) * qty_step if qty_step > 0 else safe_max_qty
+            
+        qty_str = f"{adjusted_qty:.{precision}f}".rstrip("0").rstrip(".")
+        return qty_str
+    except Exception as exc:
+        logger.error(f"Failed to calculate qty for {symbol}: {exc}")
+        min_qty, _, _, _ = await get_instrument_constraints(symbol)
+        return f"{min_qty:.6f}".rstrip("0").rstrip(".")
+
+async def place_trade(symbol: str, side: str = "Buy", max_qty_override: Optional[float] = None, is_retry: bool = False) -> Optional[dict]:
+    qty = await get_trade_qty(symbol, max_qty_override=max_qty_override)
+    try:
         order = await asyncio.to_thread(
             bybit_session.place_order,
             category="linear",
@@ -271,186 +265,168 @@ async def place_trade(symbol, side, retry_count=0):
         
         if order.get("retCode") != 0:
             error_msg = order.get("retMsg", "Unknown error")
+            logger.error(f"Trade order rejected for {symbol} (qty={qty}): {error_msg}")
             
-            # SELF-HEALING: Check for "exceeds maximum limit allowed" error
-            if "exceeds maximum limit allowed" in error_msg and retry_count < MAX_RETRIES:
-                logger.warning(f"Detected 'too large' error for {symbol}. Attempting to parse real max_qty and retry...")
+            # Self-healing for quantity limit errors
+            # Matches formats: "The max quantity is 1000", "max_qty:1000", "exceeds maximum limit allowed"
+            if not is_retry and ("exceeds maximum limit allowed" in error_msg or "too large" in error_msg):
+                logger.warning(f"Detected quantity limit error for {symbol}. Attempting self-healing...")
                 
-                # Extract the actual max_qty from the error message using regex
-                # Example: "order_qty:45663100000000 > max_qty:9510000000000"
-                match = re.search(r"max_qty:(\d+)", error_msg)
+                # Try to parse the max quantity from various error formats
+                # Format 1: "... The max quantity is 1000 ..."
+                # Format 2: "... max_qty:1000000000000 ..."
+                match = re.search(r"(?:max_qty:|max quantity is\s+)(\d+\.?\d*)", error_msg)
                 if match:
-                    real_max_qty_raw = int(match.group(1))
-                    
-                    # Bybit error messages often use internal integer units. 
-                    # We need to scale this back to the contract count.
-                    # We'll use the ratio of our requested qty to the order_qty in the error.
-                    qty_match = re.search(r"order_qty:(\d+)", error_msg)
-                    if qty_match:
-                        order_qty_raw = int(qty_match.group(1))
-                        ratio = float(qty) / order_qty_raw
-                        real_max_qty = real_max_qty_raw * ratio
-                        
-                        # Apply a small safety margin and format
-                        constraints = await get_instrument_constraints(symbol)
-                        step = constraints["qty_step"] if constraints else 0.1
-                        precision = len(str(step).split(".")[1]) if "." in str(step) else 0
-                        
-                        new_qty = f"{(real_max_qty * 0.99):.{precision}f}"
-                        logger.info(f"Retrying {symbol} {side} with corrected quantity: {new_qty}")
-                        
-                        # Recursive retry with corrected quantity
-                        return await place_trade_with_fixed_qty(symbol, side, new_qty)
-            
-            return {"error": f"{error_msg} (ErrCode: {order.get('retCode')})"}
-            
-        return order["result"]
-    except Exception as e:
-        logger.error(f"Exception in place_trade for {symbol}: {e}")
-        return {"error": str(e)}
+                    parsed_max_qty = float(match.group(1))
+                    logger.info(f"Extracted max quantity from error: {parsed_max_qty}")
+                    # Retry with the new limit
+                    return await place_trade(symbol, side, max_qty_override=parsed_max_qty, is_retry=True)
+                else:
+                    logger.error("Could not parse max quantity from error message.")
 
-async def place_trade_with_fixed_qty(symbol, side, qty):
-    """Helper to place a trade with a specific, pre-calculated quantity"""
+            return {"error": error_msg}
+        
+        return order.get("result")
+    except Exception as exc:
+        logger.error(f"Trade placement failed for {symbol} (qty={qty}): {exc}")
+        return {"error": str(exc)}
+
+async def close_position(symbol: str, side_to_close: str = "Buy") -> Optional[dict]:
     try:
-        order = await asyncio.to_thread(
-            bybit_session.place_order,
+        positions_resp = await asyncio.to_thread(
+            bybit_session.get_positions,
             category="linear",
-            symbol=symbol,
-            side=side,
-            orderType="Market",
-            qty=qty,
+            symbol=symbol
         )
-        if order.get("retCode") != 0:
-            return {"error": f"{order.get('retMsg')} (ErrCode: {order.get('retCode')})"}
-        return order["result"]
-    except Exception as e:
-        return {"error": str(e)}
+        positions = positions_resp["result"]["list"]
 
-async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE):
-    """Main monitoring loop for each symbol"""
-    job = context.job
-    symbol = job.data["symbol"]
-    chat_id = job.data["chat_id"]
+        for pos in positions:
+            if pos["side"] == side_to_close and float(pos["size"]) > 0:
+                close_side = "Sell" if side_to_close == "Buy" else "Buy"
+                qty = pos["size"]
 
-    df = await get_data(symbol)
-    if df is None or len(df) < 20:
+                order = await asyncio.to_thread(
+                    bybit_session.place_order,
+                    category="linear",
+                    symbol=symbol,
+                    side=close_side,
+                    orderType="Market",
+                    qty=qty,
+                    reduceOnly=True,
+                )
+                if order.get("retCode") != 0:
+                    logger.error(f"Close order rejected for {symbol}: {order.get('retMsg')}")
+                return order
+        return None
+    except Exception as exc:
+        logger.error(f"Position close failed for {symbol}: {exc}")
+        return None
+
+async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
+    symbol = context.job.data["symbol"]
+    previous_trend = symbol_trends.get(symbol, None)
+    current_open_trade_side = await get_open_position_side(symbol)
+    symbol_open_trade_side[symbol] = current_open_trade_side
+
+    conversion_line, atr, last_close, current_price = await get_ichimoku_and_atr(symbol)
+
+    if conversion_line is None or atr is None or current_price is None:
         return
 
-    latest = df.iloc[-1]
-    price = latest['close']
-    conversion_line = latest['conversion_line']
-    atr = latest['atr']
-    
     upper_buffer = conversion_line + (ATR_MULTIPLIER * atr)
     lower_buffer = conversion_line - (ATR_MULTIPLIER * atr)
 
-    # Check for trend change or initial trend
-    current_trend = None
-    if price > upper_buffer:
-        current_trend = "upward"
-    elif price < lower_buffer:
-        current_trend = "downward"
-    
-    # Special case for initial trade: use conversion line directly
-    if symbol not in symbol_trends:
-        initial_trend = "upward" if price > conversion_line else "downward"
-        symbol_trends[symbol] = initial_trend
-        msg = f"<b>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} — {symbol} initial trend detected: {initial_trend.upper()}!</b>\nPrice: {price} | Conversion Line: {conversion_line}"
-        await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
-        
-        # Place initial trade
-        if initial_trend == "upward":
-            result = await place_trade(symbol, "Buy")
-            if result and "orderId" in result:
-                order_id = result.get("orderId", "—")
-                await context.bot.send_message(chat_id=chat_id, text=f"✅ Long order placed for {symbol}\nOrder ID: <code>{order_id}</code>", parse_mode="HTML")
-            elif result and "error" in result:
-                await context.bot.send_message(chat_id=chat_id, text=f"❌ Failed to place Long for {symbol}: {result['error']}", parse_mode="HTML")
-            symbol_open_trade_side[symbol] = "Buy"
-        else:
-            result = await place_trade(symbol, "Sell")
-            if result and "orderId" in result:
+    if current_price > upper_buffer:
+        current_market_state = "upward"
+    elif current_price < lower_buffer:
+        current_market_state = "downward"
+    else:
+        current_market_state = "neutral"
+
+    chat_id = context.job.chat_id if context.job else CHAT_ID
+
+    # 1. Handle Reversals (Buffer-to-Buffer Logic)
+    if current_open_trade_side == "Buy":
+        if current_price < lower_buffer:
+            await context.bot.send_message(chat_id=chat_id, text=f"⚡ INSTANT REVERSAL: {symbol} broke below the LOWER ATR Buffer Zone! Closing Long, opening Short.")
+            await close_position(symbol, side_to_close="Buy")
+            result = await place_trade(symbol, side="Sell")
+            if result and "error" not in result:
                 order_id = result.get("orderId", "—")
                 await context.bot.send_message(chat_id=chat_id, text=f"✅ Short order placed for {symbol}\nOrder ID: <code>{order_id}</code>", parse_mode="HTML")
             elif result and "error" in result:
-                await context.bot.send_message(chat_id=chat_id, text=f"❌ Failed to place Short for {symbol}: {result['error']}", parse_mode="HTML")
-            symbol_open_trade_side[symbol] = "Sell"
-        return
-
-    # Buffer-to-Buffer Reversal Logic
-    previous_trend = symbol_trends.get(symbol)
-    open_side = symbol_open_trade_side.get(symbol)
-
-    if open_side == "Buy" and price < lower_buffer:
-        # Reverse Long to Short
-        await close_position(symbol)
-        msg = f"<b>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} — {symbol} trend REVERSED to DOWNWARD!</b>\nPrice: {price} | Lower Buffer: {lower_buffer:.4f}"
-        await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
-        
-        result = await place_trade(symbol, "Sell")
-        if result and "orderId" in result:
-            order_id = result.get("orderId", "—")
-            await context.bot.send_message(chat_id=chat_id, text=f"✅ Short reversal placed for {symbol}\nOrder ID: <code>{order_id}</code>", parse_mode="HTML")
-        elif result and "error" in result:
-            await context.bot.send_message(chat_id=chat_id, text=f"❌ Failed to place Short reversal for {symbol}: {result['error']}", parse_mode="HTML")
-        
-        symbol_trends[symbol] = "downward"
-        symbol_open_trade_side[symbol] = "Sell"
-
-    elif open_side == "Sell" and price > upper_buffer:
-        # Reverse Short to Long
-        await close_position(symbol)
-        msg = f"<b>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} — {symbol} trend REVERSED to UPWARD!</b>\nPrice: {price} | Upper Buffer: {upper_buffer:.4f}"
-        await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
-        
-        result = await place_trade(symbol, "Buy")
-        if result and "orderId" in result:
-            order_id = result.get("orderId", "—")
-            await context.bot.send_message(chat_id=chat_id, text=f"✅ Long reversal placed for {symbol}\nOrder ID: <code>{order_id}</code>", parse_mode="HTML")
-        elif result and "error" in result:
-            await context.bot.send_message(chat_id=chat_id, text=f"❌ Failed to place Long reversal for {symbol}: {result['error']}", parse_mode="HTML")
+                await context.bot.send_message(chat_id=chat_id, text=f"❌ Failed to place Short for {symbol}: {result['error']}")
             
-        symbol_trends[symbol] = "upward"
-        symbol_open_trade_side[symbol] = "Buy"
+            symbol_trends[symbol] = "downward"
+            symbol_open_trade_side[symbol] = "Sell"
+            return
+    elif current_open_trade_side == "Sell":
+        if current_price > upper_buffer:
+            await context.bot.send_message(chat_id=chat_id, text=f"⚡ INSTANT REVERSAL: {symbol} broke above the UPPER ATR Buffer Zone! Closing Short, opening Long.")
+            await close_position(symbol, side_to_close="Sell")
+            result = await place_trade(symbol, side="Buy")
+            if result and "error" not in result:
+                order_id = result.get("orderId", "—")
+                await context.bot.send_message(chat_id=chat_id, text=f"✅ Long order placed for {symbol}\nOrder ID: <code>{order_id}</code>", parse_mode="HTML")
+            elif result and "error" in result:
+                await context.bot.send_message(chat_id=chat_id, text=f"❌ Failed to place Long for {symbol}: {result['error']}")
+            
+            symbol_trends[symbol] = "upward"
+            symbol_open_trade_side[symbol] = "Buy"
+            return
 
-    # Periodic Status Report (Every 30 minutes)
-    now = time.time()
-    last_report = symbol_last_report_time.get(symbol, 0)
-    if now - last_report >= REPORT_INTERVAL:
-        open_side = await get_open_position(symbol)
-        symbol_open_trade_side[symbol] = open_side
+    # 2. Initial Trade Logic
+    if current_open_trade_side is None:
+        new_trend = None
+        if current_price > conversion_line:
+            new_trend = "upward"
+        elif current_price < conversion_line:
+            new_trend = "downward"
         
-        status_msg = (
-            f"📊 <b>Status Report: {symbol}</b>\n"
-            f"• Time: {datetime.now().strftime('%H:%M:%S')}\n"
-            f"• Price: {price}\n"
-            f"• Conversion Line: {conversion_line:.4f}\n"
-            f"• ATR Buffer (1.5x): {ATR_MULTIPLIER * atr:.4f}\n"
-            f"• Trend: {symbol_trends.get(symbol, 'UNKNOWN').upper()}\n"
-            f"• Open Trade: {open_side if open_side else 'None'}\n"
-            f"• Monitoring: Active (1s interval)"
+        if new_trend and (previous_trend is None or new_trend != previous_trend):
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            msg = (
+                f"{ts} — {symbol} initial trend detected: <b>{new_trend.upper()}</b>!\n"
+                f"Price: {current_price:.2f} | Conversion Line: {conversion_line:.2f}"
+            )
+            await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
+
+            if new_trend == "upward":
+                result = await place_trade(symbol, side="Buy")
+                side_text = "Long (Buy)"
+            else:
+                result = await place_trade(symbol, side="Sell")
+                side_text = "Short (Sell)"
+
+            if result and "error" not in result:
+                order_id = result.get("orderId", "—")
+                await context.bot.send_message(chat_id=chat_id, text=f"✅ {side_text} order placed for {symbol}\nOrder ID: <code>{order_id}</code>", parse_mode="HTML")
+            elif result and "error" in result:
+                await context.bot.send_message(chat_id=chat_id, text=f"❌ Failed to place {side_text} for {symbol}: {result['error']}")
+            
+            symbol_trends[symbol] = new_trend
+            symbol_open_trade_side[symbol] = await get_open_position_side(symbol)
+
+    # 3. 30-Minute Status Report Logic
+    current_time = time.time()
+    last_report_time = context.job.data.get("last_report_time", 0)
+    
+    if current_time - last_report_time >= 1800:
+        trade_status = f"✅ {current_open_trade_side} trade open for {symbol}" if current_open_trade_side else f"❌ No open trade for {symbol}"
+        report_msg = (
+            f"Still monitoring {symbol}\n"
+            f"• Timeframe: 30 minutes Ichimoku Conversion Line\n"
+            f"• Filter: ATR-based Buffer Zone ({ATR_MULTIPLIER}x ATR)\n"
+            f"• Monitoring every 1 second\n"
+            f"• {symbol} current market state: {current_market_state.upper()}\n"
+            f"• {trade_status}"
         )
-        await context.bot.send_message(chat_id=chat_id, text=status_msg, parse_mode="HTML")
-        symbol_last_report_time[symbol] = now
+        await context.bot.send_message(chat_id=chat_id, text=report_msg)
+        context.job.data["last_report_time"] = current_time
 
-async def send_motivational_quote(context: ContextTypes.DEFAULT_TYPE):
-    """Send a random motivational quote to the chat"""
-    quote = random.choice(MOTIVATIONAL_QUOTES)
-    msg = f"💡 <b>Trading Discipline</b>\n\n<i>\"{quote}\"</i>"
-    await context.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="HTML")
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start command handler"""
-    await update.message.reply_text(
-        "🚀 Bybit Ichimoku Bot v19 Started!\n"
-        "Use /add_symbol <SYMBOL> to start monitoring.\n"
-        "Example: /add_symbol BTCUSDT"
-    )
-
-async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Add a symbol to monitor"""
+async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        await update.message.reply_text("Please provide a symbol. Example: /add_symbol BTCUSDT")
+        await update.message.reply_text("Usage: /add_symbol <symbol>")
         return
 
     symbol = context.args[0].upper()
@@ -458,34 +434,25 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"{symbol} is already being monitored.")
         return
 
-    monitored_symbols.add(symbol)
+    monitored_symbols.append(symbol)
+    symbol_trends[symbol] = None
+
     chat_id = update.effective_chat.id
-    
-    # Initialize report time
-    symbol_last_report_time[symbol] = time.time()
+    await update.message.reply_text(f"Added {symbol} to monitoring!")
 
-    # Add repeating job for 1-second monitoring
-    context.job_queue.run_repeating(
-        monitor_symbol,
-        interval=CHECK_INTERVAL,
-        first=1,
-        name=f"{symbol}_monitor",
-        data={"symbol": symbol, "chat_id": chat_id}
-    )
+    if context.job_queue:
+        context.job_queue.run_repeating(
+            callback=monitor_symbol,
+            interval=1,
+            first=1,
+            chat_id=chat_id,
+            name=f"{symbol}_monitor",
+            data={"symbol": symbol, "last_report_time": time.time()},
+        )
 
-    await update.message.reply_text(
-        f"Added {symbol} to monitoring!\n"
-        f"• Timeframe: 30 minutes Ichimoku Conversion Line\n"
-        f"• Filter: ATR-based Buffer Zone (1.5x ATR)\n"
-        f"• Monitoring every 1 second\n"
-        f"• Status report every 30 minutes\n"
-        f"Initial trade based on Conversion Line. Reversals use full ATR Buffer."
-    )
-
-async def remove_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Remove a symbol from monitoring"""
+async def remove_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        await update.message.reply_text("Please provide a symbol. Example: /remove_symbol BTCUSDT")
+        await update.message.reply_text("Usage: /remove_symbol <symbol>")
         return
 
     symbol = context.args[0].upper()
@@ -494,46 +461,35 @@ async def remove_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     monitored_symbols.remove(symbol)
-    if symbol in symbol_trends: del symbol_trends[symbol]
-    if symbol in symbol_open_trade_side: del symbol_open_trade_side[symbol]
-    if symbol in symbol_last_report_time: del symbol_last_report_time[symbol]
-
-    # Remove the job
-    current_jobs = context.job_queue.get_jobs_by_name(f"{symbol}_monitor")
-    for job in current_jobs:
-        job.schedule_removal()
-
+    if context.job_queue:
+        jobs = context.job_queue.get_jobs_by_name(f"{symbol}_monitor")
+        for job in jobs:
+            job.schedule_removal()
     await update.message.reply_text(f"Stopped monitoring {symbol}.")
 
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("Bot ready! Use /add_symbol <symbol> to start.")
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error(f"Exception while handling update: {context.error}")
+    if CHAT_ID:
+        await context.bot.send_message(chat_id=CHAT_ID, text=f"⚠️ Bot error: {context.error}")
+
 async def main():
-    """Main entry point"""
-    # Check time sync
-    try:
-        resp = await asyncio.to_thread(bybit_session.get_server_time)
-        server_ms = int(resp["result"]["timeNano"])
-        local_ms = int(time.time() * 1_000_000_000)
-        diff = abs(local_ms - server_ms) / 1_000_000_000
-        logger.info(f"Time diff: {diff:.2f} seconds")
-    except Exception as e:
-        logger.error(f"Time sync check failed: {e}")
-
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-
-    # Handlers
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("add_symbol", add_symbol))
-    app.add_handler(CommandHandler("remove_symbol", remove_symbol))
-
-    # Schedule motivational quotes every 12 hours
-    app.job_queue.run_repeating(send_motivational_quote, interval=43200, first=10)
-
-    logger.info("Bot is running...")
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("add_symbol", add_symbol))
+    application.add_handler(CommandHandler("remove_symbol", remove_symbol))
+    application.add_error_handler(error_handler)
     
-    # Keep running
-    await asyncio.Event().wait()
+    # Schedule motivational quotes every 12 hours
+    if application.job_queue:
+        application.job_queue.run_repeating(send_motivational_quote, interval=43200, first=10, chat_id=CHAT_ID)
+
+    logger.info("Bot starting...")
+    await application.initialize()
+    await application.start()
+    await application.run_polling()
 
 if __name__ == "__main__":
     asyncio.run(main())
