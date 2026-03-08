@@ -563,8 +563,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Sends a welcome message when the command /start is issued."""
     await update.message.reply_text("Hello! I am your Bybit Ichimoku Trading Bot. Use /add_symbol <SYMBOL> to start monitoring a coin.")
 
-def main():
+async def main():
     """Start the bot."""
+    if not TELEGRAM_TOKEN:
+        logger.error("TELEGRAM_TOKEN is not set in environment variables.")
+        return
+
     application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start))
@@ -572,10 +576,26 @@ def main():
     application.add_handler(CommandHandler("remove_symbol", remove_symbol))
 
     # Schedule motivational quotes every 12 hours
-    application.job_queue.run_repeating(send_motivational_quote, interval=timedelta(hours=12), first=0, name="motivational_quote")
+    if application.job_queue:
+        application.job_queue.run_repeating(send_motivational_quote, interval=timedelta(hours=12), first=0, name="motivational_quote")
 
-    application.run_polling()
+    logger.info("Bot is starting...")
+    # Using run_polling in a way that is compatible with the library's internal loop management
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+    
+    # Keep the bot running until interrupted
+    try:
+        while True:
+            await asyncio.sleep(1)
+    except (KeyboardInterrupt, SystemExit):
+        await application.stop()
+        await application.shutdown()
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        pass
 
