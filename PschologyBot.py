@@ -71,7 +71,7 @@ logger = logging.getLogger(__name__)
 
 # Bybit Session
 bybit_session = HTTP(
-    demo=True,  # Set to True for Bybit Demo account
+    testnet=True,  # Set to False for mainnet
     api_key=BYBIT_API_KEY,
     api_secret=BYBIT_API_SECRET,
     recv_window=5000,
@@ -140,16 +140,14 @@ async def get_instrument_constraints(symbol):
         logger.error(f"Error getting constraints for {symbol}: {e}")
     return None
 
-async def get_trade_qty(symbol, price, chat_id, current_max_qty_limit=None):
+async def get_trade_qty(symbol, price, current_max_qty_limit=None):
     """Calculate trade quantity based on 20% of balance and instrument constraints.
     current_max_qty_limit can be passed from a previous error message to enforce a stricter limit.
     """
     try:
         constraints = await get_instrument_constraints(symbol)
         if not constraints:
-            error_msg = f"Failed to get instrument constraints for {symbol}. Please check symbol or API status."
-            logger.error(f"[get_trade_qty] {error_msg}")
-            await context.bot.send_message(chat_id=chat_id, text=f"❌ {error_msg}")
+            logger.error(f"[get_trade_qty] Failed to get instrument constraints for {symbol}")
             return None
 
         balance_resp = await asyncio.to_thread(
@@ -157,9 +155,7 @@ async def get_trade_qty(symbol, price, chat_id, current_max_qty_limit=None):
             accountType="UNIFIED"
         )
         if balance_resp["retCode"] != 0:
-            error_msg = f"Failed to get wallet balance: {balance_resp["retMsg"]}. Please check API permissions or account status."
-            logger.error(f"[get_trade_qty] {error_msg}")
-            await context.bot.send_message(chat_id=chat_id, text=f"❌ {error_msg}")
+            logger.error(f"[get_trade_qty] Failed to get wallet balance: {balance_resp["retMsg"]}")
             return None
             
         # Get available balance (USDT)
@@ -170,9 +166,7 @@ async def get_trade_qty(symbol, price, chat_id, current_max_qty_limit=None):
                 break
         
         if balance <= 0:
-            error_msg = f"Insufficient balance for trading {symbol}. Current balance: {balance:.2f} USDT."
-            logger.warning(f"[get_trade_qty] {error_msg}")
-            await context.bot.send_message(chat_id=chat_id, text=f"❌ {error_msg}")
+            logger.warning(f"[get_trade_qty] Insufficient balance for trading {symbol}. Balance: {balance}")
             return None
 
         # Extract constraints
@@ -198,9 +192,7 @@ async def get_trade_qty(symbol, price, chat_id, current_max_qty_limit=None):
         # 2. Adjust for qty_step (round down to avoid exceeding limits)
         # Ensure qty_step is not zero to prevent division by zero
         if qty_step == 0:
-            error_msg = f"{symbol}: Quantity step is zero, cannot calculate trade quantity. This indicates an issue with instrument info."
-            logger.error(f"[get_trade_qty] {error_msg}")
-            await context.bot.send_message(chat_id=chat_id, text=f"❌ {error_msg}")
+            logger.error(f"[get_trade_qty] {symbol}: qty_step is zero, cannot calculate quantity. Returning None.")
             return None
 
         qty = (np.floor(qty / qty_step)) * qty_step
@@ -236,16 +228,12 @@ async def get_trade_qty(symbol, price, chat_id, current_max_qty_limit=None):
         
         # Final validation: ensure quantity is positive, meets min_qty, and does not exceed effective_max_qty
         if qty <= 0:
-            error_msg = f"{symbol}: Calculated trade quantity {qty:.6f} is zero or negative. Cannot place trade."
-            logger.error(f"[get_trade_qty] {error_msg}")
-            await context.bot.send_message(chat_id=chat_id, text=f"❌ {error_msg}")
+            logger.error(f"[get_trade_qty] {symbol}: Final calculated quantity {qty} is zero or negative. Returning None.")
             return None
         
         # If calculated qty is less than min_qty, it means we cannot place a valid trade with current balance/constraints
         if qty < min_qty:
-            error_msg = f"{symbol}: Calculated trade quantity {qty:.6f} is less than minimum allowed quantity {min_qty:.6f}. Cannot place trade."
-            logger.error(f"[get_trade_qty] {error_msg}")
-            await context.bot.send_message(chat_id=chat_id, text=f"❌ {error_msg}")
+            logger.error(f"[get_trade_qty] {symbol}: Final calculated quantity {qty} is less than min_qty {min_qty}. Cannot place trade. Returning None.")
             return None
 
         # Convert to string with correct precision for Bybit API
@@ -258,9 +246,7 @@ async def get_trade_qty(symbol, price, chat_id, current_max_qty_limit=None):
         return final_qty_str
 
     except Exception as e:
-        error_msg = f"An unexpected error occurred while calculating trade quantity for {symbol}: {e}"
-        logger.error(f"[get_trade_qty] {error_msg}")
-        await context.bot.send_message(chat_id=chat_id, text=f"❌ {error_msg}")
+        logger.error(f"[get_trade_qty] Exception for {symbol}: {e}")
         return None
 
 async def get_open_trade_side(symbol):
@@ -280,7 +266,7 @@ async def get_open_trade_side(symbol):
         logger.error(f"Error getting open trade side for {symbol}: {e}")
         return None
 
-async def close_trade(symbol, side, context, chat_id):
+async def close_trade(symbol, side, context):
     """Close an open trade"""
     try:
         logger.info(f"Attempting to close {side} trade for {symbol}")
@@ -311,23 +297,23 @@ async def close_trade(symbol, side, context, chat_id):
 
             if resp["retCode"] == 0:
                 logger.info(f"Successfully closed {side} trade for {symbol}")
-                await context.bot.send_message(chat_id=chat_id, text=f"✅ Closed {side} trade for {symbol}.")
+                await context.bot.send_message(chat_id=CHAT_ID, text=f"✅ Closed {side} trade for {symbol}.")
                 return True
             else:
                 error_msg = resp.get("retMsg", "Unknown error")
                 logger.error(f"Failed to close {side} trade for {symbol}: {error_msg}")
-                await context.bot.send_message(chat_id=chat_id, text=f"❌ Failed to close {side} trade for {symbol}: {error_msg}")
-                return None
+                await context.bot.send_message(chat_id=CHAT_ID, text=f"❌ Failed to close {side} trade for {symbol}: {error_msg}")
+                return False
         else:
             logger.info(f"No open {side} position to close for {symbol}.")
             return True # Nothing to close
 
     except Exception as e:
         logger.error(f"Exception closing {side} trade for {symbol}: {e}")
-        await context.bot.send_message(chat_id=chat_id, text=f"❌ Exception closing {side} trade for {symbol}: {e}")
-        return None
+        await context.bot.send_message(chat_id=CHAT_ID, text=f"❌ Exception closing {side} trade for {symbol}: {e}")
+        return False
 
-async def place_trade(symbol, side, context, df, chat_id, retry_count=0, initial_qty_str=None):
+async def place_trade(symbol, side, context, df, retry_count=0, initial_qty_str=None):
     """Place a market order with dynamic quantity adjustment and retry for 'too large' errors"""
     price = float(df.iloc[-1]["close"])
     
@@ -335,11 +321,11 @@ async def place_trade(symbol, side, context, df, chat_id, retry_count=0, initial
     constraints = await get_instrument_constraints(symbol)
     max_qty_from_api = constraints["max_qty"] if constraints else None
 
-    qty_str = initial_qty_str if initial_qty_str else await get_trade_qty(symbol, price, chat_id, current_max_qty_limit=max_qty_from_api)
+    qty_str = initial_qty_str if initial_qty_str else await get_trade_qty(symbol, price, current_max_qty_limit=max_qty_from_api)
 
     if not qty_str:
-        await context.bot.send_message(chat_id=chat_id, text=f"❌ Failed to place {side} for {symbol}: Could not calculate valid quantity.")
-        return None
+        await context.bot.send_message(chat_id=CHAT_ID, text=f"❌ Failed to place {side} for {symbol}: Could not calculate valid quantity.")
+        return False
 
     logger.info(f"Attempting to place {side} order for {symbol} with quantity {qty_str} (Retry: {retry_count})")
     
@@ -358,11 +344,11 @@ async def place_trade(symbol, side, context, df, chat_id, retry_count=0, initial
 
         if resp["retCode"] == 0:
             logger.info(f"Successfully placed {side} order for {symbol} with quantity {qty_str}")
-            return resp["result"]["orderId"]
+            return True
         else:
             error_msg = resp.get("retMsg", "Unknown error")
             logger.error(f"[place_trade] Failed to place {side} order for {symbol}: {error_msg}")
-            await context.bot.send_message(chat_id=chat_id, text=f"❌ Failed to place {side} for {symbol}: {error_msg}")
+            await context.bot.send_message(chat_id=CHAT_ID, text=f"❌ Failed to place {side} for {symbol}: {error_msg}")
 
             # Dynamic Error-Response Clamping and Retry
             if "exceeds maximum limit allowed" in error_msg and retry_count < MAX_RETRIES:
@@ -387,64 +373,23 @@ async def place_trade(symbol, side, context, df, chat_id, retry_count=0, initial
 
                     # Recalculate quantity using the stricter max_qty from the error message
                     # Use 99% of reported max_qty for safety to avoid floating point issues
-                    new_qty_str = await get_trade_qty(symbol, price, chat_id, current_max_qty_limit=effective_max_qty_from_error * 0.99)
+                    new_qty_str = await get_trade_qty(symbol, price, current_max_qty_limit=effective_max_qty_from_error * 0.99)
 
                     if new_qty_str:
                         logger.warning(f"[place_trade] Retrying {side} order for {symbol} with adjusted quantity: {new_qty_str}")
                         await context.bot.send_message(chat_id=CHAT_ID, text=f"⚠️ Retrying {side} order for {symbol} with adjusted quantity: {new_qty_str}")
-                        order_id = await place_trade(symbol, side, context, df, chat_id, retry_count + 1, initial_qty_str=new_qty_str)
-                        if order_id:
-                            return order_id
-                        return None
+                        return await place_trade(symbol, side, context, df, retry_count + 1, initial_qty_str=new_qty_str)
                     else:
                         logger.error(f"[place_trade] Failed to recalculate valid quantity for retry for {symbol}")
-                        await context.bot.send_message(chat_id=chat_id, text=f"❌ Failed to recalculate valid quantity for retry for {symbol}.")
+                        await context.bot.send_message(chat_id=CHAT_ID, text=f"❌ Failed to recalculate valid quantity for retry for {symbol}.")
                 else:
                     logger.error(f"[place_trade] Could not parse max_qty from error message for {symbol}")
-            return None
+            return False
 
     except Exception as e:
         logger.error(f"[place_trade] Exception for {symbol}: {e}")
-        await context.bot.send_message(chat_id=chat_id, text=f"❌ Exception placing {side} for {symbol}: {e}")
-        return None
-
-async def perform_initial_trade(symbol, context, chat_id):
-    """Perform initial trend detection and trade placement for a symbol."""
-    try:
-        df = await get_data(symbol)
-        if df is None or df.empty or df['conversion_line'].isnull().any() or df['atr'].isnull().any():
-            logger.warning(f"Skipping initial trade for {symbol} due to insufficient data.")
-            return
-
-        current_price = float(df.iloc[-1]['close'])
-        conversion_line = float(df.iloc[-1]['conversion_line'])
-
-        new_trend = None
-        if current_price > conversion_line:
-            new_trend = "upward"
-        elif current_price < conversion_line:
-            new_trend = "downward"
-
-        if new_trend:
-            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            logger.info(f"{symbol} initial trend detected: {new_trend.upper()}! Price: {current_price:.2f} | Conversion Line: {conversion_line:.2f}")
-            await context.bot.send_message(chat_id=chat_id, text=f"{ts} — {symbol} initial trend detected: {new_trend.upper()}!\nPrice: {current_price:.2f} | Conversion Line: {conversion_line:.2f}")
-            
-            trade_side = "Buy" if new_trend == "upward" else "Sell"
-            order_id = await place_trade(symbol, trade_side, context, df, chat_id=chat_id)
-            if order_id:
-                symbol_open_trade_side[symbol] = trade_side
-                await context.bot.send_message(chat_id=chat_id, text=f"✅ {'Long (Buy)' if trade_side == 'Buy' else 'Short (Sell)'} order placed for {symbol}\nOrder ID: <code>{order_id}</code>", parse_mode="HTML")
-            else:
-                await context.bot.send_message(chat_id=chat_id, text=f"❌ Failed to place {'Long (Buy)' if trade_side == 'Buy' else 'Short (Sell)'} order for {symbol}.")
-            symbol_trends[symbol] = new_trend
-        else:
-            logger.info(f"{symbol} initial trend detected: NEUTRAL. Price: {current_price:.2f} | Conversion Line: {conversion_line:.2f}")
-            await context.bot.send_message(chat_id=chat_id, text=f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} — {symbol} initial trend detected: NEUTRAL.\nPrice: {current_price:.2f} | Conversion Line: {conversion_line:.2f}")
-            symbol_trends[symbol] = "neutral"
-
-    except Exception as e:
-        logger.error(f"Exception in perform_initial_trade for {symbol}: {e}")
+        await context.bot.send_message(chat_id=CHAT_ID, text=f"❌ Exception placing {side} for {symbol}: {e}")
+        return False
 
 async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE):
     """Monitor symbol for trend changes and place trades"""
@@ -481,8 +426,26 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE):
         elif current_price < lower_buffer_line:
             market_state = "BEARISH"
         
-        # Trend change detection and reversal logic
-        if current_trend is not None and new_trend and new_trend != current_trend:
+        # Initial trade placement or trend change detection
+        if current_trend is None: # First time monitoring this symbol
+            if new_trend == "upward":
+                logger.info(f"{symbol} initial trend detected: UPWARD! Price: {current_price:.2f} | Conversion Line: {conversion_line:.2f}")
+                await context.bot.send_message(chat_id=chat_id, text=f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} — {symbol} initial trend detected: UPWARD!\nPrice: {current_price:.2f} | Conversion Line: {conversion_line:.2f}")
+                if await place_trade(symbol, "Buy", context, df):
+                    symbol_open_trade_side[symbol] = "Buy"
+                symbol_trends[symbol] = new_trend
+            elif new_trend == "downward":
+                logger.info(f"{symbol} initial trend detected: DOWNWARD! Price: {current_price:.2f} | Conversion Line: {conversion_line:.2f}")
+                await context.bot.send_message(chat_id=chat_id, text=f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} — {symbol} initial trend detected: DOWNWARD!\nPrice: {current_price:.2f} | Conversion Line: {conversion_line:.2f}")
+                if await place_trade(symbol, "Sell", context, df):
+                    symbol_open_trade_side[symbol] = "Sell"
+                symbol_trends[symbol] = new_trend
+            else:
+                logger.info(f"{symbol} initial trend detected: NEUTRAL. Price: {current_price:.2f} | Conversion Line: {conversion_line:.2f}")
+                await context.bot.send_message(chat_id=chat_id, text=f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} — {symbol} initial trend detected: NEUTRAL.\nPrice: {current_price:.2f} | Conversion Line: {conversion_line:.2f}")
+                symbol_trends[symbol] = "neutral" # Mark as neutral to avoid re-triggering initial detection
+
+        elif new_trend and new_trend != current_trend:
             logger.info(f"{symbol} trend changed from {current_trend} to {new_trend}! Price: {current_price:.2f} | Conversion Line: {conversion_line:.2f}")
             await context.bot.send_message(chat_id=chat_id, text=f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} — {symbol} trend changed to {new_trend.upper()}!\nPrice: {current_price:.2f} | Conversion Line: {conversion_line:.2f}")
             symbol_trends[symbol] = new_trend
@@ -492,12 +455,10 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE):
                 # Only reverse if price breaks below lower buffer line
                 if current_price < lower_buffer_line:
                     logger.info(f"Reversing Long to Short for {symbol} as price broke below lower buffer.")
-                    if await close_trade(symbol, "Buy", context, chat_id):
+                    if await close_trade(symbol, "Buy", context):
                         symbol_open_trade_side[symbol] = None
-                        order_id = await place_trade(symbol, "Sell", context, df, chat_id=chat_id)
-                        if order_id:
+                        if await place_trade(symbol, "Sell", context, df):
                             symbol_open_trade_side[symbol] = "Sell"
-                            await context.bot.send_message(chat_id=chat_id, text=f"✅ Short (Sell) order placed for {symbol}\nOrder ID: <code>{order_id}</code>", parse_mode="HTML")
                 else:
                     logger.info(f"Long trade for {symbol} continues. Price {current_price:.2f} is above lower buffer {lower_buffer_line:.2f}.")
 
@@ -505,22 +466,20 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE):
                 # Only reverse if price breaks above upper buffer line
                 if current_price > upper_buffer_line:
                     logger.info(f"Reversing Short to Long for {symbol} as price broke above upper buffer.")
-                    if await close_trade(symbol, "Sell", context, chat_id):
+                    if await close_trade(symbol, "Sell", context):
                         symbol_open_trade_side[symbol] = None
-                        order_id = await place_trade(symbol, "Buy", context, df, chat_id=chat_id)
-                        if order_id:
+                        if await place_trade(symbol, "Buy", context, df):
                             symbol_open_trade_side[symbol] = "Buy"
-                            await context.bot.send_message(chat_id=chat_id, text=f"✅ Long (Buy) order placed for {symbol}\nOrder ID: <code>{order_id}</code>", parse_mode="HTML")
                 else:
                     logger.info(f"Short trade for {symbol} continues. Price {current_price:.2f} is below upper buffer {upper_buffer_line:.2f}.")
 
             elif open_trade_side is None:
                 # No open trade, place new trade based on new trend
                 if new_trend == "upward":
-                    if await place_trade(symbol, "Buy", context, df, chat_id=chat_id):
+                    if await place_trade(symbol, "Buy", context, df):
                         symbol_open_trade_side[symbol] = "Buy"
                 elif new_trend == "downward":
-                    if await place_trade(symbol, "Sell", context, df, chat_id=chat_id):
+                    if await place_trade(symbol, "Sell", context, df):
                         symbol_open_trade_side[symbol] = "Sell"
 
         # Report status every REPORT_INTERVAL
@@ -574,7 +533,6 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         confirmation_message += f"Initial trade based on Conversion Line. Reversals use full ATR Buffer."
         await update.message.reply_text(confirmation_message)
         logger.info(f"Added {symbol} to monitoring.")
-        await perform_initial_trade(symbol, context, update.effective_chat.id)
     else:
         await update.message.reply_text(f"{symbol} is already being monitored.")
 
@@ -605,12 +563,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Sends a welcome message when the command /start is issued."""
     await update.message.reply_text("Hello! I am your Bybit Ichimoku Trading Bot. Use /add_symbol <SYMBOL> to start monitoring a coin.")
 
-async def main():
-    """Start the bot."""
-    if not TELEGRAM_TOKEN:
-        logger.error("TELEGRAM_TOKEN is not set in environment variables.")
-        return
-
+async def main_async():
+    """Asynchronous main function to run the bot."""
     application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start))
@@ -618,26 +572,14 @@ async def main():
     application.add_handler(CommandHandler("remove_symbol", remove_symbol))
 
     # Schedule motivational quotes every 12 hours
-    if application.job_queue:
-        application.job_queue.run_repeating(send_motivational_quote, interval=timedelta(hours=12), first=0, name="motivational_quote")
+    application.job_queue.run_repeating(send_motivational_quote, interval=timedelta(hours=12), first=0, name="motivational_quote")
 
-    logger.info("Bot is starting...")
-    # Using run_polling in a way that is compatible with the library's internal loop management
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-    
-    # Keep the bot running until interrupted
-    try:
-        while True:
-            await asyncio.sleep(1)
-    except (KeyboardInterrupt, SystemExit):
-        await application.stop()
-        await application.shutdown()
+    await application.run_polling()
+
+def main():
+    """Start the bot."""
+    asyncio.run(main_async())
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        pass
+    main()
 
