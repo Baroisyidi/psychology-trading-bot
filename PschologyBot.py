@@ -190,7 +190,7 @@ async def get_instrument_constraints(symbol: str) -> Tuple[float, float, float, 
         instrument = info["result"]["list"][0]
         lot_filter = instrument["lotSizeFilter"]
         min_qty = float(lot_filter["minOrderQty"])
-        max_qty = float(lot_filter["maxOrderQty"])  # Use Bybit's max directly — no adjustment needed
+        max_qty = float(lot_filter["maxMktOrderQty"])  # Use MARKET order max (lower than limit order max)
         qty_step = float(lot_filter["qtyStep"])
         
         # Also get min notional value if available
