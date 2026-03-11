@@ -190,11 +190,13 @@ async def get_instrument_constraints(symbol: str) -> Tuple[float, float, float, 
         instrument = info["result"]["list"][0]
         lot_filter = instrument["lotSizeFilter"]
         min_qty = float(lot_filter["minOrderQty"])
-        max_qty = float(lot_filter["maxOrderQty"]) / (1 / float(lot_filter["qtyStep"])) if float(lot_filter["qtyStep"]) < 1 else float(lot_filter["maxOrderQty"])
+        max_qty = float(lot_filter["maxOrderQty"])  # Use Bybit's max directly — no adjustment needed
         qty_step = float(lot_filter["qtyStep"])
         
         # Also get min notional value if available
         min_notional = float(lot_filter.get("minNotionalValue", 5.0)) # Default to 5 USDT if not specified
+        
+        print(f"[DEBUG] {symbol} constraints → min_qty={min_qty}, max_qty={max_qty}, qty_step={qty_step}, min_notional={min_notional}")
         
         return min_qty, max_qty, qty_step, min_notional
     
@@ -202,14 +204,28 @@ async def get_instrument_constraints(symbol: str) -> Tuple[float, float, float, 
         print(f"Failed to get constraints for {symbol}: {e}")
         return 0.001, 1000000.0, 0.001, 5.0
 
+def round_qty_to_step(qty: float, qty_step: float, min_qty: float) -> float:
+    """Round quantity DOWN to the nearest valid step increment, ensuring it meets the minimum."""
+    if qty_step > 0:
+        qty = (qty // qty_step) * qty_step
+    return max(qty, min_qty)
+
+def format_qty_str(qty: float, qty_step: float) -> str:
+    """Format quantity as a string with the correct decimal precision derived from qtyStep."""
+    if qty_step >= 1:
+        return str(int(qty))
+    step_str = f"{qty_step:.10f}".rstrip('0')
+    decimals = len(step_str.split('.')[1]) if '.' in step_str else 0
+    return f"{qty:.{decimals}f}"
+
 async def get_trade_qty(symbol: str) -> float:
     try:
         # 1. Check for manual quantity override
         if symbol in symbol_manual_quantities and symbol_manual_quantities[symbol] is not None:
             manual_qty = symbol_manual_quantities[symbol]
-            # Still respect the minimum order quantity
-            min_qty, _, _, _ = await get_instrument_constraints(symbol)
-            return max(manual_qty, min_qty)
+            # Respect instrument constraints: round to step and clamp to min
+            min_qty, max_qty, qty_step, _ = await get_instrument_constraints(symbol)
+            return round_qty_to_step(manual_qty, qty_step, min_qty)
 
         # 2. Fallback to balance-based calculation (20% risk)
         balance_resp = await asyncio.to_thread(
@@ -285,10 +301,10 @@ async def close_position(symbol: str, side_to_close: str = "Buy") -> Optional[fl
                 
                 while remaining_qty > 0:
                     current_batch_qty = min(remaining_qty, max_qty)
+                    current_batch_qty = round_qty_to_step(current_batch_qty, qty_step, min_qty)
                     
-                    # Format qty for API
-                    precision = 6 if current_batch_qty < 10 else 3
-                    qty_str = f"{current_batch_qty:.{precision}f}".rstrip("0").rstrip(".")
+                    # Format qty for API using instrument's qtyStep precision
+                    qty_str = format_qty_str(current_batch_qty, qty_step)
                     
                     # Offload blocking API call to a thread
                     order = await asyncio.to_thread(
@@ -330,15 +346,22 @@ async def place_trade(symbol: str, side: str = "Buy", manual_qty_override: Optio
         # Get constraints for max_qty
         min_qty, max_qty, qty_step, _ = await get_instrument_constraints(symbol)
         
+        # Round total_qty to valid step (important for manual overrides)
+        total_qty = round_qty_to_step(total_qty, qty_step, min_qty)
+        
         remaining_qty = total_qty
         successful_orders = []
         
+        print(f"[DEBUG] {symbol} place_trade → total_qty={total_qty}, max_qty={max_qty}, qty_step={qty_step}")
+        
         while remaining_qty > 0:
             current_batch_qty = min(remaining_qty, max_qty)
+            current_batch_qty = round_qty_to_step(current_batch_qty, qty_step, min_qty)
             
-            # Format qty for API
-            precision = 6 if current_batch_qty < 10 else 3
-            qty_str = f"{current_batch_qty:.{precision}f}".rstrip("0").rstrip(".")
+            # Format qty for API using instrument's qtyStep precision
+            qty_str = format_qty_str(current_batch_qty, qty_step)
+            
+            print(f"[DEBUG] {symbol} batch → qty_str={qty_str}, remaining_after={remaining_qty - current_batch_qty}")
             
             # Offload blocking API call to a thread
             order = await asyncio.to_thread(
