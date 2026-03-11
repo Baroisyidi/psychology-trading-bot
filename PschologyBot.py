@@ -537,10 +537,12 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             side = "Buy" if current_price > conversion_line else "Sell"
             side_text = "Long (Buy)" if side == "Buy" else "Short (Sell)"
             
+            # FIXED: Ensure we use the batching logic for instant trades
             result = await place_trade(symbol, side=side)
+            
             if result and "error" not in result:
                 order_id = result.get("orderId", "—")
-                await update.message.reply_text(f"✅ Instant {side_text} placed for {symbol}\nOrder ID: <code>{order_id}</code>", parse_mode="HTML")
+                await update.message.reply_text(f"✅ Instant {side_text} order(s) placed for {symbol}\nLast Order ID: <code>{order_id}</code>", parse_mode="HTML")
                 symbol_trends[symbol] = "upward" if side == "Buy" else "downward"
             elif result and "error" in result:
                 await update.message.reply_text(f"❌ Failed to place instant {side_text} for {symbol}: {result['error']}")
