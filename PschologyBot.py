@@ -5,7 +5,7 @@ import random
 import time
 import pandas as pd
 from datetime import datetime
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 from dotenv import load_dotenv
 from pybit.unified_trading import HTTP
 from telegram import Update
@@ -201,7 +201,7 @@ async def get_instrument_constraints(symbol: str) -> Tuple[float, float, float, 
         print(f"Failed to get constraints for {symbol}: {e}")
         return 0.001, 1000000.0, 0.001, 5.0
 
-async def get_trade_qty(symbol: str) -> str:
+async def get_trade_qty(symbol: str) -> float:
     try:
         # Offload blocking API call to a thread
         balance_resp = await asyncio.to_thread(
@@ -209,7 +209,7 @@ async def get_trade_qty(symbol: str) -> str:
             accountType="UNIFIED"
         )
         if balance_resp["retCode"] != 0:
-            raise ValueError(f"Balance API error: {balance_resp["retMsg"]}")
+            raise ValueError(f"Balance API error: {balance_resp['retMsg']}")
         result = balance_resp["result"]
         if not result["list"]:
             raise ValueError("No account data in response")
@@ -222,7 +222,7 @@ async def get_trade_qty(symbol: str) -> str:
         min_qty, max_qty, qty_step, min_notional = await get_instrument_constraints(symbol)
 
         if current_price is None or current_price <= 0:
-            return f"{min_qty:.6f}".rstrip("0").rstrip(".")
+            return min_qty
 
         # Calculate quantity based on 20% risk
         risk_amount_usd = total_avail_usd * 0.20
@@ -245,16 +245,11 @@ async def get_trade_qty(symbol: str) -> str:
                 adjusted_qty = (adjusted_qty // qty_step) * qty_step
             adjusted_qty = max(min_qty, adjusted_qty)
 
-        # NEW: Cap the quantity at the maximum allowed
-        adjusted_qty = min(adjusted_qty, max_qty)
-
-        precision = 6 if adjusted_qty < 10 else 3
-        qty_str = f"{adjusted_qty:.{precision}f}".rstrip("0").rstrip(".")
-        return qty_str
+        return adjusted_qty
     except Exception as exc:
         print(f"Failed to calculate qty for {symbol}: {exc}")
         min_qty, _, _, _ = await get_instrument_constraints(symbol)
-        return f"{min_qty:.6f}".rstrip("0").rstrip(".")
+        return min_qty
 
 async def close_position(symbol: str, side_to_close: str = "Buy") -> Optional[dict]:
     try:
@@ -269,44 +264,93 @@ async def close_position(symbol: str, side_to_close: str = "Buy") -> Optional[di
         for pos in positions:
             if pos["side"] == side_to_close and float(pos["size"]) > 0:
                 close_side = "Sell" if side_to_close == "Buy" else "Buy"
-                qty = pos["size"]
-
-                # Offload blocking API call to a thread
-                order = await asyncio.to_thread(
-                    bybit_session.place_order,
-                    category="linear",
-                    symbol=symbol,
-                    side=close_side,
-                    orderType="Market",
-                    qty=qty,
-                    reduceOnly=True,
-                )
-                if order.get("retCode") != 0:
-                    print(f"Close order rejected for {symbol}: {order.get("retMsg")}")
-                return order
+                total_qty = float(pos["size"])
+                
+                # Get constraints for max_qty
+                min_qty, max_qty, qty_step, _ = await get_instrument_constraints(symbol)
+                
+                # Split close order if necessary
+                remaining_qty = total_qty
+                last_order = None
+                
+                while remaining_qty > 0:
+                    current_batch_qty = min(remaining_qty, max_qty)
+                    
+                    # Format qty for API
+                    precision = 6 if current_batch_qty < 10 else 3
+                    qty_str = f"{current_batch_qty:.{precision}f}".rstrip("0").rstrip(".")
+                    
+                    # Offload blocking API call to a thread
+                    order = await asyncio.to_thread(
+                        bybit_session.place_order,
+                        category="linear",
+                        symbol=symbol,
+                        side=close_side,
+                        orderType="Market",
+                        qty=qty_str,
+                        reduceOnly=True,
+                    )
+                    
+                    if order.get("retCode") != 0:
+                        print(f"Close order batch failed for {symbol}: {order.get('retMsg')}")
+                        return order # Return failed order to show error
+                    
+                    last_order = order
+                    remaining_qty -= current_batch_qty
+                    
+                    # Short delay between batches if multiple
+                    if remaining_qty > 0:
+                        await asyncio.sleep(0.5)
+                        
+                return last_order
         return None
     except Exception as exc:
         print(f"Position close failed for {symbol}: {exc}")
         return None
 
 async def place_trade(symbol: str, side: str = "Buy") -> Optional[dict]:
-    qty = await get_trade_qty(symbol)
+    total_qty = await get_trade_qty(symbol)
     try:
-        # Offload blocking API call to a thread
-        order = await asyncio.to_thread(
-            bybit_session.place_order,
-            category="linear",
-            symbol=symbol,
-            side=side,
-            orderType="Market",
-            qty=qty,
-        )
-        if order.get("retCode") != 0:
-            print(f"Trade order rejected for {symbol} (qty={qty}): {order.get("retMsg")}")
-            return {"error": order.get("retMsg")}
-        return order.get("result")
+        # Get constraints for max_qty
+        min_qty, max_qty, qty_step, _ = await get_instrument_constraints(symbol)
+        
+        remaining_qty = total_qty
+        successful_orders = []
+        
+        while remaining_qty > 0:
+            current_batch_qty = min(remaining_qty, max_qty)
+            
+            # Format qty for API
+            precision = 6 if current_batch_qty < 10 else 3
+            qty_str = f"{current_batch_qty:.{precision}f}".rstrip("0").rstrip(".")
+            
+            # Offload blocking API call to a thread
+            order = await asyncio.to_thread(
+                bybit_session.place_order,
+                category="linear",
+                symbol=symbol,
+                side=side,
+                orderType="Market",
+                qty=qty_str,
+            )
+            
+            if order.get("retCode") != 0:
+                print(f"Trade order batch rejected for {symbol} (qty={qty_str}): {order.get('retMsg')}")
+                # If any batch fails, return error but include what we successfully placed
+                return {"error": order.get("retMsg"), "partial": len(successful_orders) > 0}
+            
+            successful_orders.append(order.get("result"))
+            remaining_qty -= current_batch_qty
+            
+            # Short delay between batches to ensure sequential execution
+            if remaining_qty > 0:
+                await asyncio.sleep(0.5)
+        
+        # Return the last successful order result (or a summary)
+        return successful_orders[-1] if successful_orders else {"error": "No orders placed"}
+        
     except Exception as exc:
-        print(f"Trade placement failed for {symbol} (qty={qty}): {exc}")
+        print(f"Trade placement failed for {symbol}: {exc}")
         return {"error": str(exc)}
 
 async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -344,9 +388,9 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
             result = await place_trade(symbol, side="Sell")
             if result and "error" not in result:
                 order_id = result.get("orderId", "—")
-                await context.bot.send_message(chat_id=chat_id, text=f"✅ Short order placed for {symbol}\nOrder ID: <code>{order_id}</code>", parse_mode="HTML")
+                await context.bot.send_message(chat_id=chat_id, text=f"✅ Short order(s) placed for {symbol}\nLast Order ID: <code>{order_id}</code>", parse_mode="HTML")
             elif result and "error" in result:
-                await context.bot.send_message(chat_id=chat_id, text=f"❌ Failed to place Short for {symbol}: {result["error"]}")
+                await context.bot.send_message(chat_id=chat_id, text=f"❌ Failed to place Short for {symbol}: {result['error']}")
             
             symbol_trends[symbol] = "downward"
             symbol_open_trade_side[symbol] = "Sell"
@@ -359,9 +403,9 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
             result = await place_trade(symbol, side="Buy")
             if result and "error" not in result:
                 order_id = result.get("orderId", "—")
-                await context.bot.send_message(chat_id=chat_id, text=f"✅ Long order placed for {symbol}\nOrder ID: <code>{order_id}</code>", parse_mode="HTML")
+                await context.bot.send_message(chat_id=chat_id, text=f"✅ Long order(s) placed for {symbol}\nLast Order ID: <code>{order_id}</code>", parse_mode="HTML")
             elif result and "error" in result:
-                await context.bot.send_message(chat_id=chat_id, text=f"❌ Failed to place Long for {symbol}: {result["error"]}")
+                await context.bot.send_message(chat_id=chat_id, text=f"❌ Failed to place Long for {symbol}: {result['error']}")
             
             symbol_trends[symbol] = "upward"
             symbol_open_trade_side[symbol] = "Buy"
@@ -393,9 +437,9 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
 
             if result and "error" not in result:
                 order_id = result.get("orderId", "—")
-                await context.bot.send_message(chat_id=chat_id, text=f"✅ {side_text} order placed for {symbol}\nOrder ID: <code>{order_id}</code>", parse_mode="HTML")
+                await context.bot.send_message(chat_id=chat_id, text=f"✅ {side_text} order(s) placed for {symbol}\nLast Order ID: <code>{order_id}</code>", parse_mode="HTML")
             elif result and "error" in result:
-                await context.bot.send_message(chat_id=chat_id, text=f"❌ Failed to place {side_text} for {symbol}: {result["error"]}")
+                await context.bot.send_message(chat_id=chat_id, text=f"❌ Failed to place {side_text} for {symbol}: {result['error']}")
             else:
                 await context.bot.send_message(chat_id=chat_id, text=f"⚠️ {side_text} attempt for {symbol} returned no result or error.")
             
