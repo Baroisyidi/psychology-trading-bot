@@ -5,7 +5,7 @@ import random
 import time
 import pandas as pd
 from datetime import datetime
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict
 from dotenv import load_dotenv
 from pybit.unified_trading import HTTP
 from telegram import Update
@@ -61,6 +61,7 @@ except Exception as e:
 symbol_trends: dict[str, Optional[str]] = {}
 monitored_symbols: list[str] = []
 symbol_open_trade_side: dict[str, Optional[str]] = {}
+symbol_manual_quantities: dict[str, Optional[float]] = {} # New: store manual quantity override
 
 # ATR Multiplier for the buffer zone
 ATR_MULTIPLIER = 1.5
@@ -203,7 +204,14 @@ async def get_instrument_constraints(symbol: str) -> Tuple[float, float, float, 
 
 async def get_trade_qty(symbol: str) -> float:
     try:
-        # Offload blocking API call to a thread
+        # 1. Check for manual quantity override
+        if symbol in symbol_manual_quantities and symbol_manual_quantities[symbol] is not None:
+            manual_qty = symbol_manual_quantities[symbol]
+            # Still respect the minimum order quantity
+            min_qty, _, _, _ = await get_instrument_constraints(symbol)
+            return max(manual_qty, min_qty)
+
+        # 2. Fallback to balance-based calculation (20% risk)
         balance_resp = await asyncio.to_thread(
             bybit_session.get_wallet_balance,
             accountType="UNIFIED"
@@ -466,25 +474,51 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
             f"• {symbol} current market state: {current_market_state.upper()}\n"
             f"• {trade_status}"
         )
+        if symbol in symbol_manual_quantities and symbol_manual_quantities[symbol] is not None:
+            report_msg += f"\n• Manual Quantity: {symbol_manual_quantities[symbol]}"
+        else:
+            report_msg += "\n• Auto-sizing: 20% Balance"
+            
         await context.bot.send_message(chat_id=chat_id, text=report_msg)
         context.job.data["last_report_time"] = current_time
 
 async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        await update.message.reply_text("Usage: /add_symbol <symbol> e.g. /add_symbol BTCUSDT")
+        await update.message.reply_text("Usage:\n/add_symbol <symbol> (Auto-size 20% balance)\n/add_symbol <symbol> <quantity> (Manual quantity)")
         return
 
     symbol = context.args[0].upper()
+    manual_qty = None
+    
+    # Check for manual quantity argument
+    if len(context.args) >= 2:
+        try:
+            manual_qty = float(context.args[1])
+            if manual_qty <= 0:
+                await update.message.reply_text("Quantity must be greater than 0.")
+                return
+        except ValueError:
+            await update.message.reply_text("Quantity must be a valid number.")
+            return
+
     if symbol in monitored_symbols:
-        await update.message.reply_text(f"{symbol} is already being monitored.")
+        # If already monitoring, update the quantity setting
+        symbol_manual_quantities[symbol] = manual_qty
+        qty_msg = f"Updated {symbol} settings: Manual Quantity = {manual_qty}" if manual_qty else f"Updated {symbol} settings: Auto-sizing (20% balance)"
+        await update.message.reply_text(qty_msg)
         return
 
     monitored_symbols.append(symbol)
     symbol_trends[symbol] = None
+    symbol_manual_quantities[symbol] = manual_qty
 
     chat_id = update.effective_chat.id
+    
+    qty_info = f"Manual Quantity: {manual_qty}" if manual_qty else "Auto-sizing: 20% of available USDT balance"
+    
     await update.message.reply_text(
         f"Added {symbol} to monitoring!\n"
+        f"• {qty_info}\n"
         "• Timeframe: 30 minutes Ichimoku Conversion Line\n"
         f"• Filter: ATR-based Buffer Zone ({ATR_MULTIPLIER}x ATR)\n"
         "• Monitoring every 1 second\n"
@@ -515,6 +549,8 @@ async def remove_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     monitored_symbols.remove(symbol)
     if symbol in symbol_trends:
         del symbol_trends[symbol]
+    if symbol in symbol_manual_quantities:
+        del symbol_manual_quantities[symbol]
 
     if context.job_queue:
         jobs = context.job_queue.get_jobs_by_name(f"{symbol}_monitor")
@@ -526,9 +562,15 @@ async def remove_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Bot ready!\n"
-        "Use /add_symbol <symbol> to start monitoring (e.g. /add_symbol BTCUSDT)\n"
-        "Use /remove_symbol <symbol> to stop monitoring.\n"
-        "Supports multiple symbols. Trades use 20% of available USDT balance."
+        "Commands:\n"
+        "1. /start - Display this message\n"
+        "2. /add_symbol <symbol> - Start monitoring with auto-sizing (20% balance)\n"
+        "3. /add_symbol <symbol> <quantity> - Start monitoring with manual quantity\n"
+        "4. /remove_symbol <symbol> - Stop monitoring a symbol\n\n"
+        "Examples:\n"
+        "• /add_symbol BTCUSDT\n"
+        "• /add_symbol ETHUSDT 0.5\n"
+        "Supports multiple symbols. Large orders are automatically split into sequential batches."
     )
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
