@@ -61,7 +61,7 @@ except Exception as e:
 symbol_trends: dict[str, Optional[str]] = {}
 monitored_symbols: list[str] = []
 symbol_open_trade_side: dict[str, Optional[str]] = {}
-symbol_manual_quantities: dict[str, Optional[float]] = {} # New: store manual quantity override
+symbol_manual_quantities: dict[str, Optional[float]] = {} # Store manual quantity override
 
 # ATR Multiplier for the buffer zone
 ATR_MULTIPLIER = 1.5
@@ -259,7 +259,10 @@ async def get_trade_qty(symbol: str) -> float:
         min_qty, _, _, _ = await get_instrument_constraints(symbol)
         return min_qty
 
-async def close_position(symbol: str, side_to_close: str = "Buy") -> Optional[dict]:
+async def close_position(symbol: str, side_to_close: str = "Buy") -> Optional[float]:
+    """
+    Closes the position and returns the total closed quantity.
+    """
     try:
         # Offload blocking API call to a thread
         positions_resp = await asyncio.to_thread(
@@ -279,7 +282,6 @@ async def close_position(symbol: str, side_to_close: str = "Buy") -> Optional[di
                 
                 # Split close order if necessary
                 remaining_qty = total_qty
-                last_order = None
                 
                 while remaining_qty > 0:
                     current_batch_qty = min(remaining_qty, max_qty)
@@ -301,23 +303,29 @@ async def close_position(symbol: str, side_to_close: str = "Buy") -> Optional[di
                     
                     if order.get("retCode") != 0:
                         print(f"Close order batch failed for {symbol}: {order.get('retMsg')}")
-                        return order # Return failed order to show error
+                        return None
                     
-                    last_order = order
                     remaining_qty -= current_batch_qty
                     
                     # Short delay between batches if multiple
                     if remaining_qty > 0:
                         await asyncio.sleep(0.5)
                         
-                return last_order
+                return total_qty
         return None
     except Exception as exc:
         print(f"Position close failed for {symbol}: {exc}")
         return None
 
-async def place_trade(symbol: str, side: str = "Buy") -> Optional[dict]:
-    total_qty = await get_trade_qty(symbol)
+async def place_trade(symbol: str, side: str = "Buy", manual_qty_override: Optional[float] = None) -> Optional[dict]:
+    """
+    Places a trade, optionally using a specific manual quantity override for reversals.
+    """
+    if manual_qty_override:
+        total_qty = manual_qty_override
+    else:
+        total_qty = await get_trade_qty(symbol)
+        
     try:
         # Get constraints for max_qty
         min_qty, max_qty, qty_step, _ = await get_instrument_constraints(symbol)
@@ -392,8 +400,14 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
         # If Long is open, only reverse to Short if price breaks BELOW the lower buffer
         if current_price < lower_buffer:
             await context.bot.send_message(chat_id=chat_id, text=f"⚡ INSTANT REVERSAL: {symbol} broke below the LOWER ATR Buffer Zone! Closing Long, opening Short.")
-            await close_position(symbol, side_to_close="Buy")
-            result = await place_trade(symbol, side="Sell")
+            
+            # For manual quantity, capture exact closed quantity to use for reversal
+            closed_qty = await close_position(symbol, side_to_close="Buy")
+            manual_override = None
+            if symbol in symbol_manual_quantities and symbol_manual_quantities[symbol] is not None:
+                manual_override = closed_qty
+                
+            result = await place_trade(symbol, side="Sell", manual_qty_override=manual_override)
             if result and "error" not in result:
                 order_id = result.get("orderId", "—")
                 await context.bot.send_message(chat_id=chat_id, text=f"✅ Short order(s) placed for {symbol}\nLast Order ID: <code>{order_id}</code>", parse_mode="HTML")
@@ -407,8 +421,14 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
         # If Short is open, only reverse to Long if price breaks ABOVE the upper buffer
         if current_price > upper_buffer:
             await context.bot.send_message(chat_id=chat_id, text=f"⚡ INSTANT REVERSAL: {symbol} broke above the UPPER ATR Buffer Zone! Closing Short, opening Long.")
-            await close_position(symbol, side_to_close="Sell")
-            result = await place_trade(symbol, side="Buy")
+            
+            # For manual quantity, capture exact closed quantity to use for reversal
+            closed_qty = await close_position(symbol, side_to_close="Sell")
+            manual_override = None
+            if symbol in symbol_manual_quantities and symbol_manual_quantities[symbol] is not None:
+                manual_override = closed_qty
+                
+            result = await place_trade(symbol, side="Buy", manual_qty_override=manual_override)
             if result and "error" not in result:
                 order_id = result.get("orderId", "—")
                 await context.bot.send_message(chat_id=chat_id, text=f"✅ Long order(s) placed for {symbol}\nLast Order ID: <code>{order_id}</code>", parse_mode="HTML")
@@ -419,7 +439,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
             symbol_open_trade_side[symbol] = "Buy"
             return
 
-    # 2. Initial Trade Logic
+    # 2. Initial Trade Logic (Trend detection)
     if current_open_trade_side is None:
         new_trend = None
         if current_price > conversion_line:
@@ -431,7 +451,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
         if new_trend and (previous_trend is None or new_trend != previous_trend):
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             msg = (
-                f"{ts} — {symbol} initial trend detected: <b>{new_trend.upper()}</b>!\n"
+                f"{ts} — {symbol} trend detected: <b>{new_trend.upper()}</b>!\n"
                 f"Price: {current_price:.2f} | Conversion Line: {conversion_line:.2f}"
             )
             await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
@@ -448,8 +468,6 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                 await context.bot.send_message(chat_id=chat_id, text=f"✅ {side_text} order(s) placed for {symbol}\nLast Order ID: <code>{order_id}</code>", parse_mode="HTML")
             elif result and "error" in result:
                 await context.bot.send_message(chat_id=chat_id, text=f"❌ Failed to place {side_text} for {symbol}: {result['error']}")
-            else:
-                await context.bot.send_message(chat_id=chat_id, text=f"⚠️ {side_text} attempt for {symbol} returned no result or error.")
             
             symbol_trends[symbol] = new_trend
             # Re-check position side after attempt
@@ -484,7 +502,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        await update.message.reply_text("Usage:\n/add_symbol <symbol> (Auto-size 20% balance)\n/add_symbol <symbol> <quantity> (Manual quantity)")
+        await update.message.reply_text("Usage:\n/add_symbol <symbol> (Auto-size 20% balance)\n/add_symbol <symbol> <quantity> (Manual quantity + INSTANT TRADE)")
         return
 
     symbol = context.args[0].upper()
@@ -501,40 +519,58 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             await update.message.reply_text("Quantity must be a valid number.")
             return
 
-    if symbol in monitored_symbols:
-        # If already monitoring, update the quantity setting
-        symbol_manual_quantities[symbol] = manual_qty
-        qty_msg = f"Updated {symbol} settings: Manual Quantity = {manual_qty}" if manual_qty else f"Updated {symbol} settings: Auto-sizing (20% balance)"
-        await update.message.reply_text(qty_msg)
-        return
-
-    monitored_symbols.append(symbol)
-    symbol_trends[symbol] = None
+    # Store settings
     symbol_manual_quantities[symbol] = manual_qty
+    symbol_trends[symbol] = None
+    if symbol not in monitored_symbols:
+        monitored_symbols.append(symbol)
 
     chat_id = update.effective_chat.id
     
-    qty_info = f"Manual Quantity: {manual_qty}" if manual_qty else "Auto-sizing: 20% of available USDT balance"
+    # Handle instant trade for manual quantity
+    if manual_qty:
+        await update.message.reply_text(f"🚀 INSTANT TRADE for {symbol} with quantity {manual_qty}...")
+        
+        # Determine trend instantly
+        conversion_line, _, _, current_price = await get_ichimoku_and_atr(symbol)
+        if conversion_line and current_price:
+            side = "Buy" if current_price > conversion_line else "Sell"
+            side_text = "Long (Buy)" if side == "Buy" else "Short (Sell)"
+            
+            result = await place_trade(symbol, side=side)
+            if result and "error" not in result:
+                order_id = result.get("orderId", "—")
+                await update.message.reply_text(f"✅ Instant {side_text} placed for {symbol}\nOrder ID: <code>{order_id}</code>", parse_mode="HTML")
+                symbol_trends[symbol] = "upward" if side == "Buy" else "downward"
+            elif result and "error" in result:
+                await update.message.reply_text(f"❌ Failed to place instant {side_text} for {symbol}: {result['error']}")
+        else:
+            await update.message.reply_text(f"⚠️ Could not fetch instant trend for {symbol}. Monitoring will take over.")
+
+    qty_info = f"Manual Quantity: {manual_qty} (Instant Trade Executed)" if manual_qty else "Auto-sizing: 20% of available USDT balance"
     
     await update.message.reply_text(
-        f"Added {symbol} to monitoring!\n"
+        f"Monitoring {symbol}!\n"
         f"• {qty_info}\n"
         "• Timeframe: 30 minutes Ichimoku Conversion Line\n"
         f"• Filter: ATR-based Buffer Zone ({ATR_MULTIPLIER}x ATR)\n"
         "• Monitoring every 1 second\n"
         "• Status report every 30 minutes\n"
-        "Initial trade based on Conversion Line. Reversals use full ATR Buffer."
+        "Reversals use full ATR Buffer."
     )
 
     if context.job_queue:
-        context.job_queue.run_repeating(
-            callback=monitor_symbol,
-            interval=1,
-            first=1,
-            chat_id=chat_id,
-            name=f"{symbol}_monitor",
-            data={"symbol": symbol, "last_report_time": time.time()},
-        )
+        # Check if already running to avoid duplicate jobs
+        existing_jobs = context.job_queue.get_jobs_by_name(f"{symbol}_monitor")
+        if not existing_jobs:
+            context.job_queue.run_repeating(
+                callback=monitor_symbol,
+                interval=1,
+                first=1,
+                chat_id=chat_id,
+                name=f"{symbol}_monitor",
+                data={"symbol": symbol, "last_report_time": time.time()},
+            )
 
 async def remove_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
@@ -565,12 +601,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Commands:\n"
         "1. /start - Display this message\n"
         "2. /add_symbol <symbol> - Start monitoring with auto-sizing (20% balance)\n"
-        "3. /add_symbol <symbol> <quantity> - Start monitoring with manual quantity\n"
+        "3. /add_symbol <symbol> <quantity> - INSTANT TRADE + Manual quantity monitoring\n"
         "4. /remove_symbol <symbol> - Stop monitoring a symbol\n\n"
         "Examples:\n"
         "• /add_symbol BTCUSDT\n"
         "• /add_symbol ETHUSDT 0.5\n"
-        "Supports multiple symbols. Large orders are automatically split into sequential batches."
+        "Manual trades place an order instantly and use the same quantity on reversals."
     )
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
