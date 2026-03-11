@@ -190,7 +190,7 @@ async def get_instrument_constraints(symbol: str) -> Tuple[float, float, float, 
         instrument = info["result"]["list"][0]
         lot_filter = instrument["lotSizeFilter"]
         min_qty = float(lot_filter["minOrderQty"])
-        max_qty = float(lot_filter["maxOrderQty"])
+        max_qty = float(lot_filter["maxOrderQty"]) / (1 / float(lot_filter["qtyStep"])) if float(lot_filter["qtyStep"]) < 1 else float(lot_filter["maxOrderQty"])
         qty_step = float(lot_filter["qtyStep"])
         
         # Also get min notional value if available
@@ -538,7 +538,7 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             side_text = "Long (Buy)" if side == "Buy" else "Short (Sell)"
             
             # FIXED: Ensure we use the batching logic for instant trades
-            result = await place_trade(symbol, side=side)
+            result = await place_trade(symbol, side=side, manual_qty_override=manual_qty)
             
             if result and "error" not in result:
                 order_id = result.get("orderId", "—")
