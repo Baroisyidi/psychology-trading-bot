@@ -62,6 +62,7 @@ symbol_trends: dict[str, Optional[str]] = {}
 monitored_symbols: list[str] = []
 symbol_open_trade_side: dict[str, Optional[str]] = {}
 symbol_manual_quantities: dict[str, Optional[float]] = {} # Store manual quantity override
+symbol_last_di_cross_candle: dict[str, Optional[str]] = {}  # Track last DI cross candle to avoid re-triggering
 
 # ATR Multiplier for the buffer zone
 ATR_MULTIPLIER = 1.5
@@ -158,6 +159,128 @@ async def get_ichimoku_and_atr(
     except Exception as exc:
         print(f"Error in get_ichimoku_and_atr for {symbol}: {exc}")
         return None, None, None, None
+
+async def get_all_indicators(
+    symbol: str,
+    interval: str = "30",
+    limit: int = 100,
+) -> Optional[dict]:
+    """
+    Returns a dict with all trading indicators:
+    - conversion_line, atr, ema_20
+    - plus_di, minus_di (current candle)
+    - prev_plus_di, prev_minus_di (previous candle)
+    - di_crossed (bool), di_cross_type ("bullish"/"bearish"/None)
+    - current_price
+    - last_candle_ts (for dedup)
+    """
+    try:
+        resp = await asyncio.to_thread(
+            bybit_session.get_kline,
+            category="linear",
+            symbol=symbol,
+            interval=interval,
+            limit=limit,
+        )
+        klines = resp["result"]["list"]
+        if not klines:
+            raise ValueError("No klines returned")
+
+        df = pd.DataFrame(
+            klines,
+            columns=["timestamp", "open", "high", "low", "close", "volume", "turnover"],
+        ).iloc[::-1].reset_index(drop=True)
+        df["high"] = pd.to_numeric(df["high"], errors="coerce")
+        df["low"] = pd.to_numeric(df["low"], errors="coerce")
+        df["close"] = pd.to_numeric(df["close"], errors="coerce")
+
+        if df["close"].isna().any():
+            raise ValueError("Invalid prices")
+
+        # 1. Ichimoku Conversion Line (Tenkan-sen)
+        nine_period_high = df["high"].rolling(window=9).max()
+        nine_period_low = df["low"].rolling(window=9).min()
+        df["tenkan_sen"] = (nine_period_high + nine_period_low) / 2
+        conversion_line = float(df["tenkan_sen"].iloc[-1])
+
+        # 2. ATR (14) using Wilder's smoothing
+        df["prev_close"] = df["close"].shift(1)
+        df["tr1"] = df["high"] - df["low"]
+        df["tr2"] = (df["high"] - df["prev_close"]).abs()
+        df["tr3"] = (df["low"] - df["prev_close"]).abs()
+        df["tr"] = df[["tr1", "tr2", "tr3"]].max(axis=1)
+        df["atr"] = df["tr"].ewm(alpha=1/14, min_periods=14).mean()
+        atr = float(df["atr"].iloc[-1])
+
+        # 3. 20 EMA (30-minute chart)
+        df["ema_20"] = df["close"].ewm(span=20, adjust=False).mean()
+        ema_20 = float(df["ema_20"].iloc[-1])
+
+        # 4. DMI: +DI / -DI (14-period, Wilder's smoothing)
+        df["up_move"] = df["high"] - df["high"].shift(1)
+        df["down_move"] = df["low"].shift(1) - df["low"]
+
+        df["+dm"] = 0.0
+        df["-dm"] = 0.0
+        plus_dm_mask = (df["up_move"] > df["down_move"]) & (df["up_move"] > 0)
+        minus_dm_mask = (df["down_move"] > df["up_move"]) & (df["down_move"] > 0)
+        df.loc[plus_dm_mask, "+dm"] = df.loc[plus_dm_mask, "up_move"]
+        df.loc[minus_dm_mask, "-dm"] = df.loc[minus_dm_mask, "down_move"]
+
+        # Wilder's smoothing (EMA with alpha=1/14)
+        df["+dm_smooth"] = df["+dm"].ewm(alpha=1/14, min_periods=14).mean()
+        df["-dm_smooth"] = df["-dm"].ewm(alpha=1/14, min_periods=14).mean()
+
+        # +DI and -DI
+        df["+di"] = (df["+dm_smooth"] / df["atr"]) * 100
+        df["-di"] = (df["-dm_smooth"] / df["atr"]) * 100
+
+        plus_di = float(df["+di"].iloc[-1])
+        minus_di = float(df["-di"].iloc[-1])
+        prev_plus_di = float(df["+di"].iloc[-2])
+        prev_minus_di = float(df["-di"].iloc[-2])
+
+        # Detect DI crossover on the latest candle
+        prev_diff = prev_plus_di - prev_minus_di
+        curr_diff = plus_di - minus_di
+
+        di_crossed = False
+        di_cross_type = None
+        if prev_diff <= 0 and curr_diff > 0:
+            di_crossed = True
+            di_cross_type = "bullish"  # +DI crossed above -DI
+        elif prev_diff >= 0 and curr_diff < 0:
+            di_crossed = True
+            di_cross_type = "bearish"  # -DI crossed above +DI
+
+        last_candle_ts = str(df["timestamp"].iloc[-1])
+
+        # 5. Current Price from ticker
+        ticker_resp = await asyncio.to_thread(
+            bybit_session.get_tickers,
+            category="linear",
+            symbol=symbol
+        )
+        ticker = ticker_resp["result"]["list"][0]
+        current_price = float(ticker["lastPrice"])
+
+        return {
+            "conversion_line": conversion_line,
+            "atr": atr,
+            "ema_20": ema_20,
+            "plus_di": plus_di,
+            "minus_di": minus_di,
+            "prev_plus_di": prev_plus_di,
+            "prev_minus_di": prev_minus_di,
+            "di_crossed": di_crossed,
+            "di_cross_type": di_cross_type,
+            "current_price": current_price,
+            "last_candle_ts": last_candle_ts,
+        }
+
+    except Exception as exc:
+        print(f"Error in get_all_indicators for {symbol}: {exc}")
+        return None
 
 async def get_open_position_side(symbol: str) -> Optional[str]:
     try:
@@ -398,84 +521,118 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
     current_open_trade_side = await get_open_position_side(symbol)
     symbol_open_trade_side[symbol] = current_open_trade_side
 
-    conversion_line, atr, last_close, current_price = await get_ichimoku_and_atr(symbol)
-
-    if conversion_line is None or atr is None or current_price is None:
-        print(f"Skipping monitoring for {symbol}: Incomplete data (CL: {conversion_line}, ATR: {atr}, Price: {current_price})")
+    indicators = await get_all_indicators(symbol)
+    if indicators is None:
+        print(f"Skipping monitoring for {symbol}: Could not fetch indicators")
         return
 
-    # Define the Buffer Zone using ATR
-    upper_buffer = conversion_line + (ATR_MULTIPLIER * atr)
-    lower_buffer = conversion_line - (ATR_MULTIPLIER * atr)
-
-    # Determine the current market state relative to the buffer zone
-    if current_price > upper_buffer:
-        current_market_state = "upward"
-    elif current_price < lower_buffer:
-        current_market_state = "downward"
-    else:
-        current_market_state = "neutral" # Inside the buffer zone
+    current_price = indicators["current_price"]
+    ema_20 = indicators["ema_20"]
+    atr = indicators["atr"]
+    plus_di = indicators["plus_di"]
+    minus_di = indicators["minus_di"]
+    di_crossed = indicators["di_crossed"]
+    di_cross_type = indicators["di_cross_type"]
+    last_candle_ts = indicators["last_candle_ts"]
 
     chat_id = context.job.chat_id if context.job else CHAT_ID
 
-    # 1. Handle Reversals (Buffer-to-Buffer Logic)
-    if current_open_trade_side == "Buy":
-        # If Long is open, only reverse to Short if price breaks BELOW the lower buffer
-        if current_price < lower_buffer:
-            await context.bot.send_message(chat_id=chat_id, text=f"⚡ INSTANT REVERSAL: {symbol} broke below the LOWER ATR Buffer Zone! Closing Long, opening Short.")
-            
-            # For manual quantity, capture exact closed quantity to use for reversal
-            closed_qty = await close_position(symbol, side_to_close="Buy")
-            manual_override = None
-            if symbol in symbol_manual_quantities and symbol_manual_quantities[symbol] is not None:
-                manual_override = closed_qty
-                
-            result = await place_trade(symbol, side="Sell", manual_qty_override=manual_override)
-            if result and "error" not in result:
-                order_id = result.get("orderId", "—")
-                await context.bot.send_message(chat_id=chat_id, text=f"✅ Short order(s) placed for {symbol}\nLast Order ID: <code>{order_id}</code>", parse_mode="HTML")
-            elif result and "error" in result:
-                await context.bot.send_message(chat_id=chat_id, text=f"❌ Failed to place Short for {symbol}: {result['error']}")
-            
-            symbol_trends[symbol] = "downward"
-            symbol_open_trade_side[symbol] = "Sell"
-            return
-    elif current_open_trade_side == "Sell":
-        # If Short is open, only reverse to Long if price breaks ABOVE the upper buffer
-        if current_price > upper_buffer:
-            await context.bot.send_message(chat_id=chat_id, text=f"⚡ INSTANT REVERSAL: {symbol} broke above the UPPER ATR Buffer Zone! Closing Short, opening Long.")
-            
-            # For manual quantity, capture exact closed quantity to use for reversal
-            closed_qty = await close_position(symbol, side_to_close="Sell")
-            manual_override = None
-            if symbol in symbol_manual_quantities and symbol_manual_quantities[symbol] is not None:
-                manual_override = closed_qty
-                
-            result = await place_trade(symbol, side="Buy", manual_qty_override=manual_override)
-            if result and "error" not in result:
-                order_id = result.get("orderId", "—")
-                await context.bot.send_message(chat_id=chat_id, text=f"✅ Long order(s) placed for {symbol}\nLast Order ID: <code>{order_id}</code>", parse_mode="HTML")
-            elif result and "error" in result:
-                await context.bot.send_message(chat_id=chat_id, text=f"❌ Failed to place Long for {symbol}: {result['error']}")
-            
-            symbol_trends[symbol] = "upward"
-            symbol_open_trade_side[symbol] = "Buy"
-            return
+    # Determine market state relative to 20 EMA
+    if current_price > ema_20:
+        current_market_state = "ABOVE 20 EMA (Bullish)"
+    elif current_price < ema_20:
+        current_market_state = "BELOW 20 EMA (Bearish)"
+    else:
+        current_market_state = "AT 20 EMA (Neutral)"
 
-    # 2. Initial Trade Logic (Trend detection)
+    # ──────────────────────────────────────────────
+    # 1. Handle Reversals (+DI/-DI Cross + 20 EMA confirmation)
+    # ──────────────────────────────────────────────
+    if current_open_trade_side is not None:
+        last_acted_ts = symbol_last_di_cross_candle.get(symbol)
+
+        if di_crossed and last_candle_ts != last_acted_ts:
+            # +DI/-DI crossover detected on a new candle we haven't acted on yet
+
+            if current_price < ema_20 and current_open_trade_side == "Buy":
+                # DI cross + price below 20 EMA → Close Long, open Short
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"⚡ REVERSAL SIGNAL for {symbol}!\n"
+                        f"+DI/-DI crossover detected ({di_cross_type})\n"
+                        f"+DI: {plus_di:.2f} | -DI: {minus_di:.2f}\n"
+                        f"Price ({current_price}) < 20 EMA ({ema_20:.6g})\n"
+                        f"Closing Long → Opening Short"
+                    )
+                )
+
+                closed_qty = await close_position(symbol, side_to_close="Buy")
+                manual_override = None
+                if symbol in symbol_manual_quantities and symbol_manual_quantities[symbol] is not None:
+                    manual_override = closed_qty
+
+                result = await place_trade(symbol, side="Sell", manual_qty_override=manual_override)
+                if result and "error" not in result:
+                    order_id = result.get("orderId", "—")
+                    await context.bot.send_message(chat_id=chat_id, text=f"✅ Short order(s) placed for {symbol}\nLast Order ID: <code>{order_id}</code>", parse_mode="HTML")
+                elif result and "error" in result:
+                    await context.bot.send_message(chat_id=chat_id, text=f"❌ Failed to place Short for {symbol}: {result['error']}")
+
+                symbol_trends[symbol] = "downward"
+                symbol_open_trade_side[symbol] = "Sell"
+                symbol_last_di_cross_candle[symbol] = last_candle_ts
+                return
+
+            elif current_price > ema_20 and current_open_trade_side == "Sell":
+                # DI cross + price above 20 EMA → Close Short, open Long
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"⚡ REVERSAL SIGNAL for {symbol}!\n"
+                        f"+DI/-DI crossover detected ({di_cross_type})\n"
+                        f"+DI: {plus_di:.2f} | -DI: {minus_di:.2f}\n"
+                        f"Price ({current_price}) > 20 EMA ({ema_20:.6g})\n"
+                        f"Closing Short → Opening Long"
+                    )
+                )
+
+                closed_qty = await close_position(symbol, side_to_close="Sell")
+                manual_override = None
+                if symbol in symbol_manual_quantities and symbol_manual_quantities[symbol] is not None:
+                    manual_override = closed_qty
+
+                result = await place_trade(symbol, side="Buy", manual_qty_override=manual_override)
+                if result and "error" not in result:
+                    order_id = result.get("orderId", "—")
+                    await context.bot.send_message(chat_id=chat_id, text=f"✅ Long order(s) placed for {symbol}\nLast Order ID: <code>{order_id}</code>", parse_mode="HTML")
+                elif result and "error" in result:
+                    await context.bot.send_message(chat_id=chat_id, text=f"❌ Failed to place Long for {symbol}: {result['error']}")
+
+                symbol_trends[symbol] = "upward"
+                symbol_open_trade_side[symbol] = "Buy"
+                symbol_last_di_cross_candle[symbol] = last_candle_ts
+                return
+
+    # ──────────────────────────────────────────────
+    # 2. Initial Trade Logic (20 EMA based)
+    #    Long only if price > 20 EMA
+    #    Short only if price < 20 EMA
+    # ──────────────────────────────────────────────
     if current_open_trade_side is None:
         new_trend = None
-        if current_price > conversion_line:
+        if current_price > ema_20:
             new_trend = "upward"
-        elif current_price < conversion_line:
+        elif current_price < ema_20:
             new_trend = "downward"
-        
-        # We act if it's the first run (previous_trend is None) OR if the trend has flipped
+
+        # Act if it's the first run (previous_trend is None) OR if the trend has flipped
         if new_trend and (previous_trend is None or new_trend != previous_trend):
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             msg = (
                 f"{ts} — {symbol} trend detected: <b>{new_trend.upper()}</b>!\n"
-                f"Price: {current_price:.2f} | Conversion Line: {conversion_line:.2f}"
+                f"Price: {current_price} | 20 EMA: {ema_20:.6g}\n"
+                f"+DI: {plus_di:.2f} | -DI: {minus_di:.2f}"
             )
             await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
 
@@ -491,15 +648,16 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                 await context.bot.send_message(chat_id=chat_id, text=f"✅ {side_text} order(s) placed for {symbol}\nLast Order ID: <code>{order_id}</code>", parse_mode="HTML")
             elif result and "error" in result:
                 await context.bot.send_message(chat_id=chat_id, text=f"❌ Failed to place {side_text} for {symbol}: {result['error']}")
-            
+
             symbol_trends[symbol] = new_trend
-            # Re-check position side after attempt
             symbol_open_trade_side[symbol] = await get_open_position_side(symbol)
 
-    # 3. 30-Minute Status Report Logic
+    # ──────────────────────────────────────────────
+    # 3. 30-Minute Status Report
+    # ──────────────────────────────────────────────
     current_time = time.time()
     last_report_time = context.job.data.get("last_report_time", 0)
-    
+
     if current_time - last_report_time >= 1800:
         trade_status = "No open trade"
         if current_open_trade_side:
@@ -509,17 +667,18 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
 
         report_msg = (
             f"Still monitoring {symbol}\n"
-            f"• Timeframe: 30 minutes Ichimoku Conversion Line\n"
-            f"• Filter: ATR-based Buffer Zone ({ATR_MULTIPLIER}x ATR)\n"
+            f"• Entry Filter: Price vs 20 EMA (30m)\n"
+            f"• Reversal Trigger: +DI/-DI crossover (30m) + 20 EMA confirmation\n"
             f"• Monitoring every 1 second\n"
-            f"• {symbol} current market state: {current_market_state.upper()}\n"
+            f"• 20 EMA: {ema_20:.6g} | +DI: {plus_di:.2f} | -DI: {minus_di:.2f}\n"
+            f"• {symbol} state: {current_market_state}\n"
             f"• {trade_status}"
         )
         if symbol in symbol_manual_quantities and symbol_manual_quantities[symbol] is not None:
             report_msg += f"\n• Manual Quantity: {symbol_manual_quantities[symbol]}"
         else:
             report_msg += "\n• Auto-sizing: 20% Balance"
-            
+
         await context.bot.send_message(chat_id=chat_id, text=report_msg)
         context.job.data["last_report_time"] = current_time
 
@@ -554,13 +713,24 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if manual_qty:
         await update.message.reply_text(f"🚀 INSTANT TRADE for {symbol} with quantity {manual_qty}...")
         
-        # Determine trend instantly
-        conversion_line, _, _, current_price = await get_ichimoku_and_atr(symbol)
-        if conversion_line and current_price:
-            side = "Buy" if current_price > conversion_line else "Sell"
+        # Determine trend using 20 EMA
+        indicators = await get_all_indicators(symbol)
+        if indicators and indicators["current_price"]:
+            current_price = indicators["current_price"]
+            ema_20 = indicators["ema_20"]
+            plus_di = indicators["plus_di"]
+            minus_di = indicators["minus_di"]
+            
+            # Long if price > 20 EMA, Short if price < 20 EMA
+            side = "Buy" if current_price > ema_20 else "Sell"
             side_text = "Long (Buy)" if side == "Buy" else "Short (Sell)"
             
-            # FIXED: Ensure we use the batching logic for instant trades
+            await update.message.reply_text(
+                f"📊 {symbol}: Price={current_price} | 20 EMA={ema_20:.6g}\n"
+                f"+DI: {plus_di:.2f} | -DI: {minus_di:.2f}\n"
+                f"Direction: {side_text}"
+            )
+            
             result = await place_trade(symbol, side=side, manual_qty_override=manual_qty)
             
             if result and "error" not in result:
@@ -570,18 +740,17 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             elif result and "error" in result:
                 await update.message.reply_text(f"❌ Failed to place instant {side_text} for {symbol}: {result['error']}")
         else:
-            await update.message.reply_text(f"⚠️ Could not fetch instant trend for {symbol}. Monitoring will take over.")
+            await update.message.reply_text(f"⚠️ Could not fetch indicators for {symbol}. Monitoring will take over.")
 
     qty_info = f"Manual Quantity: {manual_qty} (Instant Trade Executed)" if manual_qty else "Auto-sizing: 20% of available USDT balance"
     
     await update.message.reply_text(
         f"Monitoring {symbol}!\n"
         f"• {qty_info}\n"
-        "• Timeframe: 30 minutes Ichimoku Conversion Line\n"
-        f"• Filter: ATR-based Buffer Zone ({ATR_MULTIPLIER}x ATR)\n"
+        "• Entry: Price vs 20 EMA (30m chart)\n"
+        "• Reversals: +DI/-DI crossover (30m) + Price vs 20 EMA\n"
         "• Monitoring every 1 second\n"
-        "• Status report every 30 minutes\n"
-        "Reversals use full ATR Buffer."
+        "• Status report every 30 minutes"
     )
 
     if context.job_queue:
@@ -612,6 +781,8 @@ async def remove_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         del symbol_trends[symbol]
     if symbol in symbol_manual_quantities:
         del symbol_manual_quantities[symbol]
+    if symbol in symbol_last_di_cross_candle:
+        del symbol_last_di_cross_candle[symbol]
 
     if context.job_queue:
         jobs = context.job_queue.get_jobs_by_name(f"{symbol}_monitor")
@@ -628,6 +799,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "2. /add_symbol <symbol> - Start monitoring with auto-sizing (20% balance)\n"
         "3. /add_symbol <symbol> <quantity> - INSTANT TRADE + Manual quantity monitoring\n"
         "4. /remove_symbol <symbol> - Stop monitoring a symbol\n\n"
+        "Strategy:\n"
+        "• Initial Entry: Long if Price > 20 EMA (30m), Short if Price < 20 EMA (30m)\n"
+        "• Reversals: Only when +DI/-DI crossover occurs (30m), then direction based on Price vs 20 EMA\n\n"
         "Examples:\n"
         "• /add_symbol BTCUSDT\n"
         "• /add_symbol ETHUSDT 0.5\n"
