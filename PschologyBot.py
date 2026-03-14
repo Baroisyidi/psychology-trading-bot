@@ -71,7 +71,7 @@ symbol_entry_price: dict[str, Optional[float]] = {}
 symbol_entry_atr: dict[str, Optional[float]] = {}
 symbol_peak_price: dict[str, Optional[float]] = {}
 symbol_trailing_active: dict[str, bool] = {}
-symbol_partial_taken: dict[str, bool] = {}  # Track if 50% trailing profit has been taken
+symbol_partial_taken: dict[str, bool] = {}  # Track if 60% trailing profit has been taken
 
 # ────────────────────────────────────────────────
 #  Constants
@@ -81,7 +81,7 @@ ADX_THRESHOLD = 20           # Only trade when ADX > 20 (trending)
 STOP_LOSS_ATR_MULT = 2.0    # Stop-loss at 2x ATR from entry
 TRAILING_ACTIVATE_ATR = 1.5  # Activate trailing stop after 1.5x ATR profit
 TRAILING_STOP_ATR = 1.0      # Trailing stop distance: 1x ATR from peak
-TRAILING_CLOSE_PCT = 0.50    # Close 50% of position when trailing stop hits
+TRAILING_CLOSE_PCT = 0.50    # Close 60% of position when trailing stop hits
 POLL_INTERVAL_SECONDS = 30   # Poll every 30 seconds (was 1 second)
 
 MOTIVATIONAL_QUOTES = [
@@ -470,7 +470,7 @@ async def close_position(symbol: str, side_to_close: str = "Buy") -> Optional[fl
 
 async def close_partial_position(symbol: str, side_to_close: str = "Buy", close_pct: float = 0.50) -> Optional[float]:
     """
-    Closes a percentage of the position (e.g., 50%) and returns the closed quantity.
+    Closes a percentage of the position (e.g., 60%) and returns the closed quantity.
     Does NOT clear risk management state — the remaining position stays open.
     """
     try:
@@ -692,7 +692,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                 return
 
         # ── Trailing Stop Check (1x ATR from peak after 1.5x ATR profit) ──
-        # When trailing stop hits: close 50% of position, let remaining 50% ride.
+        # When trailing stop hits: close 60% of position, let remaining 60% ride.
         trailing_active = symbol_trailing_active.get(symbol, False)
         partial_taken = symbol_partial_taken.get(symbol, False)
 
@@ -971,7 +971,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
             if peak:
                 risk_info += f"\n\u2022 Peak Price: {peak:.6g}"
             partial_taken_flag = symbol_partial_taken.get(symbol, False)
-            trailing_status = 'ACTIVE (50% taken)' if partial_taken_flag else ('ACTIVE' if trailing else 'Not yet')
+            trailing_status = 'ACTIVE (60% taken)' if partial_taken_flag else ('ACTIVE' if trailing else 'Not yet')
             risk_info += f"\n\u2022 Trailing Stop: {trailing_status}"
 
         report_msg = (
