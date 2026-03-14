@@ -71,6 +71,7 @@ symbol_entry_price: dict[str, Optional[float]] = {}
 symbol_entry_atr: dict[str, Optional[float]] = {}
 symbol_peak_price: dict[str, Optional[float]] = {}
 symbol_trailing_active: dict[str, bool] = {}
+symbol_partial_taken: dict[str, bool] = {}  # Track if 50% trailing profit has been taken
 
 # ────────────────────────────────────────────────
 #  Constants
@@ -80,6 +81,7 @@ ADX_THRESHOLD = 20           # Only trade when ADX > 20 (trending)
 STOP_LOSS_ATR_MULT = 2.0    # Stop-loss at 2x ATR from entry
 TRAILING_ACTIVATE_ATR = 1.5  # Activate trailing stop after 1.5x ATR profit
 TRAILING_STOP_ATR = 1.0      # Trailing stop distance: 1x ATR from peak
+TRAILING_CLOSE_PCT = 0.50    # Close 50% of position when trailing stop hits
 POLL_INTERVAL_SECONDS = 30   # Poll every 30 seconds (was 1 second)
 
 MOTIVATIONAL_QUOTES = [
@@ -466,12 +468,76 @@ async def close_position(symbol: str, side_to_close: str = "Buy") -> Optional[fl
         return None
 
 
+async def close_partial_position(symbol: str, side_to_close: str = "Buy", close_pct: float = 0.50) -> Optional[float]:
+    """
+    Closes a percentage of the position (e.g., 50%) and returns the closed quantity.
+    Does NOT clear risk management state — the remaining position stays open.
+    """
+    try:
+        positions_resp = await asyncio.to_thread(
+            bybit_session.get_positions,
+            category="linear",
+            symbol=symbol
+        )
+        positions = positions_resp["result"]["list"]
+
+        for pos in positions:
+            if pos["side"] == side_to_close and float(pos["size"]) > 0:
+                close_side = "Sell" if side_to_close == "Buy" else "Buy"
+                total_qty = float(pos["size"])
+
+                min_qty, max_qty, qty_step, _ = await get_instrument_constraints(symbol)
+
+                # Calculate the partial quantity to close
+                partial_qty = total_qty * close_pct
+                partial_qty = round_qty_to_step(partial_qty, qty_step, min_qty)
+
+                # If partial_qty equals total position (e.g., position too small to split), close all
+                if partial_qty >= total_qty:
+                    partial_qty = total_qty
+
+                remaining_to_close = partial_qty
+
+                while remaining_to_close > 0:
+                    current_batch_qty = min(remaining_to_close, max_qty)
+                    current_batch_qty = round_qty_to_step(current_batch_qty, qty_step, min_qty)
+
+                    qty_str = format_qty_str(current_batch_qty, qty_step)
+
+                    order = await asyncio.to_thread(
+                        bybit_session.place_order,
+                        category="linear",
+                        symbol=symbol,
+                        side=close_side,
+                        orderType="Market",
+                        qty=qty_str,
+                        reduceOnly=True,
+                    )
+
+                    if order.get("retCode") != 0:
+                        print(f"Partial close batch failed for {symbol}: {order.get('retMsg')}")
+                        return None
+
+                    remaining_to_close -= current_batch_qty
+
+                    if remaining_to_close > 0:
+                        await asyncio.sleep(0.5)
+
+                print(f"[INFO] {symbol}: Partially closed {partial_qty} of {total_qty} ({close_pct*100:.0f}%)")
+                return partial_qty
+        return None
+    except Exception as exc:
+        print(f"Partial position close failed for {symbol}: {exc}")
+        return None
+
+
 def _clear_risk_state(symbol: str) -> None:
     """Clear per-symbol risk management tracking after closing a position."""
     symbol_entry_price[symbol] = None
     symbol_entry_atr[symbol] = None
     symbol_peak_price[symbol] = None
     symbol_trailing_active[symbol] = False
+    symbol_partial_taken[symbol] = False
 
 
 def _set_entry_risk_state(symbol: str, entry_price: float, atr: float) -> None:
@@ -480,6 +546,7 @@ def _set_entry_risk_state(symbol: str, entry_price: float, atr: float) -> None:
     symbol_entry_atr[symbol] = atr
     symbol_peak_price[symbol] = entry_price
     symbol_trailing_active[symbol] = False
+    symbol_partial_taken[symbol] = False
 
 
 async def place_trade(symbol: str, side: str = "Buy", manual_qty_override: Optional[float] = None) -> Optional[dict]:
@@ -625,7 +692,9 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                 return
 
         # ── Trailing Stop Check (1x ATR from peak after 1.5x ATR profit) ──
+        # When trailing stop hits: close 50% of position, let remaining 50% ride.
         trailing_active = symbol_trailing_active.get(symbol, False)
+        partial_taken = symbol_partial_taken.get(symbol, False)
 
         if current_open_trade_side == "Buy":
             unrealized_profit = peak - entry_price
@@ -638,25 +707,34 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                         text=(
                             f"\U0001f4c8 TRAILING STOP ACTIVATED for {symbol} (Long)\n"
                             f"Profit reached {TRAILING_ACTIVATE_ATR}x ATR ({unrealized_profit:.6g})\n"
-                            f"Trailing at {TRAILING_STOP_ATR}x ATR below peak ({peak:.6g})"
+                            f"Trailing at {TRAILING_STOP_ATR}x ATR below peak ({peak:.6g})\n"
+                            f"Will close {TRAILING_CLOSE_PCT*100:.0f}% on hit, rest rides."
                         )
                     )
 
-            if trailing_active:
+            if trailing_active and not partial_taken:
                 trailing_stop_price = peak - (TRAILING_STOP_ATR * entry_atr)
                 if last_close <= trailing_stop_price:
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=(
-                            f"\U0001f3c1 TRAILING STOP HIT for {symbol} (Long)\n"
-                            f"Peak: {peak:.6g} | Trail: {trailing_stop_price:.6g}\n"
-                            f"Last Close: {last_close}\n"
-                            f"Profits locked. Going FLAT."
+                    closed_qty = await close_partial_position(symbol, side_to_close="Buy", close_pct=TRAILING_CLOSE_PCT)
+                    symbol_partial_taken[symbol] = True
+                    remaining_side = await get_open_position_side(symbol)
+                    if closed_qty:
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=(
+                                f"\U0001f3c1 TRAILING STOP HIT for {symbol} (Long)\n"
+                                f"Peak: {peak:.6g} | Trail: {trailing_stop_price:.6g}\n"
+                                f"Last Close: {last_close}\n"
+                                f"Closed {TRAILING_CLOSE_PCT*100:.0f}% ({closed_qty}) to lock profits.\n"
+                                f"Remaining {(1-TRAILING_CLOSE_PCT)*100:.0f}% continues riding the trade."
+                            )
                         )
-                    )
-                    await close_position(symbol, side_to_close="Buy")
-                    symbol_trends[symbol] = None
-                    symbol_open_trade_side[symbol] = None
+                    if remaining_side is None:
+                        # Position was too small to split, fully closed
+                        symbol_trends[symbol] = None
+                        symbol_open_trade_side[symbol] = None
+                        _clear_risk_state(symbol)
+                    # If remaining_side is still open, do NOT return — let the rest of the logic continue monitoring
                     return
 
         elif current_open_trade_side == "Sell":
@@ -670,41 +748,51 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                         text=(
                             f"\U0001f4c8 TRAILING STOP ACTIVATED for {symbol} (Short)\n"
                             f"Profit reached {TRAILING_ACTIVATE_ATR}x ATR ({unrealized_profit:.6g})\n"
-                            f"Trailing at {TRAILING_STOP_ATR}x ATR above trough ({peak:.6g})"
+                            f"Trailing at {TRAILING_STOP_ATR}x ATR above trough ({peak:.6g})\n"
+                            f"Will close {TRAILING_CLOSE_PCT*100:.0f}% on hit, rest rides."
                         )
                     )
 
-            if trailing_active:
+            if trailing_active and not partial_taken:
                 trailing_stop_price = peak + (TRAILING_STOP_ATR * entry_atr)
                 if last_close >= trailing_stop_price:
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=(
-                            f"\U0001f3c1 TRAILING STOP HIT for {symbol} (Short)\n"
-                            f"Trough: {peak:.6g} | Trail: {trailing_stop_price:.6g}\n"
-                            f"Last Close: {last_close}\n"
-                            f"Profits locked. Going FLAT."
+                    closed_qty = await close_partial_position(symbol, side_to_close="Sell", close_pct=TRAILING_CLOSE_PCT)
+                    symbol_partial_taken[symbol] = True
+                    remaining_side = await get_open_position_side(symbol)
+                    if closed_qty:
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=(
+                                f"\U0001f3c1 TRAILING STOP HIT for {symbol} (Short)\n"
+                                f"Trough: {peak:.6g} | Trail: {trailing_stop_price:.6g}\n"
+                                f"Last Close: {last_close}\n"
+                                f"Closed {TRAILING_CLOSE_PCT*100:.0f}% ({closed_qty}) to lock profits.\n"
+                                f"Remaining {(1-TRAILING_CLOSE_PCT)*100:.0f}% continues riding the trade."
+                            )
                         )
-                    )
-                    await close_position(symbol, side_to_close="Sell")
-                    symbol_trends[symbol] = None
-                    symbol_open_trade_side[symbol] = None
+                    if remaining_side is None:
+                        # Position was too small to split, fully closed
+                        symbol_trends[symbol] = None
+                        symbol_open_trade_side[symbol] = None
+                        _clear_risk_state(symbol)
                     return
 
     # ──────────────────────────────────────────────
     # 2. EXIT + POSSIBLE REVERSAL (Decoupled)
-    #    Exit if price crosses EMA. Reverse ONLY if DI + ADX confirm.
-    #    Otherwise go FLAT.
+    #    Exit requires: price crosses EMA AND DI crossover.
+    #    Reverse ONLY if DI + ADX confirm. Otherwise go FLAT.
     # ──────────────────────────────────────────────
     if current_open_trade_side is not None:
 
-        # ── Long Exit: close price dropped below 20 EMA ──
-        if current_open_trade_side == "Buy" and last_close < ema_20:
+        # ── Long Exit: close price below 20 EMA AND DI crossover ──
+        if current_open_trade_side == "Buy" and last_close < ema_20 and di_crossed:
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=(
                     f"\u26a0\ufe0f EXIT SIGNAL for {symbol} (Long)\n"
                     f"Last Close ({last_close}) < 20 EMA ({ema_20:.6g})\n"
+                    f"DI Crossover detected ({di_cross_type})\n"
+                    f"+DI: {plus_di:.2f} | -DI: {minus_di:.2f}\n"
                     f"Closing Long position..."
                 )
             )
@@ -750,13 +838,15 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                 symbol_open_trade_side[symbol] = None
             return
 
-        # ── Short Exit: close price rose above 20 EMA ──
-        elif current_open_trade_side == "Sell" and last_close > ema_20:
+        # ── Short Exit: close price above 20 EMA AND DI crossover ──
+        elif current_open_trade_side == "Sell" and last_close > ema_20 and di_crossed:
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=(
                     f"\u26a0\ufe0f EXIT SIGNAL for {symbol} (Short)\n"
                     f"Last Close ({last_close}) > 20 EMA ({ema_20:.6g})\n"
+                    f"DI Crossover detected ({di_cross_type})\n"
+                    f"+DI: {plus_di:.2f} | -DI: {minus_di:.2f}\n"
                     f"Closing Short position..."
                 )
             )
@@ -880,14 +970,16 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             if peak:
                 risk_info += f"\n\u2022 Peak Price: {peak:.6g}"
-            risk_info += f"\n\u2022 Trailing Stop: {'ACTIVE' if trailing else 'Not yet'}"
+            partial_taken_flag = symbol_partial_taken.get(symbol, False)
+            trailing_status = 'ACTIVE (50% taken)' if partial_taken_flag else ('ACTIVE' if trailing else 'Not yet')
+            risk_info += f"\n\u2022 Trailing Stop: {trailing_status}"
 
         report_msg = (
             f"Still monitoring {symbol}\n"
             f"\u2022 Entry: EMA + DI alignment + ADX > {ADX_THRESHOLD}\n"
-            f"\u2022 Exit: Price < EMA (Long) or > EMA (Short)\n"
+            f"\u2022 Exit: Price crosses EMA + DI crossover required\n"
             f"\u2022 Reverse: Only if DI + ADX confirm, else FLAT\n"
-            f"\u2022 Stop-Loss: {STOP_LOSS_ATR_MULT}x ATR | Trailing: {TRAILING_STOP_ATR}x ATR after {TRAILING_ACTIVATE_ATR}x ATR profit\n"
+            f"\u2022 Stop-Loss: {STOP_LOSS_ATR_MULT}x ATR | Trailing: closes {TRAILING_CLOSE_PCT*100:.0f}% at {TRAILING_STOP_ATR}x ATR after {TRAILING_ACTIVATE_ATR}x ATR profit\n"
             f"\u2022 Monitoring every {POLL_INTERVAL_SECONDS} seconds (candle close)\n"
             f"\u2022 20 EMA: {ema_20:.6g} | +DI: {plus_di:.2f} | -DI: {minus_di:.2f} | ADX: {adx:.2f}\n"
             f"\u2022 Last Close: {last_close} | Current Price: {current_price}\n"
@@ -1002,9 +1094,9 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"Monitoring {symbol}!\n"
         f"\u2022 {qty_info}\n"
         f"\u2022 Entry: Last Close vs 20 EMA + DI alignment + ADX > {ADX_THRESHOLD}\n"
-        f"\u2022 Exit: Price crosses 20 EMA (decoupled from reversal)\n"
+        f"\u2022 Exit: Price crosses 20 EMA + DI crossover required\n"
         f"\u2022 Reverse only if DI + ADX confirm, else FLAT\n"
-        f"\u2022 Stop-Loss: {STOP_LOSS_ATR_MULT}x ATR | Trailing: {TRAILING_STOP_ATR}x ATR after {TRAILING_ACTIVATE_ATR}x ATR profit\n"
+        f"\u2022 Stop-Loss: {STOP_LOSS_ATR_MULT}x ATR | Trailing: closes {TRAILING_CLOSE_PCT*100:.0f}% at {TRAILING_STOP_ATR}x ATR after {TRAILING_ACTIVATE_ATR}x ATR profit\n"
         f"\u2022 Monitoring every {POLL_INTERVAL_SECONDS} seconds (candle close decisions)\n"
         f"\u2022 Status report every 30 minutes"
     )
@@ -1039,7 +1131,7 @@ async def remove_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if symbol in symbol_last_di_cross_candle:
         del symbol_last_di_cross_candle[symbol]
     # Clean up risk management state
-    for state_dict in [symbol_entry_price, symbol_entry_atr, symbol_peak_price, symbol_trailing_active]:
+    for state_dict in [symbol_entry_price, symbol_entry_atr, symbol_peak_price, symbol_trailing_active, symbol_partial_taken]:
         if symbol in state_dict:
             del state_dict[symbol]
 
@@ -1061,9 +1153,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Strategy Improvements:\n"
         f"\u2022 ADX > {ADX_THRESHOLD} filter (no trades in sideways markets)\n"
         f"\u2022 ATR stop-loss ({STOP_LOSS_ATR_MULT}x ATR from entry)\n"
-        f"\u2022 Trailing stop ({TRAILING_STOP_ATR}x ATR from peak after {TRAILING_ACTIVATE_ATR}x ATR profit)\n"
+        f"\u2022 Trailing stop: closes {TRAILING_CLOSE_PCT*100:.0f}% at {TRAILING_STOP_ATR}x ATR from peak after {TRAILING_ACTIVATE_ATR}x ATR profit\n"
         "\u2022 EMA + DI alignment required for entry\n"
-        "\u2022 Decoupled exit/reversal (can go FLAT)\n"
+        "\u2022 Exit requires: EMA cross + DI crossover (decoupled from reversal)\n"
         f"\u2022 Polls every {POLL_INTERVAL_SECONDS}s using closed candle price\n\n"
         "Examples:\n"
         "\u2022 /add_symbol BTCUSDT\n"
