@@ -78,15 +78,33 @@ symbol_trail_order_id: dict[str, Optional[str]] = {}  # Conditional order ID for
 symbol_trail_qty: dict[str, Optional[float]] = {}     # 60% qty under trailing stop order
 symbol_trail_price: dict[str, Optional[float]] = {}   # Current trailing stop trigger price
 
+# Stage 2 trailing stop (30% of original position, after 60% closed)
+symbol_stage2_active: dict[str, bool] = {}             # Is stage 2 trailing active?
+symbol_stage2_taken: dict[str, bool] = {}              # Has stage 2 trail been filled?
+symbol_trail2_order_id: dict[str, Optional[str]] = {}  # Conditional order ID for stage 2 trail
+symbol_trail2_qty: dict[str, Optional[float]] = {}     # Stage 2 trail qty
+symbol_trail2_price: dict[str, Optional[float]] = {}   # Stage 2 trail trigger price
+symbol_peak_stage2: dict[str, Optional[float]] = {}    # Peak price tracking for stage 2
+
+# Tiered stop-loss tracking
+symbol_sl1_order_id: dict[str, Optional[str]] = {}     # Conditional order for 30% at 1.5x ATR
+symbol_sl1_qty: dict[str, Optional[float]] = {}        # Qty for the 30% SL order
+symbol_sl1_taken: dict[str, bool] = {}                 # Has 30% SL at 1.5x ATR been taken?
+symbol_original_qty: dict[str, Optional[float]] = {}   # Original position qty at entry
+
 # ────────────────────────────────────────────────
 #  Constants
 # ────────────────────────────────────────────────
 ATR_MULTIPLIER = 1.5        # Legacy (kept for reference)
 ADX_THRESHOLD = 20           # Only trade when ADX > 20 (trending)
-STOP_LOSS_ATR_MULT = 2.0    # Stop-loss at 2x ATR from entry
+STOP_LOSS_ATR_MULT = 2.0    # Ultimate stop-loss at 2x ATR from entry (closes remaining 70%)
+SL_STAGE1_ATR_MULT = 1.5    # First tier SL at 1.5x ATR (closes 30%)
+SL_STAGE1_CLOSE_PCT = 0.30  # Close 30% of position at first SL level
 TRAILING_ACTIVATE_ATR = 1.5  # Activate trailing stop after 1.5x ATR profit
-TRAILING_STOP_ATR = 1.0      # Trailing stop distance: 1x ATR from peak
-TRAILING_CLOSE_PCT = 0.60    # Close 60% of position when trailing activates (lock profits)
+TRAILING_STOP_ATR = 1.0      # Stage 1 trailing stop distance: 1x ATR from peak
+TRAILING_STOP_ATR_STAGE2 = 1.0  # Stage 2 trailing stop distance: 1x ATR from peak
+TRAILING_CLOSE_PCT = 0.60    # Close 60% of position on stage 1 trail
+TRAILING_STAGE2_PCT = 0.75   # Close 75% of remaining 40% (= 30% of original) on stage 2
 POLL_INTERVAL_SECONDS = 10   # Poll every 10 seconds (faster for risk management)
 
 MOTIVATIONAL_QUOTES = [
@@ -548,6 +566,18 @@ def _clear_risk_state(symbol: str) -> None:
     symbol_trail_order_id[symbol] = None
     symbol_trail_qty[symbol] = None
     symbol_trail_price[symbol] = None
+    # Stage 2 trailing
+    symbol_stage2_active[symbol] = False
+    symbol_stage2_taken[symbol] = False
+    symbol_trail2_order_id[symbol] = None
+    symbol_trail2_qty[symbol] = None
+    symbol_trail2_price[symbol] = None
+    symbol_peak_stage2[symbol] = None
+    # Tiered stop-loss
+    symbol_sl1_order_id[symbol] = None
+    symbol_sl1_qty[symbol] = None
+    symbol_sl1_taken[symbol] = False
+    symbol_original_qty[symbol] = None
 
 
 def _set_entry_risk_state(symbol: str, entry_price: float, atr: float) -> None:
@@ -562,6 +592,18 @@ def _set_entry_risk_state(symbol: str, entry_price: float, atr: float) -> None:
     symbol_trail_order_id[symbol] = None
     symbol_trail_qty[symbol] = None
     symbol_trail_price[symbol] = None
+    # Stage 2 trailing
+    symbol_stage2_active[symbol] = False
+    symbol_stage2_taken[symbol] = False
+    symbol_trail2_order_id[symbol] = None
+    symbol_trail2_qty[symbol] = None
+    symbol_trail2_price[symbol] = None
+    symbol_peak_stage2[symbol] = None
+    # Tiered stop-loss
+    symbol_sl1_order_id[symbol] = None
+    symbol_sl1_qty[symbol] = None
+    symbol_sl1_taken[symbol] = False
+    symbol_original_qty[symbol] = None
 
 
 # ────────────────────────────────────────────────
@@ -711,12 +753,117 @@ async def cancel_trail_stop_order(symbol: str) -> bool:
         return False
 
 
+async def place_conditional_close_order(symbol: str, side: str, qty: float, trigger_price: float) -> Optional[str]:
+    """
+    Place a server-side conditional stop-market order to close a portion of position.
+    Generic function used for SL tiers and stage 2 trailing.
+    Returns order_id if successful, None otherwise.
+    """
+    close_side = "Sell" if side == "Buy" else "Buy"
+    trigger_dir = 2 if side == "Buy" else 1  # 2=falls below, 1=rises above
+
+    try:
+        min_qty, max_qty, qty_step, _ = await get_instrument_constraints(symbol)
+        rounded_qty = round_qty_to_step(qty, qty_step, min_qty)
+        qty_str = format_qty_str(rounded_qty, qty_step)
+
+        resp = await asyncio.to_thread(
+            bybit_session.place_order,
+            category="linear",
+            symbol=symbol,
+            side=close_side,
+            orderType="Market",
+            qty=qty_str,
+            triggerPrice=str(trigger_price),
+            triggerDirection=trigger_dir,
+            triggerBy="LastPrice",
+            reduceOnly=True,
+        )
+        if resp.get("retCode") == 0:
+            order_id = resp.get("result", {}).get("orderId")
+            print(f"[CONDITIONAL] {symbol}: Stop order placed for {rounded_qty} @ {trigger_price:.6g} (order: {order_id})")
+            return order_id
+        else:
+            print(f"[CONDITIONAL] {symbol}: Failed to place - {resp.get('retMsg')}")
+            return None
+    except Exception as e:
+        print(f"[CONDITIONAL] {symbol}: Error placing order: {e}")
+        return None
+
+
+async def amend_conditional_order(symbol: str, order_id: str, new_trigger_price: float) -> bool:
+    """Amend trigger price of any conditional order by ID."""
+    try:
+        resp = await asyncio.to_thread(
+            bybit_session.amend_order,
+            category="linear",
+            symbol=symbol,
+            orderId=order_id,
+            triggerPrice=str(new_trigger_price),
+        )
+        if resp.get("retCode") == 0:
+            print(f"[CONDITIONAL] {symbol}: Order {order_id} amended to {new_trigger_price:.6g}")
+            return True
+        else:
+            print(f"[CONDITIONAL] {symbol}: Amend failed - {resp.get('retMsg')}")
+            return False
+    except Exception as e:
+        print(f"[CONDITIONAL] {symbol}: Error amending: {e}")
+        return False
+
+
+async def cancel_conditional_order_by_id(symbol: str, order_id: str) -> bool:
+    """Cancel a specific conditional order by ID."""
+    try:
+        resp = await asyncio.to_thread(
+            bybit_session.cancel_order,
+            category="linear",
+            symbol=symbol,
+            orderId=order_id,
+        )
+        if resp.get("retCode") == 0:
+            print(f"[CONDITIONAL] {symbol}: Order {order_id} cancelled")
+            return True
+        else:
+            print(f"[CONDITIONAL] {symbol}: Cancel failed - {resp.get('retMsg')} (may already be filled)")
+            return False
+    except Exception as e:
+        print(f"[CONDITIONAL] {symbol}: Error cancelling order: {e}")
+        return False
+
+
+async def cancel_stage2_trail_order(symbol: str) -> bool:
+    """Cancel the stage 2 trailing stop conditional order."""
+    order_id = symbol_trail2_order_id.get(symbol)
+    if not order_id:
+        return True
+    await cancel_conditional_order_by_id(symbol, order_id)
+    symbol_trail2_order_id[symbol] = None
+    symbol_trail2_qty[symbol] = None
+    symbol_trail2_price[symbol] = None
+    symbol_stage2_active[symbol] = False
+    return True
+
+
+async def cancel_sl1_order(symbol: str) -> bool:
+    """Cancel the SL stage 1 (30% at 1.5x ATR) conditional order."""
+    order_id = symbol_sl1_order_id.get(symbol)
+    if not order_id:
+        return True
+    await cancel_conditional_order_by_id(symbol, order_id)
+    symbol_sl1_order_id[symbol] = None
+    symbol_sl1_qty[symbol] = None
+    return True
+
+
 async def cancel_server_stops(symbol: str) -> bool:
     """
-    Cancel all server-side TP/SL/trailing stops + any conditional trail orders.
+    Cancel all server-side TP/SL/trailing stops + any conditional trail/SL orders.
     """
-    # Cancel the conditional trail stop order first (if any)
+    # Cancel conditional orders first
     await cancel_trail_stop_order(symbol)
+    await cancel_stage2_trail_order(symbol)
+    await cancel_sl1_order(symbol)
     try:
         resp = await asyncio.to_thread(
             bybit_session.set_trading_stop,
@@ -826,12 +973,16 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
         current_market_state = "AT 20 EMA (Neutral)"
 
     # ──────────────────────────────────────────────
-    # 1. RISK MANAGEMENT: Server-side stops + client-side backup
-    #    - Server-side SL at 2x ATR (set at entry, Bybit executes instantly)
-    #    - Trailing activation at 1.5x ATR profit: places conditional stop on 60%
-    #    - Trail moves with price; Bybit closes 60% INSTANTLY when trail is hit
-    #    - Remaining 40% has NO stop — exits only on EMA+DI crossover
-    #    - Uses current_price (real-time) for all risk checks
+    # 1. RISK MANAGEMENT: Multi-stage trailing + tiered stop-loss
+    #    STOP-LOSS (price goes against us):
+    #      - Server-side SL at 2x ATR (safety net, closes remaining 70%)
+    #      - Conditional order at 1.5x ATR closes 30% INSTANTLY
+    #      - If price continues to 2x ATR, server SL closes remaining 70%
+    #    TRAILING STOP (price goes in our favor):
+    #      - Stage 1: At 1.5x ATR profit, trail on 60%. Bybit closes INSTANTLY when hit.
+    #      - Stage 2: After 60% closed, trail on 30% (1x ATR distance). Bybit closes INSTANTLY.
+    #      - Stage 3: Remaining 10% has NO trail — exits only on EMA+DI crossover.
+    #    Uses current_price (real-time) for all risk checks
     # ──────────────────────────────────────────────
     if current_open_trade_side is not None:
         entry_price = symbol_entry_price.get(symbol)
@@ -850,13 +1001,30 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                 sl_price = entry_price + (STOP_LOSS_ATR_MULT * entry_atr)
             await set_server_stop_loss(symbol, current_open_trade_side, sl_price)
 
-        # Ensure server-side stop-loss is set (retry if not) — skip if trailing is active (SL was replaced by trail order)
+        # Ensure server-side stop-loss is set (retry if not) — skip if trailing is active
         if not symbol_server_sl_set.get(symbol, False) and not symbol_partial_taken.get(symbol, False) and not symbol_trailing_active.get(symbol, False):
             if current_open_trade_side == "Buy":
                 sl_price = entry_price - (STOP_LOSS_ATR_MULT * entry_atr)
             else:
                 sl_price = entry_price + (STOP_LOSS_ATR_MULT * entry_atr)
             await set_server_stop_loss(symbol, current_open_trade_side, sl_price)
+
+        # Ensure SL1 conditional order (30% at 1.5x ATR) is placed — skip if trailing active or SL1 already taken/set
+        if not symbol_sl1_order_id.get(symbol) and not symbol_sl1_taken.get(symbol, False) and not symbol_trailing_active.get(symbol, False) and not symbol_partial_taken.get(symbol, False):
+            pos_qty = await get_position_size(symbol)
+            if pos_qty:
+                sl1_qty = pos_qty * SL_STAGE1_CLOSE_PCT
+                if current_open_trade_side == "Buy":
+                    sl1_price = entry_price - (SL_STAGE1_ATR_MULT * entry_atr)
+                else:
+                    sl1_price = entry_price + (SL_STAGE1_ATR_MULT * entry_atr)
+                sl1_order_id = await place_conditional_close_order(symbol, current_open_trade_side, sl1_qty, sl1_price)
+                if sl1_order_id:
+                    min_qty, _, qty_step, _ = await get_instrument_constraints(symbol)
+                    symbol_sl1_order_id[symbol] = sl1_order_id
+                    symbol_sl1_qty[symbol] = round_qty_to_step(sl1_qty, qty_step, min_qty)
+                    symbol_original_qty[symbol] = pos_qty
+                    print(f"[SL-TIER1] {symbol}: Placed 30% SL order ({symbol_sl1_qty[symbol]}) at {sl1_price:.6g} (1.5x ATR)")
 
         # Update peak price tracking using REAL-TIME price (not last_close)
         peak = symbol_peak_price.get(symbol, entry_price)
@@ -866,68 +1034,149 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
             peak = min(peak, current_price)
         symbol_peak_price[symbol] = peak
 
-        # ── CLIENT-SIDE BACKUP: ATR Stop-Loss Check using current_price ──
-        # Server-side SL should fire first, but this is a safety net.
-        # Skip this check if trailing is active (full SL was cancelled, trail order handles risk)
-        # or if partial was already taken (remaining 40% has no SL, exits on EMA+DI only).
-        if current_open_trade_side == "Buy" and not symbol_trailing_active.get(symbol, False) and not symbol_partial_taken.get(symbol, False):
-            stop_loss_price = entry_price - (STOP_LOSS_ATR_MULT * entry_atr)
-            if current_price <= stop_loss_price:
+        # ── TIERED STOP-LOSS: Detect SL1 (30% at 1.5x ATR) fill ──
+        # Only check if SL1 order was placed and not yet confirmed as taken, and trailing not active
+        sl1_taken = symbol_sl1_taken.get(symbol, False)
+        if not sl1_taken and symbol_sl1_order_id.get(symbol) and not symbol_trailing_active.get(symbol, False):
+            current_qty = await get_position_size(symbol)
+            original_qty = symbol_original_qty.get(symbol)
+            sl1_qty_val = symbol_sl1_qty.get(symbol)
+
+            if current_qty is not None and original_qty and sl1_qty_val:
+                # If position reduced by roughly the SL1 amount, SL1 has fired
+                if current_qty <= original_qty - (sl1_qty_val * 0.8):
+                    symbol_sl1_taken[symbol] = True
+                    sl1_taken = True
+                    symbol_sl1_order_id[symbol] = None
+                    symbol_sl1_qty[symbol] = None
+                    side_label = "Long" if current_open_trade_side == "Buy" else "Short"
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"\U0001f6d1 SL TIER 1 HIT for {symbol} ({side_label})\n"
+                            f"30% closed at 1.5x ATR loss\n"
+                            f"Entry: {entry_price:.6g} | Current: {current_price:.6g}\n"
+                            f"Remaining 70% protected by server SL at 2x ATR ({STOP_LOSS_ATR_MULT}x ATR)\n"
+                            f"If price recovers, trailing can still activate."
+                        )
+                    )
+            elif current_qty is None:
+                # Position fully gone — both SL tiers may have fired
+                symbol_sl1_taken[symbol] = True
                 await context.bot.send_message(
                     chat_id=chat_id,
                     text=(
-                        f"\U0001f6d1 STOP-LOSS HIT for {symbol} (Long) [Backup check]\n"
-                        f"Entry: {entry_price} | Stop: {stop_loss_price:.6g}\n"
-                        f"Current Price: {current_price} | ATR: {entry_atr:.6g}\n"
-                        f"Loss capped at 2x ATR. Going FLAT.\n"
-                        f"(Server-side SL should have fired first)"
+                        f"\U0001f6d1 FULL STOP-LOSS for {symbol}\n"
+                        f"Position fully closed by stop-loss orders. Going FLAT."
                     )
                 )
-                await close_position(symbol, side_to_close="Buy")
                 symbol_trends[symbol] = None
                 symbol_open_trade_side[symbol] = None
+                _clear_risk_state(symbol)
                 return
 
-        elif current_open_trade_side == "Sell" and not symbol_trailing_active.get(symbol, False) and not symbol_partial_taken.get(symbol, False):
-            stop_loss_price = entry_price + (STOP_LOSS_ATR_MULT * entry_atr)
-            if current_price >= stop_loss_price:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        f"\U0001f6d1 STOP-LOSS HIT for {symbol} (Short) [Backup check]\n"
-                        f"Entry: {entry_price} | Stop: {stop_loss_price:.6g}\n"
-                        f"Current Price: {current_price} | ATR: {entry_atr:.6g}\n"
-                        f"Loss capped at 2x ATR. Going FLAT.\n"
-                        f"(Server-side SL should have fired first)"
+        # ── CLIENT-SIDE BACKUP: ATR Stop-Loss Checks ──
+        # Server-side orders should fire first, but this is a safety net.
+        # Skip if trailing is active (SL was cancelled, trail order handles risk).
+        if not symbol_trailing_active.get(symbol, False) and not symbol_partial_taken.get(symbol, False):
+            if current_open_trade_side == "Buy":
+                # Check 2x ATR (full remaining close)
+                stop_loss_price_full = entry_price - (STOP_LOSS_ATR_MULT * entry_atr)
+                if current_price <= stop_loss_price_full:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"\U0001f6d1 STOP-LOSS HIT for {symbol} (Long) [Backup check]\n"
+                            f"Entry: {entry_price} | Stop: {stop_loss_price_full:.6g}\n"
+                            f"Current Price: {current_price} | ATR: {entry_atr:.6g}\n"
+                            f"Loss at 2x ATR. Closing remaining position.\n"
+                            f"(Server-side SL should have fired first)"
+                        )
                     )
-                )
-                await close_position(symbol, side_to_close="Sell")
-                symbol_trends[symbol] = None
-                symbol_open_trade_side[symbol] = None
-                return
+                    await cancel_server_stops(symbol)
+                    await close_position(symbol, side_to_close="Buy")
+                    symbol_trends[symbol] = None
+                    symbol_open_trade_side[symbol] = None
+                    return
 
-        # ── Trailing Stop: Activate at 1.5x ATR profit ──
-        # When activated: place a conditional stop order on 60% of position.
-        # Bybit executes the 60% close INSTANTLY when trail price is hit (no slippage).
-        # The remaining 40% has NO trailing stop — exits only on EMA+DI crossover.
+                # Check 1.5x ATR (30% close) — backup if conditional order missed
+                if not sl1_taken:
+                    stop_loss_price_30 = entry_price - (SL_STAGE1_ATR_MULT * entry_atr)
+                    if current_price <= stop_loss_price_30:
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=(
+                                f"\U0001f6d1 SL TIER 1 (Backup) for {symbol} (Long)\n"
+                                f"Closing 30% at 1.5x ATR loss\n"
+                                f"Entry: {entry_price} | Current: {current_price}"
+                            )
+                        )
+                        await cancel_sl1_order(symbol)
+                        await close_partial_position(symbol, side_to_close="Buy", close_pct=SL_STAGE1_CLOSE_PCT)
+                        symbol_sl1_taken[symbol] = True
+                        sl1_taken = True
+
+            elif current_open_trade_side == "Sell":
+                # Check 2x ATR (full remaining close)
+                stop_loss_price_full = entry_price + (STOP_LOSS_ATR_MULT * entry_atr)
+                if current_price >= stop_loss_price_full:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"\U0001f6d1 STOP-LOSS HIT for {symbol} (Short) [Backup check]\n"
+                            f"Entry: {entry_price} | Stop: {stop_loss_price_full:.6g}\n"
+                            f"Current Price: {current_price} | ATR: {entry_atr:.6g}\n"
+                            f"Loss at 2x ATR. Closing remaining position.\n"
+                            f"(Server-side SL should have fired first)"
+                        )
+                    )
+                    await cancel_server_stops(symbol)
+                    await close_position(symbol, side_to_close="Sell")
+                    symbol_trends[symbol] = None
+                    symbol_open_trade_side[symbol] = None
+                    return
+
+                # Check 1.5x ATR (30% close) — backup if conditional order missed
+                if not sl1_taken:
+                    stop_loss_price_30 = entry_price + (SL_STAGE1_ATR_MULT * entry_atr)
+                    if current_price >= stop_loss_price_30:
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=(
+                                f"\U0001f6d1 SL TIER 1 (Backup) for {symbol} (Short)\n"
+                                f"Closing 30% at 1.5x ATR loss\n"
+                                f"Entry: {entry_price} | Current: {current_price}"
+                            )
+                        )
+                        await cancel_sl1_order(symbol)
+                        await close_partial_position(symbol, side_to_close="Sell", close_pct=SL_STAGE1_CLOSE_PCT)
+                        symbol_sl1_taken[symbol] = True
+                        sl1_taken = True
+
+        # ── TRAILING STOP: Multi-stage trailing ──
+        # Stage 1: At 1.5x ATR profit, trail on 60%. Bybit closes INSTANTLY when hit.
+        # Stage 2: After 60% closed, trail on 30% (1x ATR distance).
+        # Stage 3: Remaining 10% — no trail, exits on EMA+DI only.
         trailing_active = symbol_trailing_active.get(symbol, False)
         partial_taken = symbol_partial_taken.get(symbol, False)
+        stage2_active = symbol_stage2_active.get(symbol, False)
+        stage2_taken = symbol_stage2_taken.get(symbol, False)
 
         if current_open_trade_side == "Buy":
             unrealized_profit = peak - entry_price
 
-            # ── First activation: place the 60% trail stop order ──
+            # ── Stage 1: Activate 60% trail stop ──
             if unrealized_profit >= TRAILING_ACTIVATE_ATR * entry_atr and not trailing_active:
                 symbol_trailing_active[symbol] = True
                 trailing_active = True
 
-                # Get current position size and calculate 60% qty
                 pos_qty = await get_position_size(symbol)
                 if pos_qty:
                     trail_qty = pos_qty * TRAILING_CLOSE_PCT
                     trail_stop_price = peak - (TRAILING_STOP_ATR * entry_atr)
 
-                    # Cancel the full-position SL (replaced by the conditional trail order)
+                    # Cancel SL orders (replaced by trailing)
+                    await cancel_sl1_order(symbol)
                     await cancel_server_stops(symbol)
 
                     # Place conditional stop order for 60% at trail price
@@ -940,9 +1189,9 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                                 f"\U0001f4c8 TRAILING ACTIVATED for {symbol} (Long)\n"
                                 f"Profit reached {TRAILING_ACTIVATE_ATR}x ATR ({unrealized_profit:.6g})\n"
                                 f"Peak: {peak:.6g} | Current: {current_price}\n"
-                                f"Trail stop set on {TRAILING_CLOSE_PCT*100:.0f}% at {trail_stop_price:.6g}\n"
+                                f"Stage 1: Trail on {TRAILING_CLOSE_PCT*100:.0f}% at {trail_stop_price:.6g} ({TRAILING_STOP_ATR}x ATR)\n"
                                 f"Trail moves UP as price rises. Bybit executes INSTANTLY when hit.\n"
-                                f"Remaining {(1-TRAILING_CLOSE_PCT)*100:.0f}% continues until EMA+DI exit."
+                                f"After 60% closed: 30% gets trail ({TRAILING_STOP_ATR_STAGE2}x ATR), 10% rides until EMA+DI exit."
                             )
                         )
                     else:
@@ -951,7 +1200,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                             text=f"\u26a0\ufe0f {symbol}: Trail activated but failed to place stop order. Will retry."
                         )
 
-            # ── Update trail price if peak moved (trail only moves UP for longs) ──
+            # ── Stage 1: Update trail price if peak moved (trail only moves UP for longs) ──
             if trailing_active and not partial_taken:
                 current_trail = symbol_trail_price.get(symbol)
                 new_trail_price = peak - (TRAILING_STOP_ATR * entry_atr)
@@ -959,17 +1208,14 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                 if current_trail is not None and new_trail_price > current_trail:
                     success = await amend_trail_stop_price(symbol, new_trail_price)
                     if not success:
-                        # Amend failed — order may have been filled, check below
                         pass
 
                 # ── Detect if the 60% trail order has been filled ──
                 current_qty = await get_position_size(symbol)
                 trail_qty = symbol_trail_qty.get(symbol)
                 if current_qty is not None and trail_qty is not None:
-                    expected_remaining = current_qty  # After 60% close, ~40% remains
-                    # If position has shrunk significantly, the trail order filled
                     if trail_qty > 0 and current_qty <= trail_qty * 0.15:
-                        # Position is now ~0 — trail closed everything (position was too small to split)
+                        # Position is now ~0 — trail closed everything (too small to split)
                         symbol_partial_taken[symbol] = True
                         trail_price_display = symbol_trail_price.get(symbol, 0)
                         await context.bot.send_message(
@@ -985,7 +1231,6 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                         _clear_risk_state(symbol)
                         return
                 elif current_qty is None and trailing_active:
-                    # Position fully gone — trail order closed everything
                     symbol_partial_taken[symbol] = True
                     trail_price_display = symbol_trail_price.get(symbol, 0)
                     await context.bot.send_message(
@@ -1001,33 +1246,153 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                     _clear_risk_state(symbol)
                     return
 
-                # Check if trail order is gone but position still exists = 60% was closed
-                order_id = symbol_trail_order_id.get(symbol)
-                if order_id and current_qty is not None:
-                    # Position still exists but might be smaller — check if order filled
-                    # We detect fill by: position qty is now roughly 40% of what it was
-                    # Since we don't track original qty, use trail_qty: if pos_qty ≈ original - trail_qty
-                    if trail_qty and current_qty < trail_qty:
-                        # Position is smaller than the 60% we wanted to close = partial fill happened
+                # Check if trail order filled but position still exists = 60% was closed
+                if current_qty is not None and trail_qty is not None:
+                    order_id = symbol_trail_order_id.get(symbol)
+                    if order_id and current_qty < trail_qty:
+                        # 60% closed, 40% remains — activate stage 2
                         symbol_partial_taken[symbol] = True
+                        partial_taken = True
                         trail_price_display = symbol_trail_price.get(symbol, 0)
                         symbol_trail_order_id[symbol] = None
                         symbol_trail_qty[symbol] = None
                         symbol_server_ts_set[symbol] = False
+
                         await context.bot.send_message(
                             chat_id=chat_id,
                             text=(
-                                f"\U0001f3c1 TRAILING STOP closed {TRAILING_CLOSE_PCT*100:.0f}% for {symbol} (Long)\n"
+                                f"\U0001f3c1 STAGE 1 TRAIL closed {TRAILING_CLOSE_PCT*100:.0f}% for {symbol} (Long)\n"
                                 f"Trail price hit: {trail_price_display:.6g}\n"
-                                f"Remaining {(1-TRAILING_CLOSE_PCT)*100:.0f}% continues trading.\n"
-                                f"Will exit on EMA cross + DI crossover only."
+                                f"Now placing Stage 2 trail on 30% (1x ATR distance).\n"
+                                f"Remaining 10% will ride until EMA+DI exit."
                             )
                         )
+
+                        # ── Immediately activate Stage 2: trail on 30% (75% of remaining 40%) ──
+                        stage2_qty = current_qty * TRAILING_STAGE2_PCT
+                        # Stage 2 peak starts at current price (price just dropped to hit stage 1 trail)
+                        symbol_peak_stage2[symbol] = current_price
+                        stage2_trail_price = current_price - (TRAILING_STOP_ATR_STAGE2 * entry_atr)
+
+                        s2_order_id = await place_conditional_close_order(symbol, "Buy", stage2_qty, stage2_trail_price)
+                        if s2_order_id:
+                            min_qty, _, qty_step, _ = await get_instrument_constraints(symbol)
+                            symbol_stage2_active[symbol] = True
+                            stage2_active = True
+                            symbol_trail2_order_id[symbol] = s2_order_id
+                            symbol_trail2_qty[symbol] = round_qty_to_step(stage2_qty, qty_step, min_qty)
+                            symbol_trail2_price[symbol] = stage2_trail_price
+                            await context.bot.send_message(
+                                chat_id=chat_id,
+                                text=(
+                                    f"\U0001f4c8 STAGE 2 TRAIL placed for {symbol} (Long)\n"
+                                    f"Trail on 30% at {stage2_trail_price:.6g} ({TRAILING_STOP_ATR_STAGE2}x ATR distance)\n"
+                                    f"Trail moves UP as price rises. Bybit executes INSTANTLY when hit.\n"
+                                    f"Remaining 10% continues until EMA+DI exit."
+                                )
+                            )
+                        else:
+                            await context.bot.send_message(
+                                chat_id=chat_id,
+                                text=f"\u26a0\ufe0f {symbol}: Stage 2 trail failed to place. Will retry next cycle."
+                            )
+
+            # ── Stage 2: Update trail and detect fill (after 60% closed) ──
+            if stage2_active and not stage2_taken:
+                # Update stage 2 peak (only moves UP for longs)
+                stage2_peak = symbol_peak_stage2.get(symbol, current_price)
+                stage2_peak = max(stage2_peak, current_price)
+                symbol_peak_stage2[symbol] = stage2_peak
+
+                # Update stage 2 trail price if peak moved
+                current_s2_trail = symbol_trail2_price.get(symbol)
+                new_s2_trail = stage2_peak - (TRAILING_STOP_ATR_STAGE2 * entry_atr)
+                s2_order_id = symbol_trail2_order_id.get(symbol)
+
+                if current_s2_trail is not None and new_s2_trail > current_s2_trail and s2_order_id:
+                    success = await amend_conditional_order(symbol, s2_order_id, new_s2_trail)
+                    if success:
+                        symbol_trail2_price[symbol] = new_s2_trail
+
+                # Detect stage 2 fill
+                current_qty = await get_position_size(symbol)
+                s2_trail_qty = symbol_trail2_qty.get(symbol)
+
+                if current_qty is None:
+                    # Position fully gone
+                    symbol_stage2_taken[symbol] = True
+                    trail_price_display = symbol_trail2_price.get(symbol, 0)
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"\U0001f3c1 STAGE 2 TRAIL HIT for {symbol} (Long)\n"
+                            f"Trail price: {trail_price_display:.6g}\n"
+                            f"Full remaining position closed. Going FLAT."
+                        )
+                    )
+                    symbol_trends[symbol] = None
+                    symbol_open_trade_side[symbol] = None
+                    _clear_risk_state(symbol)
+                    return
+
+                if current_qty is not None and s2_trail_qty is not None:
+                    if s2_trail_qty > 0 and current_qty <= s2_trail_qty * 0.15:
+                        # Position too small — stage 2 closed everything remaining
+                        symbol_stage2_taken[symbol] = True
+                        trail_price_display = symbol_trail2_price.get(symbol, 0)
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=(
+                                f"\U0001f3c1 STAGE 2 TRAIL HIT for {symbol} (Long)\n"
+                                f"Trail price: {trail_price_display:.6g}\n"
+                                f"Remaining position closed (too small to split). Going FLAT."
+                            )
+                        )
+                        symbol_trends[symbol] = None
+                        symbol_open_trade_side[symbol] = None
+                        _clear_risk_state(symbol)
+                        return
+
+                    if s2_order_id and current_qty < s2_trail_qty:
+                        # Stage 2 closed 30%, remaining 10% continues
+                        symbol_stage2_taken[symbol] = True
+                        stage2_taken = True
+                        trail_price_display = symbol_trail2_price.get(symbol, 0)
+                        symbol_trail2_order_id[symbol] = None
+                        symbol_trail2_qty[symbol] = None
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=(
+                                f"\U0001f3c1 STAGE 2 TRAIL closed 30% for {symbol} (Long)\n"
+                                f"Trail price hit: {trail_price_display:.6g}\n"
+                                f"Remaining 10% continues trading.\n"
+                                f"No trailing stop on final 10% — exits on EMA+DI crossover only."
+                            )
+                        )
+
+            # ── Stage 2 retry: If 60% was closed but stage 2 order wasn't placed yet ──
+            if partial_taken and not stage2_active and not stage2_taken:
+                current_qty = await get_position_size(symbol)
+                if current_qty and current_qty > 0:
+                    stage2_qty = current_qty * TRAILING_STAGE2_PCT
+                    s2_peak = symbol_peak_stage2.get(symbol, current_price)
+                    s2_peak = max(s2_peak, current_price)
+                    symbol_peak_stage2[symbol] = s2_peak
+                    stage2_trail_price = s2_peak - (TRAILING_STOP_ATR_STAGE2 * entry_atr)
+
+                    s2_order_id = await place_conditional_close_order(symbol, "Buy", stage2_qty, stage2_trail_price)
+                    if s2_order_id:
+                        min_qty, _, qty_step, _ = await get_instrument_constraints(symbol)
+                        symbol_stage2_active[symbol] = True
+                        symbol_trail2_order_id[symbol] = s2_order_id
+                        symbol_trail2_qty[symbol] = round_qty_to_step(stage2_qty, qty_step, min_qty)
+                        symbol_trail2_price[symbol] = stage2_trail_price
+                        print(f"[STAGE2-RETRY] {symbol}: Stage 2 trail placed (retry) at {stage2_trail_price:.6g}")
 
         elif current_open_trade_side == "Sell":
             unrealized_profit = entry_price - peak  # peak is min for shorts
 
-            # ── First activation: place the 60% trail stop order ──
+            # ── Stage 1: Activate 60% trail stop ──
             if unrealized_profit >= TRAILING_ACTIVATE_ATR * entry_atr and not trailing_active:
                 symbol_trailing_active[symbol] = True
                 trailing_active = True
@@ -1037,10 +1402,10 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                     trail_qty = pos_qty * TRAILING_CLOSE_PCT
                     trail_stop_price = peak + (TRAILING_STOP_ATR * entry_atr)
 
-                    # Cancel the full-position SL
+                    # Cancel SL orders (replaced by trailing)
+                    await cancel_sl1_order(symbol)
                     await cancel_server_stops(symbol)
 
-                    # Place conditional stop order for 60% at trail price
                     order_id = await place_trail_stop_order(symbol, "Sell", trail_qty, trail_stop_price)
 
                     if order_id:
@@ -1050,9 +1415,9 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                                 f"\U0001f4c8 TRAILING ACTIVATED for {symbol} (Short)\n"
                                 f"Profit reached {TRAILING_ACTIVATE_ATR}x ATR ({unrealized_profit:.6g})\n"
                                 f"Trough: {peak:.6g} | Current: {current_price}\n"
-                                f"Trail stop set on {TRAILING_CLOSE_PCT*100:.0f}% at {trail_stop_price:.6g}\n"
+                                f"Stage 1: Trail on {TRAILING_CLOSE_PCT*100:.0f}% at {trail_stop_price:.6g} ({TRAILING_STOP_ATR}x ATR)\n"
                                 f"Trail moves DOWN as price falls. Bybit executes INSTANTLY when hit.\n"
-                                f"Remaining {(1-TRAILING_CLOSE_PCT)*100:.0f}% continues until EMA+DI exit."
+                                f"After 60% closed: 30% gets trail ({TRAILING_STOP_ATR_STAGE2}x ATR), 10% rides until EMA+DI exit."
                             )
                         )
                     else:
@@ -1061,7 +1426,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                             text=f"\u26a0\ufe0f {symbol}: Trail activated but failed to place stop order. Will retry."
                         )
 
-            # ── Update trail price if trough moved (trail only moves DOWN for shorts) ──
+            # ── Stage 1: Update trail price if trough moved (trail only moves DOWN for shorts) ──
             if trailing_active and not partial_taken:
                 current_trail = symbol_trail_price.get(symbol)
                 new_trail_price = peak + (TRAILING_STOP_ATR * entry_atr)
@@ -1106,23 +1471,144 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                     _clear_risk_state(symbol)
                     return
 
-                order_id = symbol_trail_order_id.get(symbol)
-                if order_id and current_qty is not None:
-                    if trail_qty and current_qty < trail_qty:
+                # Check if trail order filled but position still exists = 60% was closed
+                if current_qty is not None and trail_qty is not None:
+                    order_id = symbol_trail_order_id.get(symbol)
+                    if order_id and current_qty < trail_qty:
+                        # 60% closed, 40% remains — activate stage 2
                         symbol_partial_taken[symbol] = True
+                        partial_taken = True
                         trail_price_display = symbol_trail_price.get(symbol, 0)
                         symbol_trail_order_id[symbol] = None
                         symbol_trail_qty[symbol] = None
                         symbol_server_ts_set[symbol] = False
+
                         await context.bot.send_message(
                             chat_id=chat_id,
                             text=(
-                                f"\U0001f3c1 TRAILING STOP closed {TRAILING_CLOSE_PCT*100:.0f}% for {symbol} (Short)\n"
+                                f"\U0001f3c1 STAGE 1 TRAIL closed {TRAILING_CLOSE_PCT*100:.0f}% for {symbol} (Short)\n"
                                 f"Trail price hit: {trail_price_display:.6g}\n"
-                                f"Remaining {(1-TRAILING_CLOSE_PCT)*100:.0f}% continues trading.\n"
-                                f"Will exit on EMA cross + DI crossover only."
+                                f"Now placing Stage 2 trail on 30% (1x ATR distance).\n"
+                                f"Remaining 10% will ride until EMA+DI exit."
                             )
                         )
+
+                        # ── Immediately activate Stage 2: trail on 30% (75% of remaining) ──
+                        stage2_qty = current_qty * TRAILING_STAGE2_PCT
+                        symbol_peak_stage2[symbol] = current_price
+                        stage2_trail_price = current_price + (TRAILING_STOP_ATR_STAGE2 * entry_atr)
+
+                        s2_order_id = await place_conditional_close_order(symbol, "Sell", stage2_qty, stage2_trail_price)
+                        if s2_order_id:
+                            min_qty, _, qty_step, _ = await get_instrument_constraints(symbol)
+                            symbol_stage2_active[symbol] = True
+                            stage2_active = True
+                            symbol_trail2_order_id[symbol] = s2_order_id
+                            symbol_trail2_qty[symbol] = round_qty_to_step(stage2_qty, qty_step, min_qty)
+                            symbol_trail2_price[symbol] = stage2_trail_price
+                            await context.bot.send_message(
+                                chat_id=chat_id,
+                                text=(
+                                    f"\U0001f4c8 STAGE 2 TRAIL placed for {symbol} (Short)\n"
+                                    f"Trail on 30% at {stage2_trail_price:.6g} ({TRAILING_STOP_ATR_STAGE2}x ATR distance)\n"
+                                    f"Trail moves DOWN as price falls. Bybit executes INSTANTLY when hit.\n"
+                                    f"Remaining 10% continues until EMA+DI exit."
+                                )
+                            )
+                        else:
+                            await context.bot.send_message(
+                                chat_id=chat_id,
+                                text=f"\u26a0\ufe0f {symbol}: Stage 2 trail failed to place. Will retry next cycle."
+                            )
+
+            # ── Stage 2: Update trail and detect fill (after 60% closed) ──
+            if stage2_active and not stage2_taken:
+                # Update stage 2 peak (only moves DOWN for shorts)
+                stage2_peak = symbol_peak_stage2.get(symbol, current_price)
+                stage2_peak = min(stage2_peak, current_price)
+                symbol_peak_stage2[symbol] = stage2_peak
+
+                # Update stage 2 trail price if trough moved
+                current_s2_trail = symbol_trail2_price.get(symbol)
+                new_s2_trail = stage2_peak + (TRAILING_STOP_ATR_STAGE2 * entry_atr)
+                s2_order_id = symbol_trail2_order_id.get(symbol)
+
+                if current_s2_trail is not None and new_s2_trail < current_s2_trail and s2_order_id:
+                    success = await amend_conditional_order(symbol, s2_order_id, new_s2_trail)
+                    if success:
+                        symbol_trail2_price[symbol] = new_s2_trail
+
+                # Detect stage 2 fill
+                current_qty = await get_position_size(symbol)
+                s2_trail_qty = symbol_trail2_qty.get(symbol)
+
+                if current_qty is None:
+                    symbol_stage2_taken[symbol] = True
+                    trail_price_display = symbol_trail2_price.get(symbol, 0)
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"\U0001f3c1 STAGE 2 TRAIL HIT for {symbol} (Short)\n"
+                            f"Trail price: {trail_price_display:.6g}\n"
+                            f"Full remaining position closed. Going FLAT."
+                        )
+                    )
+                    symbol_trends[symbol] = None
+                    symbol_open_trade_side[symbol] = None
+                    _clear_risk_state(symbol)
+                    return
+
+                if current_qty is not None and s2_trail_qty is not None:
+                    if s2_trail_qty > 0 and current_qty <= s2_trail_qty * 0.15:
+                        symbol_stage2_taken[symbol] = True
+                        trail_price_display = symbol_trail2_price.get(symbol, 0)
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=(
+                                f"\U0001f3c1 STAGE 2 TRAIL HIT for {symbol} (Short)\n"
+                                f"Trail price: {trail_price_display:.6g}\n"
+                                f"Remaining position closed (too small to split). Going FLAT."
+                            )
+                        )
+                        symbol_trends[symbol] = None
+                        symbol_open_trade_side[symbol] = None
+                        _clear_risk_state(symbol)
+                        return
+
+                    if s2_order_id and current_qty < s2_trail_qty:
+                        symbol_stage2_taken[symbol] = True
+                        stage2_taken = True
+                        trail_price_display = symbol_trail2_price.get(symbol, 0)
+                        symbol_trail2_order_id[symbol] = None
+                        symbol_trail2_qty[symbol] = None
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=(
+                                f"\U0001f3c1 STAGE 2 TRAIL closed 30% for {symbol} (Short)\n"
+                                f"Trail price hit: {trail_price_display:.6g}\n"
+                                f"Remaining 10% continues trading.\n"
+                                f"No trailing stop on final 10% — exits on EMA+DI crossover only."
+                            )
+                        )
+
+            # ── Stage 2 retry: If 60% was closed but stage 2 order wasn't placed yet ──
+            if partial_taken and not stage2_active and not stage2_taken:
+                current_qty = await get_position_size(symbol)
+                if current_qty and current_qty > 0:
+                    stage2_qty = current_qty * TRAILING_STAGE2_PCT
+                    s2_peak = symbol_peak_stage2.get(symbol, current_price)
+                    s2_peak = min(s2_peak, current_price)
+                    symbol_peak_stage2[symbol] = s2_peak
+                    stage2_trail_price = s2_peak + (TRAILING_STOP_ATR_STAGE2 * entry_atr)
+
+                    s2_order_id = await place_conditional_close_order(symbol, "Sell", stage2_qty, stage2_trail_price)
+                    if s2_order_id:
+                        min_qty, _, qty_step, _ = await get_instrument_constraints(symbol)
+                        symbol_stage2_active[symbol] = True
+                        symbol_trail2_order_id[symbol] = s2_order_id
+                        symbol_trail2_qty[symbol] = round_qty_to_step(stage2_qty, qty_step, min_qty)
+                        symbol_trail2_price[symbol] = stage2_trail_price
+                        print(f"[STAGE2-RETRY] {symbol}: Stage 2 trail placed (retry) at {stage2_trail_price:.6g}")
 
     # ──────────────────────────────────────────────
     # 2. EXIT + POSSIBLE REVERSAL (Decoupled)
@@ -1332,18 +1818,32 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
             if peak:
                 risk_info += f"\n\u2022 Peak Price: {peak:.6g}"
             partial_taken_flag = symbol_partial_taken.get(symbol, False)
+            stage2_active_flag = symbol_stage2_active.get(symbol, False)
+            stage2_taken_flag = symbol_stage2_taken.get(symbol, False)
+            sl1_taken_flag = symbol_sl1_taken.get(symbol, False)
             server_sl = symbol_server_sl_set.get(symbol, False)
             server_ts = symbol_server_ts_set.get(symbol, False)
             trail_price = symbol_trail_price.get(symbol)
-            if partial_taken_flag:
-                trailing_status = f'60% CLOSED by trail. 40% riding until EMA+DI exit'
+            trail2_price = symbol_trail2_price.get(symbol)
+            if stage2_taken_flag:
+                trailing_status = '60% + 30% CLOSED by trail. 10% riding until EMA+DI exit'
+            elif stage2_active_flag and trail2_price:
+                trailing_status = f'Stage 2 ACTIVE - trail on 30% @ {trail2_price:.6g} (1x ATR)'
+            elif partial_taken_flag:
+                trailing_status = f'60% CLOSED by trail. Placing 30% trail...'
             elif trailing and trail_price:
-                trailing_status = f'ACTIVE - trail on 60% @ {trail_price:.6g}'
+                trailing_status = f'Stage 1 ACTIVE - trail on 60% @ {trail_price:.6g} (1x ATR)'
             elif trailing:
-                trailing_status = 'ACTIVE (placing trail order...)'
+                trailing_status = 'Stage 1 ACTIVE (placing trail order...)'
             else:
                 trailing_status = 'Not yet'
             risk_info += f"\n\u2022 Trailing Stop: {trailing_status}"
+            # SL status
+            if sl1_taken_flag:
+                sl_status = f'Tier 1 HIT (30% closed at 1.5x ATR). Tier 2 at 2x ATR protects remaining 70%'
+            else:
+                sl_status = f"Tier 1: {'SET' if symbol_sl1_order_id.get(symbol) else 'Not set'} (30% @ 1.5x ATR) | Tier 2: {'SET' if server_sl else 'Not set'} (70% @ 2x ATR)"
+            risk_info += f"\n\u2022 Stop-Loss: {sl_status}"
             risk_info += f"\n\u2022 Server-Side SL: {'SET' if server_sl else 'Not set'}"
             risk_info += f"\n\u2022 Server-Side TS: {'SET' if server_ts else 'Not set'}"
 
@@ -1352,7 +1852,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
             f"\u2022 Entry: EMA + DI alignment + ADX > {ADX_THRESHOLD}\n"
             f"\u2022 Exit: Price crosses EMA + DI crossover required\n"
             f"\u2022 Reverse: Only if DI + ADX confirm, else FLAT\n"
-            f"\u2022 Server-Side SL: {STOP_LOSS_ATR_MULT}x ATR | Trail on {TRAILING_CLOSE_PCT*100:.0f}% at {TRAILING_ACTIVATE_ATR}x ATR profit, {(1-TRAILING_CLOSE_PCT)*100:.0f}% rides until exit\n"
+            f"\u2022 SL: 30% at {SL_STAGE1_ATR_MULT}x ATR + 70% at {STOP_LOSS_ATR_MULT}x ATR | Trail: 60% at {TRAILING_ACTIVATE_ATR}x ATR, then 30% at 1x ATR, 10% rides\n"
             f"\u2022 Monitoring every {POLL_INTERVAL_SECONDS}s (real-time price for risk)\n"
             f"\u2022 20 EMA: {ema_20:.6g} | +DI: {plus_di:.2f} | -DI: {minus_di:.2f} | ADX: {adx:.2f}\n"
             f"\u2022 Last Close: {last_close} | Current Price: {current_price}\n"
@@ -1480,7 +1980,8 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"\u2022 Entry: Last Close vs 20 EMA + DI alignment + ADX > {ADX_THRESHOLD}\n"
         f"\u2022 Exit: Price crosses 20 EMA + DI crossover required\n"
         f"\u2022 Reverse only if DI + ADX confirm, else FLAT\n"
-        f"\u2022 Server-Side SL: {STOP_LOSS_ATR_MULT}x ATR | Trail on {TRAILING_CLOSE_PCT*100:.0f}% at {TRAILING_ACTIVATE_ATR}x ATR profit, {(1-TRAILING_CLOSE_PCT)*100:.0f}% rides until exit\n"
+        f"\u2022 SL: 30% at {SL_STAGE1_ATR_MULT}x ATR + 70% at {STOP_LOSS_ATR_MULT}x ATR\n"
+        f"\u2022 Trail: 60% at {TRAILING_ACTIVATE_ATR}x ATR profit ({TRAILING_STOP_ATR}x ATR dist), then 30% ({TRAILING_STOP_ATR_STAGE2}x ATR dist), 10% rides until EMA+DI exit\n"
         f"\u2022 Monitoring every {POLL_INTERVAL_SECONDS}s (real-time price for risk checks)\n"
         f"\u2022 Status report every 30 minutes"
     )
@@ -1521,7 +2022,12 @@ async def remove_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     # Cancel any server-side stops before removing
     await cancel_server_stops(symbol)
     # Clean up risk management state
-    for state_dict in [symbol_entry_price, symbol_entry_atr, symbol_peak_price, symbol_trailing_active, symbol_partial_taken, symbol_server_sl_set, symbol_server_ts_set, symbol_trail_order_id, symbol_trail_qty, symbol_trail_price]:
+    for state_dict in [symbol_entry_price, symbol_entry_atr, symbol_peak_price, symbol_trailing_active,
+                        symbol_partial_taken, symbol_server_sl_set, symbol_server_ts_set,
+                        symbol_trail_order_id, symbol_trail_qty, symbol_trail_price,
+                        symbol_stage2_active, symbol_stage2_taken, symbol_trail2_order_id,
+                        symbol_trail2_qty, symbol_trail2_price, symbol_peak_stage2,
+                        symbol_sl1_order_id, symbol_sl1_qty, symbol_sl1_taken, symbol_original_qty]:
         if symbol in state_dict:
             del state_dict[symbol]
 
@@ -1538,17 +2044,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("\u26d4 Unauthorized. This bot is private.")
         return
     await update.message.reply_text(
-        "Bot ready! (v5 - Server-Side Trailing)\n\n"
+        "Bot ready! (v6 - Multi-Stage Trailing + Tiered SL)\n\n"
         "Commands:\n"
         "1. /start - Display this message\n"
         "2. /add_symbol <symbol> - Start monitoring with auto-sizing (20% balance)\n"
         "3. /add_symbol <symbol> <quantity> - INSTANT TRADE + Manual quantity monitoring\n"
         "4. /remove_symbol <symbol> - Stop monitoring a symbol\n\n"
-        "v5 Trailing Stop Behavior:\n"
-        f"\u2022 SERVER-SIDE stop-loss ({STOP_LOSS_ATR_MULT}x ATR) at entry\n"
-        f"\u2022 At {TRAILING_ACTIVATE_ATR}x ATR profit: trailing stop activates on {TRAILING_CLOSE_PCT*100:.0f}%\n"
-        f"\u2022 Trail moves with price ({TRAILING_STOP_ATR}x ATR distance). Bybit closes {TRAILING_CLOSE_PCT*100:.0f}% INSTANTLY when hit\n"
-        f"\u2022 Remaining {(1-TRAILING_CLOSE_PCT)*100:.0f}% has NO trailing stop \u2014 exits on EMA+DI crossover only\n"
+        "v6 Stop-Loss (Tiered):\n"
+        f"\u2022 Tier 1: 30% closed INSTANTLY at {SL_STAGE1_ATR_MULT}x ATR loss\n"
+        f"\u2022 Tier 2: Remaining 70% closed at {STOP_LOSS_ATR_MULT}x ATR loss (server-side)\n\n"
+        "v6 Trailing Stop (Multi-Stage):\n"
+        f"\u2022 At {TRAILING_ACTIVATE_ATR}x ATR profit: Stage 1 trail activates on {TRAILING_CLOSE_PCT*100:.0f}%\n"
+        f"\u2022 Stage 1 trail: {TRAILING_STOP_ATR}x ATR distance. Bybit closes {TRAILING_CLOSE_PCT*100:.0f}% INSTANTLY when hit\n"
+        f"\u2022 Stage 2 trail: After 60% closed, 30% gets trail ({TRAILING_STOP_ATR_STAGE2}x ATR distance)\n"
+        f"\u2022 Remaining 10% has NO trailing stop \u2014 exits on EMA+DI crossover only\n\n"
+        "Entry/Exit Rules:\n"
         f"\u2022 ADX > {ADX_THRESHOLD} filter (no trades in sideways markets)\n"
         "\u2022 EMA + DI alignment required for entry\n"
         "\u2022 Exit requires: EMA cross + DI crossover\n"
