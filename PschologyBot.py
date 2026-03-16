@@ -656,6 +656,29 @@ async def get_position_size(symbol: str) -> Optional[float]:
         return None
 
 
+async def get_position_entry_price(symbol: str) -> Optional[float]:
+    """Get the actual average entry price of the current position from Bybit.
+    This is the real fill price, not the candle close price at signal time."""
+    try:
+        resp = await asyncio.to_thread(
+            bybit_session.get_positions,
+            category="linear",
+            symbol=symbol,
+        )
+        positions = resp.get("result", {}).get("list", [])
+        for pos in positions:
+            size = float(pos.get("size", 0))
+            if size > 0:
+                avg_price = float(pos.get("avgPrice", 0))
+                if avg_price > 0:
+                    print(f"[INFO] {symbol}: Bybit avgPrice = {avg_price}")
+                    return avg_price
+        return None
+    except Exception as e:
+        print(f"Error fetching position entry price for {symbol}: {e}")
+        return None
+
+
 async def place_trail_stop_order(symbol: str, side: str, qty: float, trigger_price: float) -> Optional[str]:
     """
     Place a conditional stop-market order for partial trailing close (60%).
@@ -1649,11 +1672,15 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                 result = await place_trade(symbol, side="Sell", manual_qty_override=manual_override)
                 if result and "error" not in result:
                     order_id = result.get("orderId", "\u2014")
-                    _set_entry_risk_state(symbol, last_close, atr)
-                    # Set server-side stop-loss immediately
-                    sl_price = last_close + (STOP_LOSS_ATR_MULT * atr)
+                    # Get actual fill price from Bybit (not candle close)
+                    await asyncio.sleep(1)
+                    real_entry = await get_position_entry_price(symbol)
+                    fill_price = real_entry if real_entry else last_close
+                    _set_entry_risk_state(symbol, fill_price, atr)
+                    # Set server-side stop-loss based on actual fill price
+                    sl_price = fill_price + (STOP_LOSS_ATR_MULT * atr)
                     await set_server_stop_loss(symbol, "Sell", sl_price)
-                    await context.bot.send_message(chat_id=chat_id, text=f"\u2705 Short order(s) placed for {symbol}\nLast Order ID: <code>{order_id}</code>\nServer-side SL: {sl_price:.6g}", parse_mode="HTML")
+                    await context.bot.send_message(chat_id=chat_id, text=f"\u2705 Short order(s) placed for {symbol}\nLast Order ID: <code>{order_id}</code>\nFill Price: {fill_price:.6g}\nServer-side SL: {sl_price:.6g}", parse_mode="HTML")
                     symbol_trends[symbol] = "downward"
                     symbol_open_trade_side[symbol] = "Sell"
                 elif result and "error" in result:
@@ -1708,11 +1735,15 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                 result = await place_trade(symbol, side="Buy", manual_qty_override=manual_override)
                 if result and "error" not in result:
                     order_id = result.get("orderId", "\u2014")
-                    _set_entry_risk_state(symbol, last_close, atr)
-                    # Set server-side stop-loss immediately
-                    sl_price = last_close - (STOP_LOSS_ATR_MULT * atr)
+                    # Get actual fill price from Bybit (not candle close)
+                    await asyncio.sleep(1)
+                    real_entry = await get_position_entry_price(symbol)
+                    fill_price = real_entry if real_entry else last_close
+                    _set_entry_risk_state(symbol, fill_price, atr)
+                    # Set server-side stop-loss based on actual fill price
+                    sl_price = fill_price - (STOP_LOSS_ATR_MULT * atr)
                     await set_server_stop_loss(symbol, "Buy", sl_price)
-                    await context.bot.send_message(chat_id=chat_id, text=f"\u2705 Long order(s) placed for {symbol}\nLast Order ID: <code>{order_id}</code>\nServer-side SL: {sl_price:.6g}", parse_mode="HTML")
+                    await context.bot.send_message(chat_id=chat_id, text=f"\u2705 Long order(s) placed for {symbol}\nLast Order ID: <code>{order_id}</code>\nFill Price: {fill_price:.6g}\nServer-side SL: {sl_price:.6g}", parse_mode="HTML")
                     symbol_trends[symbol] = "upward"
                     symbol_open_trade_side[symbol] = "Buy"
                 elif result and "error" in result:
@@ -1772,14 +1803,18 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
 
             if result and "error" not in result:
                 order_id = result.get("orderId", "\u2014")
-                _set_entry_risk_state(symbol, last_close, atr)
-                # Set server-side stop-loss immediately after entry
+                # Get actual fill price from Bybit (not candle close)
+                await asyncio.sleep(1)
+                real_entry = await get_position_entry_price(symbol)
+                fill_price = real_entry if real_entry else last_close
+                _set_entry_risk_state(symbol, fill_price, atr)
+                # Set server-side stop-loss based on actual fill price
                 if side == "Buy":
-                    sl_price = last_close - (STOP_LOSS_ATR_MULT * atr)
+                    sl_price = fill_price - (STOP_LOSS_ATR_MULT * atr)
                 else:
-                    sl_price = last_close + (STOP_LOSS_ATR_MULT * atr)
+                    sl_price = fill_price + (STOP_LOSS_ATR_MULT * atr)
                 await set_server_stop_loss(symbol, side, sl_price)
-                await context.bot.send_message(chat_id=chat_id, text=f"\u2705 {side_text} order(s) placed for {symbol}\nLast Order ID: <code>{order_id}</code>\nServer-side SL: {sl_price:.6g}", parse_mode="HTML")
+                await context.bot.send_message(chat_id=chat_id, text=f"\u2705 {side_text} order(s) placed for {symbol}\nLast Order ID: <code>{order_id}</code>\nFill Price: {fill_price:.6g}\nServer-side SL: {sl_price:.6g}", parse_mode="HTML")
             elif result and "error" in result:
                 await context.bot.send_message(chat_id=chat_id, text=f"\u274c Failed to place {side_text} for {symbol}: {result['error']}")
 
@@ -1954,16 +1989,21 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
                     if result and "error" not in result:
                         order_id = result.get("orderId", "\u2014")
-                        _set_entry_risk_state(symbol, last_close, atr)
-                        # Set server-side stop-loss immediately
+                        # Get actual fill price from Bybit (not candle close)
+                        await asyncio.sleep(1)
+                        real_entry = await get_position_entry_price(symbol)
+                        fill_price = real_entry if real_entry else last_close
+                        _set_entry_risk_state(symbol, fill_price, atr)
+                        # Set server-side stop-loss based on actual fill price
                         if side == "Buy":
-                            sl_price = last_close - (STOP_LOSS_ATR_MULT * atr)
+                            sl_price = fill_price - (STOP_LOSS_ATR_MULT * atr)
                         else:
-                            sl_price = last_close + (STOP_LOSS_ATR_MULT * atr)
+                            sl_price = fill_price + (STOP_LOSS_ATR_MULT * atr)
                         await set_server_stop_loss(symbol, side, sl_price)
                         await update.message.reply_text(
                             f"\u2705 Instant {side_text} order(s) placed for {symbol}\n"
                             f"Last Order ID: <code>{order_id}</code>\n"
+                            f"Fill Price: {fill_price:.6g}\n"
                             f"Server-side SL: {sl_price:.6g} ({STOP_LOSS_ATR_MULT}x ATR)\n"
                             f"Bybit will execute SL instantly at exact price.",
                             parse_mode="HTML"
