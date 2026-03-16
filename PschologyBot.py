@@ -1617,15 +1617,15 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
     # ──────────────────────────────────────────────
     if current_open_trade_side is not None:
 
-        # ── Long Exit: close price below 20 EMA AND DI crossover ──
-        if current_open_trade_side == "Buy" and last_close < ema_20 and di_crossed:
+        # ── Long Exit: close price below 20 EMA AND -DI > +DI (bearish alignment) ──
+        if current_open_trade_side == "Buy" and last_close < ema_20 and minus_di > plus_di:
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=(
                     f"\u26a0\ufe0f EXIT SIGNAL for {symbol} (Long)\n"
                     f"Last Close ({last_close}) < 20 EMA ({ema_20:.6g})\n"
-                    f"DI Crossover detected ({di_cross_type})\n"
-                    f"+DI: {plus_di:.2f} | -DI: {minus_di:.2f}\n"
+                    f"-DI ({minus_di:.2f}) > +DI ({plus_di:.2f}) — bearish alignment\n"
+                    f"ADX: {adx:.2f}\n"
                     f"Closing Long position..."
                 )
             )
@@ -1673,17 +1673,18 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                 )
                 symbol_trends[symbol] = None
                 symbol_open_trade_side[symbol] = None
+                _clear_risk_state(symbol)
             return
 
-        # ── Short Exit: close price above 20 EMA AND DI crossover ──
-        elif current_open_trade_side == "Sell" and last_close > ema_20 and di_crossed:
+        # ── Short Exit: close price above 20 EMA AND +DI > -DI (bullish alignment) ──
+        elif current_open_trade_side == "Sell" and last_close > ema_20 and plus_di > minus_di:
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=(
                     f"\u26a0\ufe0f EXIT SIGNAL for {symbol} (Short)\n"
                     f"Last Close ({last_close}) > 20 EMA ({ema_20:.6g})\n"
-                    f"DI Crossover detected ({di_cross_type})\n"
-                    f"+DI: {plus_di:.2f} | -DI: {minus_di:.2f}\n"
+                    f"+DI ({plus_di:.2f}) > -DI ({minus_di:.2f}) — bullish alignment\n"
+                    f"ADX: {adx:.2f}\n"
                     f"Closing Short position..."
                 )
             )
@@ -1731,6 +1732,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                 )
                 symbol_trends[symbol] = None
                 symbol_open_trade_side[symbol] = None
+                _clear_risk_state(symbol)
             return
 
     # ──────────────────────────────────────────────
