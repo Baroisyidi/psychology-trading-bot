@@ -414,7 +414,7 @@ async def get_all_indicators(
         df["dx"] = (abs(df["+di"] - df["-di"]) / di_sum) * 100
         df["adx"] = df["dx"].ewm(alpha=1/14, min_periods=14).mean()
         adx = float(df["adx"].iloc[-1])
-        # ADX rising check: ADX must be higher than 2 candles ago
+        # ADX value from 2 candles ago (for reference/logging)
         adx_prev2 = float(df["adx"].iloc[-3]) if len(df) >= 3 else adx
 
         # 5. RSI (14-period, Wilder's smoothing)
@@ -2161,10 +2161,6 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             if adx < ADX_THRESHOLD:
                 entry_blocked = True
                 block_reason = f"ADX ({adx:.2f}) < {ADX_THRESHOLD} — market is sideways"
-            # Filter 1b: ADX rising
-            elif adx <= adx_prev2:
-                entry_blocked = True
-                block_reason = f"ADX not rising ({adx:.2f} <= {adx_prev2:.2f})"
             # Filter 5: Volume
             elif volume_ratio < VOLUME_FILTER_MULT:
                 entry_blocked = True
@@ -2253,7 +2249,7 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(
         f"Monitoring {symbol}!\n"
         f"\u2022 {qty_info}\n"
-        f"\u2022 Entry filters: ADX > {ADX_THRESHOLD} + ADX rising + EMA/DI alignment + RSI filter + Divergence filter + Volume > {VOLUME_FILTER_MULT}x avg\n"
+        f"\u2022 Entry filters: ADX > {ADX_THRESHOLD} + EMA/DI alignment + RSI filter + Divergence filter + Volume > {VOLUME_FILTER_MULT}x avg\n"
         f"\u2022 Exit: Price crosses 20 EMA + DI crossover required\n"
         f"\u2022 Reverse only if DI + ADX confirm, else FLAT\n"
         f"\u2022 SL: 30% at {SL_STAGE1_ATR_MULT}x ATR + 70% at {STOP_LOSS_ATR_MULT}x ATR (server-side SL always active)\n"
@@ -2329,7 +2325,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "3. /add_symbol <symbol> <quantity> - INSTANT TRADE + Manual quantity monitoring\n"
         "4. /remove_symbol <symbol> - Stop monitoring a symbol\n\n"
         "v7 Entry Filters (ALL must pass):\n"
-        f"\u2022 1. ADX > {ADX_THRESHOLD} AND ADX rising (ADX > ADX[2 candles ago])\n"
+        f"\u2022 1. ADX > {ADX_THRESHOLD}\n"
         "\u2022 2. EMA + DI alignment (Price vs 20 EMA + DI direction)\n"
         f"\u2022 3. RSI NOT extreme (not > {RSI_OVERBOUGHT} for longs, not < {RSI_OVERSOLD} for shorts)\n"
         "\u2022 4. NO opposing RSI divergence\n"
