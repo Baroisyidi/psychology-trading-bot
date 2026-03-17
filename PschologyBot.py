@@ -1,13 +1,15 @@
 
 import os
+import json
 import asyncio
 import random
 import time
+import threading
 import pandas as pd
 from datetime import datetime
 from typing import Optional, Tuple, List, Dict
 from dotenv import load_dotenv
-from pybit.unified_trading import HTTP
+from pybit.unified_trading import HTTP, WebSocket
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -58,6 +60,151 @@ except Exception as e:
     print(f"Debug failed: {e}")
 
 # ────────────────────────────────────────────────
+#  WebSocket for real-time price feeds
+# ────────────────────────────────────────────────
+ws_prices: dict[str, float] = {}
+ws_prices_lock = threading.Lock()
+ws_connection = None
+
+def _ws_ticker_callback(message):
+    """WebSocket callback for real-time ticker updates. Runs in WS background thread."""
+    try:
+        data = message.get("data", {})
+        if isinstance(data, list):
+            for item in data:
+                sym = item.get("symbol", "")
+                price = item.get("lastPrice", "")
+                if sym and price:
+                    with ws_prices_lock:
+                        ws_prices[sym] = float(price)
+        elif isinstance(data, dict):
+            sym = data.get("symbol", "")
+            price = data.get("lastPrice", "")
+            if sym and price:
+                with ws_prices_lock:
+                    ws_prices[sym] = float(price)
+    except Exception as e:
+        print(f"[WS] Ticker callback error: {e}")
+
+def start_websocket():
+    """Initialize the Bybit WebSocket connection for real-time price feeds."""
+    global ws_connection
+    try:
+        ws_connection = WebSocket(
+            testnet=False,
+            channel_type="linear",
+        )
+        print("[WS] WebSocket connection initialized for real-time price feeds")
+        return True
+    except Exception as e:
+        print(f"[WS] Failed to start WebSocket: {e}")
+        return False
+
+def subscribe_ws_symbol(symbol: str):
+    """Subscribe to real-time ticker updates for a symbol via WebSocket."""
+    global ws_connection
+    if ws_connection is None:
+        if not start_websocket():
+            return False
+    try:
+        ws_connection.ticker_stream(symbol=symbol, callback=_ws_ticker_callback)
+        print(f"[WS] Subscribed to {symbol} ticker stream")
+        return True
+    except Exception as e:
+        print(f"[WS] Failed to subscribe {symbol}: {e}")
+        return False
+
+def get_ws_price(symbol: str) -> Optional[float]:
+    """Get the latest WebSocket price for a symbol. Returns None if not available."""
+    with ws_prices_lock:
+        return ws_prices.get(symbol)
+
+# ────────────────────────────────────────────────
+#  State Persistence (JSON)
+# ────────────────────────────────────────────────
+STATE_FILE = os.getenv("STATE_FILE", "bot_state.json")
+
+def save_state():
+    """Save all bot state to JSON file for crash recovery."""
+    try:
+        state = {
+            "symbol_trends": symbol_trends,
+            "monitored_symbols": monitored_symbols,
+            "symbol_open_trade_side": symbol_open_trade_side,
+            "symbol_manual_quantities": symbol_manual_quantities,
+            "symbol_entry_price": symbol_entry_price,
+            "symbol_entry_atr": symbol_entry_atr,
+            "symbol_peak_price": symbol_peak_price,
+            "symbol_trailing_active": symbol_trailing_active,
+            "symbol_partial_taken": symbol_partial_taken,
+            "symbol_server_sl_set": symbol_server_sl_set,
+            "symbol_server_ts_set": symbol_server_ts_set,
+            "symbol_trail_order_id": symbol_trail_order_id,
+            "symbol_trail_qty": symbol_trail_qty,
+            "symbol_trail_price": symbol_trail_price,
+            "symbol_stage2_active": symbol_stage2_active,
+            "symbol_stage2_taken": symbol_stage2_taken,
+            "symbol_trail2_order_id": symbol_trail2_order_id,
+            "symbol_trail2_qty": symbol_trail2_qty,
+            "symbol_trail2_price": symbol_trail2_price,
+            "symbol_peak_stage2": symbol_peak_stage2,
+            "symbol_sl1_order_id": symbol_sl1_order_id,
+            "symbol_sl1_qty": symbol_sl1_qty,
+            "symbol_sl1_taken": symbol_sl1_taken,
+            "symbol_original_qty": symbol_original_qty,
+        }
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f, indent=2, default=str)
+        print(f"[STATE] Saved state to {STATE_FILE}")
+    except Exception as e:
+        print(f"[STATE] Failed to save state: {e}")
+
+def load_state():
+    """Load bot state from JSON file on startup."""
+    global monitored_symbols
+    if not os.path.exists(STATE_FILE):
+        print(f"[STATE] No state file found at {STATE_FILE}, starting fresh")
+        return False
+    try:
+        with open(STATE_FILE, "r") as f:
+            state = json.load(f)
+
+        # Restore all state dicts
+        symbol_trends.update(state.get("symbol_trends", {}))
+        loaded_symbols = state.get("monitored_symbols", [])
+        for s in loaded_symbols:
+            if s not in monitored_symbols:
+                monitored_symbols.append(s)
+        symbol_open_trade_side.update(state.get("symbol_open_trade_side", {}))
+        symbol_manual_quantities.update({k: v for k, v in state.get("symbol_manual_quantities", {}).items()})
+        symbol_entry_price.update({k: v for k, v in state.get("symbol_entry_price", {}).items()})
+        symbol_entry_atr.update({k: v for k, v in state.get("symbol_entry_atr", {}).items()})
+        symbol_peak_price.update({k: v for k, v in state.get("symbol_peak_price", {}).items()})
+        symbol_trailing_active.update({k: v for k, v in state.get("symbol_trailing_active", {}).items()})
+        symbol_partial_taken.update({k: v for k, v in state.get("symbol_partial_taken", {}).items()})
+        symbol_server_sl_set.update({k: v for k, v in state.get("symbol_server_sl_set", {}).items()})
+        symbol_server_ts_set.update({k: v for k, v in state.get("symbol_server_ts_set", {}).items()})
+        symbol_trail_order_id.update({k: v for k, v in state.get("symbol_trail_order_id", {}).items()})
+        symbol_trail_qty.update({k: v for k, v in state.get("symbol_trail_qty", {}).items()})
+        symbol_trail_price.update({k: v for k, v in state.get("symbol_trail_price", {}).items()})
+        symbol_stage2_active.update({k: v for k, v in state.get("symbol_stage2_active", {}).items()})
+        symbol_stage2_taken.update({k: v for k, v in state.get("symbol_stage2_taken", {}).items()})
+        symbol_trail2_order_id.update({k: v for k, v in state.get("symbol_trail2_order_id", {}).items()})
+        symbol_trail2_qty.update({k: v for k, v in state.get("symbol_trail2_qty", {}).items()})
+        symbol_trail2_price.update({k: v for k, v in state.get("symbol_trail2_price", {}).items()})
+        symbol_peak_stage2.update({k: v for k, v in state.get("symbol_peak_stage2", {}).items()})
+        symbol_sl1_order_id.update({k: v for k, v in state.get("symbol_sl1_order_id", {}).items()})
+        symbol_sl1_qty.update({k: v for k, v in state.get("symbol_sl1_qty", {}).items()})
+        symbol_sl1_taken.update({k: v for k, v in state.get("symbol_sl1_taken", {}).items()})
+        symbol_original_qty.update({k: v for k, v in state.get("symbol_original_qty", {}).items()})
+
+        print(f"[STATE] Loaded state from {STATE_FILE} — {len(monitored_symbols)} symbols restored")
+        return True
+    except Exception as e:
+        print(f"[STATE] Failed to load state: {e}")
+        return False
+
+# ────────────────────────────────────────────────
 #  Global state
 # ────────────────────────────────────────────────
 symbol_trends: dict[str, Optional[str]] = {}
@@ -66,7 +213,7 @@ symbol_open_trade_side: dict[str, Optional[str]] = {}
 symbol_manual_quantities: dict[str, Optional[float]] = {}
 symbol_last_di_cross_candle: dict[str, Optional[str]] = {}
 
-# NEW: Per-symbol risk management tracking
+# Per-symbol risk management tracking
 symbol_entry_price: dict[str, Optional[float]] = {}
 symbol_entry_atr: dict[str, Optional[float]] = {}
 symbol_peak_price: dict[str, Optional[float]] = {}
@@ -96,7 +243,7 @@ symbol_original_qty: dict[str, Optional[float]] = {}   # Original position qty a
 #  Constants
 # ────────────────────────────────────────────────
 ATR_MULTIPLIER = 1.5        # Legacy (kept for reference)
-ADX_THRESHOLD = 20           # Only trade when ADX > 20 (trending)
+ADX_THRESHOLD = 23           # Only trade when ADX > 23 (trending)
 STOP_LOSS_ATR_MULT = 2.0    # Ultimate stop-loss at 2x ATR from entry (closes remaining 70%)
 SL_STAGE1_ATR_MULT = 1.5    # First tier SL at 1.5x ATR (closes 30%)
 SL_STAGE1_CLOSE_PCT = 0.30  # Close 30% of position at first SL level
@@ -106,6 +253,10 @@ TRAILING_STOP_ATR_STAGE2 = 1.0  # Stage 2 trailing stop distance: 1x ATR from pe
 TRAILING_CLOSE_PCT = 0.60    # Close 60% of position on stage 1 trail
 TRAILING_STAGE2_PCT = 0.75   # Close 75% of remaining 40% (= 30% of original) on stage 2
 POLL_INTERVAL_SECONDS = 10   # Poll every 10 seconds (faster for risk management)
+RSI_OVERBOUGHT = 70          # Block long entries when RSI > 70
+RSI_OVERSOLD = 30            # Block short entries when RSI < 30
+RSI_DIVERGENCE_LOOKBACK = 14 # Candles to look back for RSI divergence
+VOLUME_FILTER_MULT = 1.5     # Only enter when volume > 1.5x 20-period average
 
 MOTIVATIONAL_QUOTES = [
     "\u201cThe market doesn\u2019t reward intelligence \U0001f9e0 \u2014 it rewards discipline \U0001f9f1.\nSmart traders survive, disciplined traders compound.\u201d",
@@ -135,65 +286,50 @@ async def send_motivational_quote(context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = context.job.chat_id if context.job else CHAT_ID
     await context.bot.send_message(chat_id=chat_id, text=quote)
 
-async def get_ichimoku_and_atr(
-    symbol: str,
-    interval: str = "30",
-    limit: int = 100,
-) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
-    """
-    Returns: (conversion_line, atr, last_close, current_price)
-    """
+async def get_current_price(symbol: str) -> Optional[float]:
+    """Get current price: WebSocket first, REST ticker fallback."""
+    ws_price = get_ws_price(symbol)
+    if ws_price is not None:
+        return ws_price
     try:
-        resp = await asyncio.to_thread(
-            bybit_session.get_kline,
-            category="linear",
-            symbol=symbol,
-            interval=interval,
-            limit=limit,
-        )
-        klines = resp["result"]["list"]
-        if not klines:
-            raise ValueError("No klines returned")
-
-        df = pd.DataFrame(
-            klines,
-            columns=["timestamp", "open", "high", "low", "close", "volume", "turnover"],
-        ).iloc[::-1].reset_index(drop=True)
-        df["high"] = pd.to_numeric(df["high"], errors="coerce")
-        df["low"] = pd.to_numeric(df["low"], errors="coerce")
-        df["close"] = pd.to_numeric(df["close"], errors="coerce")
-
-        if df["close"].isna().any():
-            raise ValueError("Invalid prices")
-
-        nine_period_high = df["high"].rolling(window=9).max()
-        nine_period_low = df["low"].rolling(window=9).min()
-        df["tenkan_sen"] = (nine_period_high + nine_period_low) / 2
-        conversion_line = float(df["tenkan_sen"].iloc[-1])
-
-        df["prev_close"] = df["close"].shift(1)
-        df["tr1"] = df["high"] - df["low"]
-        df["tr2"] = (df["high"] - df["prev_close"]).abs()
-        df["tr3"] = (df["low"] - df["prev_close"]).abs()
-        df["tr"] = df[["tr1", "tr2", "tr3"]].max(axis=1)
-        df["atr"] = df["tr"].rolling(window=14).mean()
-        atr = float(df["atr"].iloc[-1])
-
-        last_close = float(df["close"].iloc[-1])
-
         ticker_resp = await asyncio.to_thread(
             bybit_session.get_tickers,
             category="linear",
             symbol=symbol
         )
-        ticker = ticker_resp["result"]["list"][0]
-        current_price = float(ticker["lastPrice"])
+        return float(ticker_resp["result"]["list"][0]["lastPrice"])
+    except Exception as e:
+        print(f"Error getting current price for {symbol}: {e}")
+        return None
 
-        return conversion_line, atr, last_close, current_price
+def _detect_rsi_divergence(closes: pd.Series, rsi_values: pd.Series, lookback: int = 14) -> Optional[str]:
+    """
+    Detect RSI divergence by comparing swing highs/lows in two halves of lookback window.
+    Returns: 'bearish', 'bullish', or None
+    """
+    if len(closes) < lookback or len(rsi_values) < lookback:
+        return None
+    recent_close = closes.iloc[-lookback:].reset_index(drop=True)
+    recent_rsi = rsi_values.iloc[-lookback:].reset_index(drop=True)
 
-    except Exception as exc:
-        print(f"Error in get_ichimoku_and_atr for {symbol}: {exc}")
-        return None, None, None, None
+    mid = lookback // 2
+    first_half_close = recent_close.iloc[:mid]
+    second_half_close = recent_close.iloc[mid:]
+    first_half_rsi = recent_rsi.iloc[:mid]
+    second_half_rsi = recent_rsi.iloc[mid:]
+
+    # Bearish divergence: price higher high + RSI lower high
+    if (second_half_close.max() > first_half_close.max() and
+            second_half_rsi.max() < first_half_rsi.max()):
+        return "bearish"
+
+    # Bullish divergence: price lower low + RSI higher low
+    if (second_half_close.min() < first_half_close.min() and
+            second_half_rsi.min() > first_half_rsi.min()):
+        return "bullish"
+
+    return None
+
 
 async def get_all_indicators(
     symbol: str,
@@ -202,12 +338,14 @@ async def get_all_indicators(
 ) -> Optional[dict]:
     """
     Returns a dict with all trading indicators:
-    - conversion_line, atr, ema_20
+    - atr, ema_20
     - plus_di, minus_di (current candle)
     - prev_plus_di, prev_minus_di (previous candle)
     - di_crossed (bool), di_cross_type ("bullish"/"bearish"/None)
-    - adx (Average Directional Index)
-    - current_price (live tick)
+    - adx, adx_prev2 (ADX 2 candles ago for rising check)
+    - rsi, rsi_divergence ("bearish"/"bullish"/None)
+    - volume_ratio (current volume / 20-period avg volume)
+    - current_price (live tick via WebSocket or REST)
     - last_close (closed candle price - used for decisions)
     - last_candle_ts (for dedup)
     """
@@ -230,17 +368,12 @@ async def get_all_indicators(
         df["high"] = pd.to_numeric(df["high"], errors="coerce")
         df["low"] = pd.to_numeric(df["low"], errors="coerce")
         df["close"] = pd.to_numeric(df["close"], errors="coerce")
+        df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
 
         if df["close"].isna().any():
             raise ValueError("Invalid prices")
 
-        # 1. Ichimoku Conversion Line (Tenkan-sen)
-        nine_period_high = df["high"].rolling(window=9).max()
-        nine_period_low = df["low"].rolling(window=9).min()
-        df["tenkan_sen"] = (nine_period_high + nine_period_low) / 2
-        conversion_line = float(df["tenkan_sen"].iloc[-1])
-
-        # 2. ATR (14) using Wilder's smoothing
+        # 1. ATR (14) using Wilder's smoothing
         df["prev_close"] = df["close"].shift(1)
         df["tr1"] = df["high"] - df["low"]
         df["tr2"] = (df["high"] - df["prev_close"]).abs()
@@ -249,11 +382,11 @@ async def get_all_indicators(
         df["atr"] = df["tr"].ewm(alpha=1/14, min_periods=14).mean()
         atr = float(df["atr"].iloc[-1])
 
-        # 3. 20 EMA (30-minute chart)
+        # 2. 20 EMA (30-minute chart)
         df["ema_20"] = df["close"].ewm(span=20, adjust=False).mean()
         ema_20 = float(df["ema_20"].iloc[-1])
 
-        # 4. DMI: +DI / -DI (14-period, Wilder's smoothing)
+        # 3. DMI: +DI / -DI (14-period, Wilder's smoothing)
         df["up_move"] = df["high"] - df["high"].shift(1)
         df["down_move"] = df["low"].shift(1) - df["low"]
 
@@ -264,11 +397,9 @@ async def get_all_indicators(
         df.loc[plus_dm_mask, "+dm"] = df.loc[plus_dm_mask, "up_move"]
         df.loc[minus_dm_mask, "-dm"] = df.loc[minus_dm_mask, "down_move"]
 
-        # Wilder's smoothing (EMA with alpha=1/14)
         df["+dm_smooth"] = df["+dm"].ewm(alpha=1/14, min_periods=14).mean()
         df["-dm_smooth"] = df["-dm"].ewm(alpha=1/14, min_periods=14).mean()
 
-        # +DI and -DI
         df["+di"] = (df["+dm_smooth"] / df["atr"]) * 100
         df["-di"] = (df["-dm_smooth"] / df["atr"]) * 100
 
@@ -277,12 +408,33 @@ async def get_all_indicators(
         prev_plus_di = float(df["+di"].iloc[-2])
         prev_minus_di = float(df["-di"].iloc[-2])
 
-        # 5. ADX (Average Directional Index) - 14-period Wilder's smoothing of DX
+        # 4. ADX (Average Directional Index) - 14-period Wilder's smoothing of DX
         di_sum = df["+di"] + df["-di"]
-        di_sum = di_sum.replace(0, float('nan'))  # avoid division by zero
+        di_sum = di_sum.replace(0, float('nan'))
         df["dx"] = (abs(df["+di"] - df["-di"]) / di_sum) * 100
         df["adx"] = df["dx"].ewm(alpha=1/14, min_periods=14).mean()
         adx = float(df["adx"].iloc[-1])
+        # ADX rising check: ADX must be higher than 2 candles ago
+        adx_prev2 = float(df["adx"].iloc[-3]) if len(df) >= 3 else adx
+
+        # 5. RSI (14-period, Wilder's smoothing)
+        delta = df["close"].diff()
+        gain = delta.where(delta > 0, 0.0)
+        loss = (-delta.where(delta < 0, 0.0))
+        avg_gain = gain.ewm(alpha=1/14, min_periods=14).mean()
+        avg_loss = loss.ewm(alpha=1/14, min_periods=14).mean()
+        rs = avg_gain / avg_loss.replace(0, float('nan'))
+        df["rsi"] = 100 - (100 / (1 + rs))
+        rsi = float(df["rsi"].iloc[-1]) if not pd.isna(df["rsi"].iloc[-1]) else 50.0
+
+        # 6. RSI Divergence detection
+        rsi_divergence = _detect_rsi_divergence(df["close"], df["rsi"], RSI_DIVERGENCE_LOOKBACK)
+
+        # 7. Volume filter: current candle volume vs 20-period average
+        df["vol_avg_20"] = df["volume"].rolling(window=20).mean()
+        last_volume = float(df["volume"].iloc[-2])  # last CLOSED candle volume
+        avg_volume = float(df["vol_avg_20"].iloc[-2]) if not pd.isna(df["vol_avg_20"].iloc[-2]) else 1.0
+        volume_ratio = last_volume / avg_volume if avg_volume > 0 else 0.0
 
         # Detect DI crossover on the latest candle
         prev_diff = prev_plus_di - prev_minus_di
@@ -300,19 +452,14 @@ async def get_all_indicators(
         last_candle_ts = str(df["timestamp"].iloc[-1])
 
         # Last closed candle price (used for all trading decisions)
-        last_close = float(df["close"].iloc[-2])  # second-to-last = last CLOSED candle
+        last_close = float(df["close"].iloc[-2])
 
-        # Current price from ticker (for display / real-time reference)
-        ticker_resp = await asyncio.to_thread(
-            bybit_session.get_tickers,
-            category="linear",
-            symbol=symbol
-        )
-        ticker = ticker_resp["result"]["list"][0]
-        current_price = float(ticker["lastPrice"])
+        # Current price from WebSocket (instant) or REST ticker (fallback)
+        current_price = await get_current_price(symbol)
+        if current_price is None:
+            current_price = last_close  # ultimate fallback
 
         return {
-            "conversion_line": conversion_line,
             "atr": atr,
             "ema_20": ema_20,
             "plus_di": plus_di,
@@ -322,6 +469,10 @@ async def get_all_indicators(
             "di_crossed": di_crossed,
             "di_cross_type": di_cross_type,
             "adx": adx,
+            "adx_prev2": adx_prev2,
+            "rsi": rsi,
+            "rsi_divergence": rsi_divergence,
+            "volume_ratio": volume_ratio,
             "current_price": current_price,
             "last_close": last_close,
             "last_candle_ts": last_candle_ts,
@@ -406,7 +557,7 @@ async def get_trade_qty(symbol: str) -> float:
         total_avail_usd_str = account.get("totalAvailableBalance", "0")
         total_avail_usd = float(total_avail_usd_str)
 
-        _, _, _, current_price = await get_ichimoku_and_atr(symbol)
+        current_price = await get_current_price(symbol)
         min_qty, max_qty, qty_step, min_notional = await get_instrument_constraints(symbol)
 
         if current_price is None or current_price <= 0:
@@ -578,6 +729,7 @@ def _clear_risk_state(symbol: str) -> None:
     symbol_sl1_qty[symbol] = None
     symbol_sl1_taken[symbol] = False
     symbol_original_qty[symbol] = None
+    save_state()
 
 
 def _set_entry_risk_state(symbol: str, entry_price: float, atr: float) -> None:
@@ -604,6 +756,7 @@ def _set_entry_risk_state(symbol: str, entry_price: float, atr: float) -> None:
     symbol_sl1_qty[symbol] = None
     symbol_sl1_taken[symbol] = False
     symbol_original_qty[symbol] = None
+    save_state()
 
 
 # ────────────────────────────────────────────────
@@ -979,6 +1132,10 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
     ema_20 = indicators["ema_20"]
     atr = indicators["atr"]
     adx = indicators["adx"]
+    adx_prev2 = indicators["adx_prev2"]
+    rsi = indicators["rsi"]
+    rsi_divergence = indicators["rsi_divergence"]
+    volume_ratio = indicators["volume_ratio"]
     plus_di = indicators["plus_di"]
     minus_di = indicators["minus_di"]
     di_crossed = indicators["di_crossed"]
@@ -1072,6 +1229,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                     sl1_taken = True
                     symbol_sl1_order_id[symbol] = None
                     symbol_sl1_qty[symbol] = None
+                    save_state()
                     side_label = "Long" if current_open_trade_side == "Buy" else "Short"
                     await context.bot.send_message(
                         chat_id=chat_id,
@@ -1192,15 +1350,16 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
             if unrealized_profit >= TRAILING_ACTIVATE_ATR * entry_atr and not trailing_active:
                 symbol_trailing_active[symbol] = True
                 trailing_active = True
+                save_state()
 
                 pos_qty = await get_position_size(symbol)
                 if pos_qty:
                     trail_qty = pos_qty * TRAILING_CLOSE_PCT
                     trail_stop_price = peak - (TRAILING_STOP_ATR * entry_atr)
 
-                    # Cancel SL orders (replaced by trailing)
+                    # Cancel SL1 tier order (trailing now manages exit)
+                    # Keep server-side SL active to protect remaining 40% (and later 10%)
                     await cancel_sl1_order(symbol)
-                    await cancel_server_stops(symbol)
 
                     # Place conditional stop order for 60% at trail price
                     order_id = await place_trail_stop_order(symbol, "Buy", trail_qty, trail_stop_price)
@@ -1280,6 +1439,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                         symbol_trail_order_id[symbol] = None
                         symbol_trail_qty[symbol] = None
                         symbol_server_ts_set[symbol] = False
+                        save_state()
 
                         await context.bot.send_message(
                             chat_id=chat_id,
@@ -1419,15 +1579,16 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
             if unrealized_profit >= TRAILING_ACTIVATE_ATR * entry_atr and not trailing_active:
                 symbol_trailing_active[symbol] = True
                 trailing_active = True
+                save_state()
 
                 pos_qty = await get_position_size(symbol)
                 if pos_qty:
                     trail_qty = pos_qty * TRAILING_CLOSE_PCT
                     trail_stop_price = peak + (TRAILING_STOP_ATR * entry_atr)
 
-                    # Cancel SL orders (replaced by trailing)
+                    # Cancel SL1 tier order (trailing now manages exit)
+                    # Keep server-side SL active to protect remaining 40% (and later 10%)
                     await cancel_sl1_order(symbol)
-                    await cancel_server_stops(symbol)
 
                     order_id = await place_trail_stop_order(symbol, "Sell", trail_qty, trail_stop_price)
 
@@ -1505,6 +1666,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                         symbol_trail_order_id[symbol] = None
                         symbol_trail_qty[symbol] = None
                         symbol_server_ts_set[symbol] = False
+                        save_state()
 
                         await context.bot.send_message(
                             chat_id=chat_id,
@@ -1768,23 +1930,52 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     # ──────────────────────────────────────────────
     # 3. INITIAL TRADE ENTRY (no open position)
-    #    Requires: ADX > 20 + EMA direction + DI alignment
+    #    5-layer filter:
+    #      1. ADX > 23 AND ADX rising (ADX > ADX[2 candles ago])
+    #      2. EMA + DI alignment
+    #      3. RSI NOT in extreme zone (not > 70 for longs, not < 30 for shorts)
+    #      4. NO opposing RSI divergence
+    #      5. Volume > 1.5x 20-period average
     # ──────────────────────────────────────────────
     if current_open_trade_side is None:
-        # ADX filter: only trade in trending markets
+        # Filter 1a: ADX must be above threshold
         if adx < ADX_THRESHOLD:
-            # Market is sideways - stay flat, do not enter
-            # (Only log occasionally to avoid spam)
+            return
+
+        # Filter 1b: ADX must be rising (stronger than 2 candles ago)
+        if adx <= adx_prev2:
+            print(f"[FILTER] {symbol}: Entry blocked — ADX not rising ({adx:.2f} <= {adx_prev2:.2f})")
+            return
+
+        # Filter 5: Volume must exceed 1.5x 20-period average
+        if volume_ratio < VOLUME_FILTER_MULT:
+            print(f"[FILTER] {symbol}: Entry blocked — volume too low (ratio={volume_ratio:.2f}, need>{VOLUME_FILTER_MULT})")
             return
 
         new_trend = None
         side = None
         # Long: last_close > 20 EMA AND +DI > -DI
         if last_close > ema_20 and plus_di > minus_di:
+            # Filter 3: RSI not overbought for longs
+            if rsi > RSI_OVERBOUGHT:
+                print(f"[FILTER] {symbol}: Long entry blocked — RSI overbought ({rsi:.2f} > {RSI_OVERBOUGHT})")
+                return
+            # Filter 4: No bearish divergence for longs
+            if rsi_divergence == "bearish":
+                print(f"[FILTER] {symbol}: Long entry blocked — bearish RSI divergence detected")
+                return
             new_trend = "upward"
             side = "Buy"
         # Short: last_close < 20 EMA AND -DI > +DI
         elif last_close < ema_20 and minus_di > plus_di:
+            # Filter 3: RSI not oversold for shorts
+            if rsi < RSI_OVERSOLD:
+                print(f"[FILTER] {symbol}: Short entry blocked — RSI oversold ({rsi:.2f} < {RSI_OVERSOLD})")
+                return
+            # Filter 4: No bullish divergence for shorts
+            if rsi_divergence == "bullish":
+                print(f"[FILTER] {symbol}: Short entry blocked — bullish RSI divergence detected")
+                return
             new_trend = "downward"
             side = "Sell"
 
@@ -1794,7 +1985,8 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
             msg = (
                 f"{ts} \u2014 {symbol} ENTRY SIGNAL: <b>{new_trend.upper()}</b>\n"
                 f"Last Close: {last_close} | 20 EMA: {ema_20:.6g}\n"
-                f"+DI: {plus_di:.2f} | -DI: {minus_di:.2f} | ADX: {adx:.2f}\n"
+                f"+DI: {plus_di:.2f} | -DI: {minus_di:.2f} | ADX: {adx:.2f} (prev2: {adx_prev2:.2f})\n"
+                f"RSI: {rsi:.2f} | Vol Ratio: {volume_ratio:.2f}x | Divergence: {rsi_divergence or 'None'}\n"
                 f"Direction: {side_text}"
             )
             await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
@@ -1820,6 +2012,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
 
             symbol_trends[symbol] = new_trend
             symbol_open_trade_side[symbol] = await get_open_position_side(symbol)
+            save_state()
 
     # ──────────────────────────────────────────────
     # 4. 30-Minute Status Report
@@ -1886,12 +2079,14 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
 
         report_msg = (
             f"Still monitoring {symbol}\n"
-            f"\u2022 Entry: EMA + DI alignment + ADX > {ADX_THRESHOLD}\n"
+            f"\u2022 Entry: 5-layer filter (ADX>{ADX_THRESHOLD}+rising, EMA+DI, RSI, Divergence, Volume)\n"
             f"\u2022 Exit: Price crosses EMA + DI crossover required\n"
             f"\u2022 Reverse: Only if DI + ADX confirm, else FLAT\n"
-            f"\u2022 SL: 30% at {SL_STAGE1_ATR_MULT}x ATR + 70% at {STOP_LOSS_ATR_MULT}x ATR | Trail: 60% at {TRAILING_ACTIVATE_ATR}x ATR, then 30% at 1x ATR, 10% rides\n"
-            f"\u2022 Monitoring every {POLL_INTERVAL_SECONDS}s (real-time price for risk)\n"
-            f"\u2022 20 EMA: {ema_20:.6g} | +DI: {plus_di:.2f} | -DI: {minus_di:.2f} | ADX: {adx:.2f}\n"
+            f"\u2022 SL: 30% at {SL_STAGE1_ATR_MULT}x ATR + 70% at {STOP_LOSS_ATR_MULT}x ATR (server SL always active)\n"
+            f"\u2022 Trail: 60% at {TRAILING_ACTIVATE_ATR}x ATR, then 30% at 1x ATR, 10% rides\n"
+            f"\u2022 WebSocket prices + polling every {POLL_INTERVAL_SECONDS}s\n"
+            f"\u2022 20 EMA: {ema_20:.6g} | +DI: {plus_di:.2f} | -DI: {minus_di:.2f} | ADX: {adx:.2f} (prev2: {adx_prev2:.2f})\n"
+            f"\u2022 RSI: {rsi:.2f} | Vol Ratio: {volume_ratio:.2f}x | Divergence: {rsi_divergence or 'None'}\n"
             f"\u2022 Last Close: {last_close} | Current Price: {current_price}\n"
             f"\u2022 {symbol} state: {current_market_state}\n"
             f"\u2022 {trade_status}"
@@ -1938,6 +2133,10 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     _clear_risk_state(symbol)
     if symbol not in monitored_symbols:
         monitored_symbols.append(symbol)
+    save_state()
+
+    # Subscribe to WebSocket ticker for real-time price feeds
+    subscribe_ws_symbol(symbol)
 
     chat_id = update.effective_chat.id
 
@@ -1954,21 +2153,61 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             adx = indicators["adx"]
             atr = indicators["atr"]
 
-            # Check ADX filter
+            adx_prev2 = indicators["adx_prev2"]
+            rsi = indicators["rsi"]
+            rsi_divergence = indicators["rsi_divergence"]
+            volume_ratio = indicators["volume_ratio"]
+
+            # 5-layer entry filter for instant trade
+            entry_blocked = False
+            block_reason = ""
+
+            # Filter 1a: ADX threshold
             if adx < ADX_THRESHOLD:
+                entry_blocked = True
+                block_reason = f"ADX ({adx:.2f}) < {ADX_THRESHOLD} — market is sideways"
+            # Filter 1b: ADX rising
+            elif adx <= adx_prev2:
+                entry_blocked = True
+                block_reason = f"ADX not rising ({adx:.2f} <= {adx_prev2:.2f})"
+            # Filter 5: Volume
+            elif volume_ratio < VOLUME_FILTER_MULT:
+                entry_blocked = True
+                block_reason = f"Volume too low (ratio={volume_ratio:.2f}, need>{VOLUME_FILTER_MULT})"
+
+            if entry_blocked:
                 await update.message.reply_text(
-                    f"\u26a0\ufe0f ADX ({adx:.2f}) < {ADX_THRESHOLD} - Market is SIDEWAYS.\n"
-                    f"Instant trade skipped. Monitoring will wait for trending conditions."
+                    f"\u26a0\ufe0f Instant trade blocked for {symbol}: {block_reason}\n"
+                    f"Monitoring will wait for proper conditions."
                 )
             else:
-                # Require EMA + DI alignment
+                # Require EMA + DI alignment + RSI + divergence filters
                 side = None
                 if last_close > ema_20 and plus_di > minus_di:
-                    side = "Buy"
+                    if rsi > RSI_OVERBOUGHT:
+                        entry_blocked = True
+                        block_reason = f"RSI overbought ({rsi:.2f} > {RSI_OVERBOUGHT})"
+                    elif rsi_divergence == "bearish":
+                        entry_blocked = True
+                        block_reason = "Bearish RSI divergence detected"
+                    else:
+                        side = "Buy"
                 elif last_close < ema_20 and minus_di > plus_di:
-                    side = "Sell"
+                    if rsi < RSI_OVERSOLD:
+                        entry_blocked = True
+                        block_reason = f"RSI oversold ({rsi:.2f} < {RSI_OVERSOLD})"
+                    elif rsi_divergence == "bullish":
+                        entry_blocked = True
+                        block_reason = "Bullish RSI divergence detected"
+                    else:
+                        side = "Sell"
 
-                if side is None:
+                if entry_blocked:
+                    await update.message.reply_text(
+                        f"\u26a0\ufe0f Instant trade blocked for {symbol}: {block_reason}\n"
+                        f"Monitoring will wait for proper conditions."
+                    )
+                elif side is None:
                     await update.message.reply_text(
                         f"\u26a0\ufe0f No aligned signal for {symbol}.\n"
                         f"Last Close: {last_close} | EMA: {ema_20:.6g}\n"
@@ -2019,12 +2258,13 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(
         f"Monitoring {symbol}!\n"
         f"\u2022 {qty_info}\n"
-        f"\u2022 Entry: Last Close vs 20 EMA + DI alignment + ADX > {ADX_THRESHOLD}\n"
+        f"\u2022 Entry filters: ADX > {ADX_THRESHOLD} + ADX rising + EMA/DI alignment + RSI filter + Divergence filter + Volume > {VOLUME_FILTER_MULT}x avg\n"
         f"\u2022 Exit: Price crosses 20 EMA + DI crossover required\n"
         f"\u2022 Reverse only if DI + ADX confirm, else FLAT\n"
-        f"\u2022 SL: 30% at {SL_STAGE1_ATR_MULT}x ATR + 70% at {STOP_LOSS_ATR_MULT}x ATR\n"
+        f"\u2022 SL: 30% at {SL_STAGE1_ATR_MULT}x ATR + 70% at {STOP_LOSS_ATR_MULT}x ATR (server-side SL always active)\n"
         f"\u2022 Trail: 60% at {TRAILING_ACTIVATE_ATR}x ATR profit ({TRAILING_STOP_ATR}x ATR dist), then 30% ({TRAILING_STOP_ATR_STAGE2}x ATR dist), 10% rides until EMA+DI exit\n"
-        f"\u2022 Monitoring every {POLL_INTERVAL_SECONDS}s (real-time price for risk checks)\n"
+        f"\u2022 WebSocket real-time price feeds + polling every {POLL_INTERVAL_SECONDS}s\n"
+        f"\u2022 State persistence: crash recovery via {STATE_FILE}\n"
         f"\u2022 Status report every 30 minutes"
     )
 
@@ -2078,6 +2318,7 @@ async def remove_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         for job in jobs:
             job.schedule_removal()
 
+    save_state()
     await update.message.reply_text(f"Stopped monitoring {symbol}.")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2086,25 +2327,30 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("\u26d4 Unauthorized. This bot is private.")
         return
     await update.message.reply_text(
-        "Bot ready! (v6 - Multi-Stage Trailing + Tiered SL)\n\n"
+        "Bot ready! (v7 - 5-Layer Filter + WebSocket + State Persistence)\n\n"
         "Commands:\n"
         "1. /start - Display this message\n"
         "2. /add_symbol <symbol> - Start monitoring with auto-sizing (20% balance)\n"
         "3. /add_symbol <symbol> <quantity> - INSTANT TRADE + Manual quantity monitoring\n"
         "4. /remove_symbol <symbol> - Stop monitoring a symbol\n\n"
-        "v6 Stop-Loss (Tiered):\n"
+        "v7 Entry Filters (ALL must pass):\n"
+        f"\u2022 1. ADX > {ADX_THRESHOLD} AND ADX rising (ADX > ADX[2 candles ago])\n"
+        "\u2022 2. EMA + DI alignment (Price vs 20 EMA + DI direction)\n"
+        f"\u2022 3. RSI NOT extreme (not > {RSI_OVERBOUGHT} for longs, not < {RSI_OVERSOLD} for shorts)\n"
+        "\u2022 4. NO opposing RSI divergence\n"
+        f"\u2022 5. Volume > {VOLUME_FILTER_MULT}x 20-period average\n\n"
+        "Stop-Loss (Tiered):\n"
         f"\u2022 Tier 1: 30% closed INSTANTLY at {SL_STAGE1_ATR_MULT}x ATR loss\n"
-        f"\u2022 Tier 2: Remaining 70% closed at {STOP_LOSS_ATR_MULT}x ATR loss (server-side)\n\n"
-        "v6 Trailing Stop (Multi-Stage):\n"
+        f"\u2022 Tier 2: Remaining 70% closed at {STOP_LOSS_ATR_MULT}x ATR loss (server-side, always active)\n\n"
+        "Trailing Stop (Multi-Stage):\n"
         f"\u2022 At {TRAILING_ACTIVATE_ATR}x ATR profit: Stage 1 trail activates on {TRAILING_CLOSE_PCT*100:.0f}%\n"
         f"\u2022 Stage 1 trail: {TRAILING_STOP_ATR}x ATR distance. Bybit closes {TRAILING_CLOSE_PCT*100:.0f}% INSTANTLY when hit\n"
         f"\u2022 Stage 2 trail: After 60% closed, 30% gets trail ({TRAILING_STOP_ATR_STAGE2}x ATR distance)\n"
-        f"\u2022 Remaining 10% has NO trailing stop \u2014 exits on EMA+DI crossover only\n\n"
-        "Entry/Exit Rules:\n"
-        f"\u2022 ADX > {ADX_THRESHOLD} filter (no trades in sideways markets)\n"
-        "\u2022 EMA + DI alignment required for entry\n"
-        "\u2022 Exit requires: EMA cross + DI crossover\n"
-        f"\u2022 Real-time price for risk checks (polls every {POLL_INTERVAL_SECONDS}s)\n"
+        f"\u2022 Remaining 10% protected by server-side SL + exits on EMA+DI crossover\n\n"
+        "Infrastructure:\n"
+        "\u2022 WebSocket real-time price feeds (REST fallback)\n"
+        f"\u2022 State persistence: {STATE_FILE} (crash recovery)\n"
+        f"\u2022 Monitoring every {POLL_INTERVAL_SECONDS}s\n"
         "\u2022 Bot is PRIVATE \u2014 only accessible by owner\n\n"
         "Examples:\n"
         "\u2022 /add_symbol BTCUSDT\n"
@@ -2124,6 +2370,17 @@ async def main():
     print("=== Render startup: Initializing ===")
     print(f"TELEGRAM_TOKEN loaded (length: {len(TELEGRAM_TOKEN)} chars)")
     print(f"CHAT_ID loaded: {CHAT_ID}")
+
+    # Load persisted state from disk (crash recovery)
+    if load_state():
+        print(f"[STARTUP] Restored {len(monitored_symbols)} monitored symbols from state file")
+
+    # Initialize WebSocket for real-time price feeds
+    if start_websocket():
+        # Subscribe to all monitored symbols
+        for sym in monitored_symbols:
+            subscribe_ws_symbol(sym)
+        print(f"[STARTUP] WebSocket subscribed to {len(monitored_symbols)} symbols")
 
     application = Application.builder().token(TELEGRAM_TOKEN).updater(None).build()
 
