@@ -1821,7 +1821,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
             if symbol in symbol_manual_quantities and symbol_manual_quantities[symbol] is not None:
                 manual_override = closed_qty
 
-            # Check if we should REVERSE to Short (requires: -DI > +DI AND ADX > 20)
+            # Check if we should REVERSE to Short (requires: -DI > +DI AND ADX > threshold)
             if minus_di > plus_di and adx > ADX_THRESHOLD:
                 await context.bot.send_message(
                     chat_id=chat_id,
@@ -1884,7 +1884,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
             if symbol in symbol_manual_quantities and symbol_manual_quantities[symbol] is not None:
                 manual_override = closed_qty
 
-            # Check if we should REVERSE to Long (requires: +DI > -DI AND ADX > 20)
+            # Check if we should REVERSE to Long (requires: +DI > -DI AND ADX > threshold)
             if plus_di > minus_di and adx > ADX_THRESHOLD:
                 await context.bot.send_message(
                     chat_id=chat_id,
@@ -1931,7 +1931,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
     # ──────────────────────────────────────────────
     # 3. INITIAL TRADE ENTRY (no open position)
     #    5-layer filter:
-    #      1. ADX > 23 AND ADX rising (ADX > ADX[2 candles ago])
+    #      1. ADX > 23
     #      2. EMA + DI alignment
     #      3. RSI NOT in extreme zone (not > 70 for longs, not < 30 for shorts)
     #      4. NO opposing RSI divergence
@@ -1940,11 +1940,6 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
     if current_open_trade_side is None:
         # Filter 1a: ADX must be above threshold
         if adx < ADX_THRESHOLD:
-            return
-
-        # Filter 1b: ADX must be rising (stronger than 2 candles ago)
-        if adx <= adx_prev2:
-            print(f"[FILTER] {symbol}: Entry blocked — ADX not rising ({adx:.2f} <= {adx_prev2:.2f})")
             return
 
         # Filter 5: Volume must exceed 1.5x 20-period average
