@@ -122,7 +122,7 @@ def get_ws_price(symbol: str) -> Optional[float]:
 # ────────────────────────────────────────────────
 #  State Persistence (JSON)
 # ────────────────────────────────────────────────
-STATE_FILE = os.getenv("STATE_FILE", "bot_state.json")
+STATE_FILE = os.getenv("STATE_FILE", "/opt/render/project/src/bot_state.json")
 
 def save_state():
     """Save all bot state to JSON file for crash recovery."""
@@ -255,8 +255,6 @@ TRAILING_STAGE2_PCT = 0.75   # Close 75% of remaining 40% (= 30% of original) on
 POLL_INTERVAL_SECONDS = 10   # Poll every 10 seconds (faster for risk management)
 RSI_OVERBOUGHT = 70          # Block long entries when RSI > 70
 RSI_OVERSOLD = 30            # Block short entries when RSI < 30
-RSI_DIVERGENCE_LOOKBACK = 14 # Candles to look back for RSI divergence
-VOLUME_FILTER_MULT = 1.5     # Only enter when volume > 1.5x 20-period average
 
 MOTIVATIONAL_QUOTES = [
     "\u201cThe market doesn\u2019t reward intelligence \U0001f9e0 \u2014 it rewards discipline \U0001f9f1.\nSmart traders survive, disciplined traders compound.\u201d",
@@ -302,34 +300,6 @@ async def get_current_price(symbol: str) -> Optional[float]:
         print(f"Error getting current price for {symbol}: {e}")
         return None
 
-def _detect_rsi_divergence(closes: pd.Series, rsi_values: pd.Series, lookback: int = 14) -> Optional[str]:
-    """
-    Detect RSI divergence by comparing swing highs/lows in two halves of lookback window.
-    Returns: 'bearish', 'bullish', or None
-    """
-    if len(closes) < lookback or len(rsi_values) < lookback:
-        return None
-    recent_close = closes.iloc[-lookback:].reset_index(drop=True)
-    recent_rsi = rsi_values.iloc[-lookback:].reset_index(drop=True)
-
-    mid = lookback // 2
-    first_half_close = recent_close.iloc[:mid]
-    second_half_close = recent_close.iloc[mid:]
-    first_half_rsi = recent_rsi.iloc[:mid]
-    second_half_rsi = recent_rsi.iloc[mid:]
-
-    # Bearish divergence: price higher high + RSI lower high
-    if (second_half_close.max() > first_half_close.max() and
-            second_half_rsi.max() < first_half_rsi.max()):
-        return "bearish"
-
-    # Bullish divergence: price lower low + RSI higher low
-    if (second_half_close.min() < first_half_close.min() and
-            second_half_rsi.min() > first_half_rsi.min()):
-        return "bullish"
-
-    return None
-
 
 async def get_all_indicators(
     symbol: str,
@@ -343,8 +313,9 @@ async def get_all_indicators(
     - prev_plus_di, prev_minus_di (previous candle)
     - di_crossed (bool), di_cross_type ("bullish"/"bearish"/None)
     - adx, adx_prev2 (ADX 2 candles ago for rising check)
-    - rsi, rsi_divergence ("bearish"/"bullish"/None)
-    - volume_ratio (current volume / 20-period avg volume)
+    - rsi
+    - macd_line, signal_line, macd_histogram, prev_macd_histogram
+    - macd_hist_increasing (bool), macd_hist_decreasing (bool)
     - current_price (live tick via WebSocket or REST)
     - last_close (closed candle price - used for decisions)
     - last_candle_ts (for dedup)
@@ -427,14 +398,24 @@ async def get_all_indicators(
         df["rsi"] = 100 - (100 / (1 + rs))
         rsi = float(df["rsi"].iloc[-1]) if not pd.isna(df["rsi"].iloc[-1]) else 50.0
 
-        # 6. RSI Divergence detection
-        rsi_divergence = _detect_rsi_divergence(df["close"], df["rsi"], RSI_DIVERGENCE_LOOKBACK)
+        # 6. MACD (12, 26, 9)
+        df["ema_12"] = df["close"].ewm(span=12, adjust=False).mean()
+        df["ema_26"] = df["close"].ewm(span=26, adjust=False).mean()
+        df["macd_line"] = df["ema_12"] - df["ema_26"]
+        df["signal_line"] = df["macd_line"].ewm(span=9, adjust=False).mean()
+        df["macd_histogram"] = df["macd_line"] - df["signal_line"]
 
-        # 7. Volume filter: current candle volume vs 20-period average
-        df["vol_avg_20"] = df["volume"].rolling(window=20).mean()
-        last_volume = float(df["volume"].iloc[-2])  # last CLOSED candle volume
-        avg_volume = float(df["vol_avg_20"].iloc[-2]) if not pd.isna(df["vol_avg_20"].iloc[-2]) else 1.0
-        volume_ratio = last_volume / avg_volume if avg_volume > 0 else 0.0
+        macd_line = float(df["macd_line"].iloc[-1])
+        signal_line = float(df["signal_line"].iloc[-1])
+        macd_histogram = float(df["macd_histogram"].iloc[-1])
+        prev_macd_histogram = float(df["macd_histogram"].iloc[-2]) if len(df) >= 2 else macd_histogram
+        prev2_macd_histogram = float(df["macd_histogram"].iloc[-3]) if len(df) >= 3 else prev_macd_histogram
+
+        # Histogram momentum: check last 2 bars direction
+        # For longs: histogram should be increasing (current > previous)
+        # For shorts: histogram should be decreasing (current < previous)
+        macd_hist_increasing = (macd_histogram > prev_macd_histogram)
+        macd_hist_decreasing = (macd_histogram < prev_macd_histogram)
 
         # Detect DI crossover on the latest candle
         prev_diff = prev_plus_di - prev_minus_di
@@ -471,8 +452,12 @@ async def get_all_indicators(
             "adx": adx,
             "adx_prev2": adx_prev2,
             "rsi": rsi,
-            "rsi_divergence": rsi_divergence,
-            "volume_ratio": volume_ratio,
+            "macd_line": macd_line,
+            "signal_line": signal_line,
+            "macd_histogram": macd_histogram,
+            "prev_macd_histogram": prev_macd_histogram,
+            "macd_hist_increasing": macd_hist_increasing,
+            "macd_hist_decreasing": macd_hist_decreasing,
             "current_price": current_price,
             "last_close": last_close,
             "last_candle_ts": last_candle_ts,
@@ -1134,8 +1119,12 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
     adx = indicators["adx"]
     adx_prev2 = indicators["adx_prev2"]
     rsi = indicators["rsi"]
-    rsi_divergence = indicators["rsi_divergence"]
-    volume_ratio = indicators["volume_ratio"]
+    macd_line = indicators["macd_line"]
+    signal_line = indicators["signal_line"]
+    macd_histogram = indicators["macd_histogram"]
+    prev_macd_histogram = indicators["prev_macd_histogram"]
+    macd_hist_increasing = indicators["macd_hist_increasing"]
+    macd_hist_decreasing = indicators["macd_hist_decreasing"]
     plus_di = indicators["plus_di"]
     minus_di = indicators["minus_di"]
     di_crossed = indicators["di_crossed"]
@@ -1837,14 +1826,15 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
             if symbol in symbol_manual_quantities and symbol_manual_quantities[symbol] is not None:
                 manual_override = closed_qty
 
-            # Check if we should REVERSE to Short (requires: Price < 20 EMA AND -DI > +DI AND ADX > threshold)
-            if last_close < ema_20 and minus_di > plus_di and adx > ADX_THRESHOLD:
+            # Check if we should REVERSE to Short (requires: Price < 20 EMA AND -DI > +DI AND ADX > threshold AND MACD < Signal)
+            if last_close < ema_20 and minus_di > plus_di and adx > ADX_THRESHOLD and macd_line < signal_line:
                 await context.bot.send_message(
                     chat_id=chat_id,
                     text=(
                         f"\U0001f504 REVERSE to Short for {symbol}\n"
                         f"Price ({last_close}) < 20 EMA ({ema_20:.6g})\n"
                         f"-DI ({minus_di:.2f}) > +DI ({plus_di:.2f}) | ADX: {adx:.2f} > {ADX_THRESHOLD}\n"
+                        f"MACD: {macd_line:.6g} < Signal: {signal_line:.6g}\n"
                         f"Opening Short..."
                     )
                 )
@@ -1872,8 +1862,9 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                     chat_id=chat_id,
                     text=(
                         f"\U0001f7e1 GOING FLAT for {symbol}\n"
-                        f"No reverse signal (need: Price < 20 EMA + -DI > +DI + ADX > {ADX_THRESHOLD})\n"
+                        f"No reverse signal (need: Price < 20 EMA + -DI > +DI + ADX > {ADX_THRESHOLD} + MACD < Signal)\n"
                         f"+DI: {plus_di:.2f} | -DI: {minus_di:.2f} | ADX: {adx:.2f}\n"
+                        f"MACD: {macd_line:.6g} | Signal: {signal_line:.6g}\n"
                         f"Waiting for next entry signal..."
                     )
                 )
@@ -1901,14 +1892,15 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
             if symbol in symbol_manual_quantities and symbol_manual_quantities[symbol] is not None:
                 manual_override = closed_qty
 
-            # Check if we should REVERSE to Long (requires: Price > 20 EMA AND +DI > -DI AND ADX > threshold)
-            if last_close > ema_20 and plus_di > minus_di and adx > ADX_THRESHOLD:
+            # Check if we should REVERSE to Long (requires: Price > 20 EMA AND +DI > -DI AND ADX > threshold AND MACD > Signal)
+            if last_close > ema_20 and plus_di > minus_di and adx > ADX_THRESHOLD and macd_line > signal_line:
                 await context.bot.send_message(
                     chat_id=chat_id,
                     text=(
                         f"\U0001f504 REVERSE to Long for {symbol}\n"
                         f"Price ({last_close}) > 20 EMA ({ema_20:.6g})\n"
                         f"+DI ({plus_di:.2f}) > -DI ({minus_di:.2f}) | ADX: {adx:.2f} > {ADX_THRESHOLD}\n"
+                        f"MACD: {macd_line:.6g} > Signal: {signal_line:.6g}\n"
                         f"Opening Long..."
                     )
                 )
@@ -1936,8 +1928,9 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                     chat_id=chat_id,
                     text=(
                         f"\U0001f7e1 GOING FLAT for {symbol}\n"
-                        f"No reverse signal (need: Price > 20 EMA + +DI > -DI + ADX > {ADX_THRESHOLD})\n"
+                        f"No reverse signal (need: Price > 20 EMA + +DI > -DI + ADX > {ADX_THRESHOLD} + MACD > Signal)\n"
                         f"+DI: {plus_di:.2f} | -DI: {minus_di:.2f} | ADX: {adx:.2f}\n"
+                        f"MACD: {macd_line:.6g} | Signal: {signal_line:.6g}\n"
                         f"Waiting for next entry signal..."
                     )
                 )
@@ -1948,11 +1941,12 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     # ──────────────────────────────────────────────
     # 3. INITIAL TRADE ENTRY (no open position)
-    #    4-layer filter:
+    #    5-layer filter:
     #      1. ADX > 24
     #      2. EMA + DI alignment (30-min chart)
     #      3. RSI NOT in extreme zone (not > 70 for longs, not < 30 for shorts)
-    #      4. NO opposing RSI divergence
+    #      4. MACD Line vs Signal Line alignment
+    #      5. MACD histogram momentum (increasing for longs, decreasing for shorts)
     # ──────────────────────────────────────────────
     if current_open_trade_side is None:
         # Filter 1: ADX must be above threshold
@@ -1967,9 +1961,13 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
             if rsi > RSI_OVERBOUGHT:
                 print(f"[FILTER] {symbol}: Long entry blocked — RSI overbought ({rsi:.2f} > {RSI_OVERBOUGHT})")
                 return
-            # Filter 4: No bearish divergence for longs
-            if rsi_divergence == "bearish":
-                print(f"[FILTER] {symbol}: Long entry blocked — bearish RSI divergence detected")
+            # Filter 4: MACD Line must be above Signal Line for longs
+            if macd_line <= signal_line:
+                print(f"[FILTER] {symbol}: Long entry blocked — MACD Line ({macd_line:.6g}) <= Signal Line ({signal_line:.6g})")
+                return
+            # Filter 5: MACD histogram must be increasing for longs
+            if not macd_hist_increasing:
+                print(f"[FILTER] {symbol}: Long entry blocked — MACD histogram declining ({prev_macd_histogram:.6g} -> {macd_histogram:.6g}), momentum dying")
                 return
             new_trend = "upward"
             side = "Buy"
@@ -1979,9 +1977,13 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
             if rsi < RSI_OVERSOLD:
                 print(f"[FILTER] {symbol}: Short entry blocked — RSI oversold ({rsi:.2f} < {RSI_OVERSOLD})")
                 return
-            # Filter 4: No bullish divergence for shorts
-            if rsi_divergence == "bullish":
-                print(f"[FILTER] {symbol}: Short entry blocked — bullish RSI divergence detected")
+            # Filter 4: MACD Line must be below Signal Line for shorts
+            if macd_line >= signal_line:
+                print(f"[FILTER] {symbol}: Short entry blocked — MACD Line ({macd_line:.6g}) >= Signal Line ({signal_line:.6g})")
+                return
+            # Filter 5: MACD histogram must be decreasing for shorts
+            if not macd_hist_decreasing:
+                print(f"[FILTER] {symbol}: Short entry blocked — MACD histogram rising ({prev_macd_histogram:.6g} -> {macd_histogram:.6g}), momentum dying")
                 return
             new_trend = "downward"
             side = "Sell"
@@ -1993,7 +1995,8 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                 f"{ts} \u2014 {symbol} ENTRY SIGNAL: <b>{new_trend.upper()}</b>\n"
                 f"Last Close: {last_close} | 20 EMA: {ema_20:.6g}\n"
                 f"+DI: {plus_di:.2f} | -DI: {minus_di:.2f} | ADX: {adx:.2f}\n"
-                f"RSI: {rsi:.2f} | Divergence: {rsi_divergence or 'None'}\n"
+                f"RSI: {rsi:.2f} | MACD: {macd_line:.6g} / Signal: {signal_line:.6g}\n"
+                f"MACD Hist: {macd_histogram:.6g} (prev: {prev_macd_histogram:.6g})\n"
                 f"Direction: {side_text}"
             )
             await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
@@ -2086,14 +2089,15 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
 
         report_msg = (
             f"Still monitoring {symbol}\n"
-            f"\u2022 Entry: 4-layer filter (ADX>{ADX_THRESHOLD}, EMA+DI, RSI, Divergence)\n"
+            f"\u2022 Entry: 5-layer filter (ADX>{ADX_THRESHOLD}, EMA+DI, RSI, MACD Line/Signal, MACD Hist momentum)\n"
             f"\u2022 Exit: Long exits when Price < 20 EMA AND -DI > +DI | Short exits when Price > 20 EMA AND +DI > -DI\n"
-            f"\u2022 Reverse: Only if ADX > {ADX_THRESHOLD} + EMA/DI alignment, else FLAT\n"
+            f"\u2022 Reverse: Only if ADX > {ADX_THRESHOLD} + EMA/DI + MACD alignment, else FLAT\n"
             f"\u2022 SL: 30% at {SL_STAGE1_ATR_MULT}x ATR + 70% at {STOP_LOSS_ATR_MULT}x ATR (server SL always active)\n"
             f"\u2022 Trail: 60% at {TRAILING_ACTIVATE_ATR}x ATR, then 30% at 1x ATR, 10% rides\n"
             f"\u2022 WebSocket prices + polling every {POLL_INTERVAL_SECONDS}s\n"
             f"\u2022 20 EMA: {ema_20:.6g} | +DI: {plus_di:.2f} | -DI: {minus_di:.2f} | ADX: {adx:.2f}\n"
-            f"\u2022 RSI: {rsi:.2f} | Divergence: {rsi_divergence or 'None'}\n"
+            f"\u2022 RSI: {rsi:.2f} | MACD: {macd_line:.6g} / Signal: {signal_line:.6g}\n"
+            f"\u2022 MACD Hist: {macd_histogram:.6g} (prev: {prev_macd_histogram:.6g})\n"
             f"\u2022 Last Close: {last_close} | Current Price: {current_price}\n"
             f"\u2022 {symbol} state: {current_market_state}\n"
             f"\u2022 {trade_status}"
@@ -2162,10 +2166,14 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
             adx_prev2 = indicators["adx_prev2"]
             rsi = indicators["rsi"]
-            rsi_divergence = indicators["rsi_divergence"]
-            volume_ratio = indicators["volume_ratio"]
+            macd_line = indicators["macd_line"]
+            signal_line = indicators["signal_line"]
+            macd_histogram = indicators["macd_histogram"]
+            prev_macd_histogram = indicators["prev_macd_histogram"]
+            macd_hist_increasing = indicators["macd_hist_increasing"]
+            macd_hist_decreasing = indicators["macd_hist_decreasing"]
 
-            # 4-layer entry filter for instant trade
+            # 5-layer entry filter for instant trade
             entry_blocked = False
             block_reason = ""
 
@@ -2180,24 +2188,30 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                     f"Monitoring will wait for proper conditions."
                 )
             else:
-                # Require EMA + DI alignment + RSI + divergence filters
+                # Require EMA + DI alignment + RSI + MACD filters
                 side = None
                 if last_close > ema_20 and plus_di > minus_di:
                     if rsi > RSI_OVERBOUGHT:
                         entry_blocked = True
                         block_reason = f"RSI overbought ({rsi:.2f} > {RSI_OVERBOUGHT})"
-                    elif rsi_divergence == "bearish":
+                    elif macd_line <= signal_line:
                         entry_blocked = True
-                        block_reason = "Bearish RSI divergence detected"
+                        block_reason = f"MACD Line ({macd_line:.6g}) <= Signal Line ({signal_line:.6g})"
+                    elif not macd_hist_increasing:
+                        entry_blocked = True
+                        block_reason = f"MACD histogram declining ({prev_macd_histogram:.6g} -> {macd_histogram:.6g}), momentum dying"
                     else:
                         side = "Buy"
                 elif last_close < ema_20 and minus_di > plus_di:
                     if rsi < RSI_OVERSOLD:
                         entry_blocked = True
                         block_reason = f"RSI oversold ({rsi:.2f} < {RSI_OVERSOLD})"
-                    elif rsi_divergence == "bullish":
+                    elif macd_line >= signal_line:
                         entry_blocked = True
-                        block_reason = "Bullish RSI divergence detected"
+                        block_reason = f"MACD Line ({macd_line:.6g}) >= Signal Line ({signal_line:.6g})"
+                    elif not macd_hist_decreasing:
+                        entry_blocked = True
+                        block_reason = f"MACD histogram rising ({prev_macd_histogram:.6g} -> {macd_histogram:.6g}), momentum dying"
                     else:
                         side = "Sell"
 
@@ -2220,6 +2234,7 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                     await update.message.reply_text(
                         f"\U0001f4ca {symbol}: Last Close={last_close} | 20 EMA={ema_20:.6g}\n"
                         f"+DI: {plus_di:.2f} | -DI: {minus_di:.2f} | ADX: {adx:.2f}\n"
+                        f"MACD: {macd_line:.6g} / Signal: {signal_line:.6g} | Hist: {macd_histogram:.6g}\n"
                         f"Direction: {side_text}"
                     )
 
@@ -2257,9 +2272,9 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(
         f"Monitoring {symbol}!\n"
         f"\u2022 {qty_info}\n"
-        f"\u2022 Entry filters: ADX > {ADX_THRESHOLD} + EMA/DI alignment + RSI filter + Divergence filter\n"
+        f"\u2022 Entry filters: ADX > {ADX_THRESHOLD} + EMA/DI + RSI + MACD Line/Signal + MACD Histogram momentum\n"
         f"\u2022 Exit: Long exits when Price < 20 EMA AND -DI > +DI | Short exits when Price > 20 EMA AND +DI > -DI\n"
-        f"\u2022 Reverse only if ADX > {ADX_THRESHOLD} + EMA/DI alignment, else FLAT\n"
+        f"\u2022 Reverse only if ADX > {ADX_THRESHOLD} + EMA/DI + MACD alignment, else FLAT\n"
         f"\u2022 SL: 30% at {SL_STAGE1_ATR_MULT}x ATR + 70% at {STOP_LOSS_ATR_MULT}x ATR (server-side SL always active)\n"
         f"\u2022 Trail: 60% at {TRAILING_ACTIVATE_ATR}x ATR profit ({TRAILING_STOP_ATR}x ATR dist), then 30% ({TRAILING_STOP_ATR_STAGE2}x ATR dist), 10% rides until EMA+DI exit\n"
         f"\u2022 WebSocket real-time price feeds + polling every {POLL_INTERVAL_SECONDS}s\n"
@@ -2326,7 +2341,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("\u26d4 Unauthorized. This bot is private.")
         return
     await update.message.reply_text(
-        "Bot ready! (v7 - 4-Layer Filter + WebSocket + State Persistence)\n\n"
+        "Bot ready! (v8 - 5-Layer Filter + MACD + WebSocket + State Persistence)\n\n"
         "Commands:\n"
         "1. /start - Display this message\n"
         "2. /add_symbol <symbol> - Start monitoring with auto-sizing (20% balance)\n"
@@ -2336,7 +2351,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"\u2022 1. ADX > {ADX_THRESHOLD}\n"
         "\u2022 2. Long: Price > 20 EMA (30m) + (+DI > -DI) | Short: Price < 20 EMA (30m) + (-DI > +DI)\n"
         f"\u2022 3. RSI NOT extreme (not > {RSI_OVERBOUGHT} for longs, not < {RSI_OVERSOLD} for shorts)\n"
-        "\u2022 4. NO opposing divergence (no bearish div for longs, no bullish div for shorts)\n\n"
+        "\u2022 4. Long: MACD Line > Signal Line | Short: MACD Line < Signal Line\n"
+        "\u2022 5. Long: MACD histogram increasing | Short: MACD histogram decreasing (momentum check)\n\n"
         "Stop-Loss (Tiered):\n"
         f"\u2022 Tier 1: 30% closed INSTANTLY at {SL_STAGE1_ATR_MULT}x ATR loss\n"
         f"\u2022 Tier 2: Remaining 70% closed at {STOP_LOSS_ATR_MULT}x ATR loss (server-side, always active)\n\n"
@@ -2351,7 +2367,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "\u2022 Short exits: Price > 20 EMA (30m) AND +DI > -DI\n\n"
         "Reversal Rules:\n"
         f"\u2022 ADX > {ADX_THRESHOLD} + EMA/DI alignment required\n"
-        "\u2022 Long reversal: Price > 20 EMA + (+DI > -DI) | Short reversal: Price < 20 EMA + (-DI > +DI)\n"
+        "\u2022 Long reversal: Price > 20 EMA + (+DI > -DI) + MACD > Signal\n"
+        "\u2022 Short reversal: Price < 20 EMA + (-DI > +DI) + MACD < Signal\n"
         "\u2022 If conditions not met, bot goes FLAT\n\n"
         "Infrastructure:\n"
         "\u2022 WebSocket real-time price feeds (REST fallback)\n"
