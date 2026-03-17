@@ -243,7 +243,7 @@ symbol_original_qty: dict[str, Optional[float]] = {}   # Original position qty a
 #  Constants
 # ────────────────────────────────────────────────
 ATR_MULTIPLIER = 1.5        # Legacy (kept for reference)
-ADX_THRESHOLD = 23           # Only trade when ADX > 23 (trending)
+ADX_THRESHOLD = 24           # Only trade when ADX > 24 (trending)
 STOP_LOSS_ATR_MULT = 2.0    # Ultimate stop-loss at 2x ATR from entry (closes remaining 70%)
 SL_STAGE1_ATR_MULT = 1.5    # First tier SL at 1.5x ATR (closes 30%)
 SL_STAGE1_CLOSE_PCT = 0.30  # Close 30% of position at first SL level
@@ -1456,6 +1456,10 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                         # Stage 2 peak starts at current price (price just dropped to hit stage 1 trail)
                         symbol_peak_stage2[symbol] = current_price
                         stage2_trail_price = current_price - (TRAILING_STOP_ATR_STAGE2 * entry_atr)
+                        # Ensure stage 2 trail is never below entry price (would be a loss, not profit)
+                        if stage2_trail_price < entry_price:
+                            stage2_trail_price = entry_price
+                            print(f"[STAGE2] {symbol}: Trail price clamped to entry price {entry_price:.6g} (cannot trail below entry for longs)")
 
                         s2_order_id = await place_conditional_close_order(symbol, "Buy", stage2_qty, stage2_trail_price)
                         if s2_order_id:
@@ -1562,6 +1566,10 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                     s2_peak = max(s2_peak, current_price)
                     symbol_peak_stage2[symbol] = s2_peak
                     stage2_trail_price = s2_peak - (TRAILING_STOP_ATR_STAGE2 * entry_atr)
+                    # Ensure stage 2 trail is never below entry price (would be a loss, not profit)
+                    if stage2_trail_price < entry_price:
+                        stage2_trail_price = entry_price
+                        print(f"[STAGE2-RETRY] {symbol}: Trail price clamped to entry price {entry_price:.6g} (cannot trail below entry for longs)")
 
                     s2_order_id = await place_conditional_close_order(symbol, "Buy", stage2_qty, stage2_trail_price)
                     if s2_order_id:
@@ -1682,6 +1690,10 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                         stage2_qty = current_qty * TRAILING_STAGE2_PCT
                         symbol_peak_stage2[symbol] = current_price
                         stage2_trail_price = current_price + (TRAILING_STOP_ATR_STAGE2 * entry_atr)
+                        # Ensure stage 2 trail is never above entry price (would be a loss, not profit)
+                        if stage2_trail_price > entry_price:
+                            stage2_trail_price = entry_price
+                            print(f"[STAGE2] {symbol}: Trail price clamped to entry price {entry_price:.6g} (cannot trail above entry for shorts)")
 
                         s2_order_id = await place_conditional_close_order(symbol, "Sell", stage2_qty, stage2_trail_price)
                         if s2_order_id:
@@ -1785,6 +1797,10 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                     s2_peak = min(s2_peak, current_price)
                     symbol_peak_stage2[symbol] = s2_peak
                     stage2_trail_price = s2_peak + (TRAILING_STOP_ATR_STAGE2 * entry_atr)
+                    # Ensure stage 2 trail is never above entry price (would be a loss, not profit)
+                    if stage2_trail_price > entry_price:
+                        stage2_trail_price = entry_price
+                        print(f"[STAGE2-RETRY] {symbol}: Trail price clamped to entry price {entry_price:.6g} (cannot trail above entry for shorts)")
 
                     s2_order_id = await place_conditional_close_order(symbol, "Sell", stage2_qty, stage2_trail_price)
                     if s2_order_id:
@@ -1821,12 +1837,13 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
             if symbol in symbol_manual_quantities and symbol_manual_quantities[symbol] is not None:
                 manual_override = closed_qty
 
-            # Check if we should REVERSE to Short (requires: -DI > +DI AND ADX > threshold)
-            if minus_di > plus_di and adx > ADX_THRESHOLD:
+            # Check if we should REVERSE to Short (requires: Price < 20 EMA AND -DI > +DI AND ADX > threshold)
+            if last_close < ema_20 and minus_di > plus_di and adx > ADX_THRESHOLD:
                 await context.bot.send_message(
                     chat_id=chat_id,
                     text=(
                         f"\U0001f504 REVERSE to Short for {symbol}\n"
+                        f"Price ({last_close}) < 20 EMA ({ema_20:.6g})\n"
                         f"-DI ({minus_di:.2f}) > +DI ({plus_di:.2f}) | ADX: {adx:.2f} > {ADX_THRESHOLD}\n"
                         f"Opening Short..."
                     )
@@ -1855,7 +1872,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                     chat_id=chat_id,
                     text=(
                         f"\U0001f7e1 GOING FLAT for {symbol}\n"
-                        f"No reverse signal (need: -DI > +DI AND ADX > {ADX_THRESHOLD})\n"
+                        f"No reverse signal (need: Price < 20 EMA + -DI > +DI + ADX > {ADX_THRESHOLD})\n"
                         f"+DI: {plus_di:.2f} | -DI: {minus_di:.2f} | ADX: {adx:.2f}\n"
                         f"Waiting for next entry signal..."
                     )
@@ -1884,12 +1901,13 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
             if symbol in symbol_manual_quantities and symbol_manual_quantities[symbol] is not None:
                 manual_override = closed_qty
 
-            # Check if we should REVERSE to Long (requires: +DI > -DI AND ADX > threshold)
-            if plus_di > minus_di and adx > ADX_THRESHOLD:
+            # Check if we should REVERSE to Long (requires: Price > 20 EMA AND +DI > -DI AND ADX > threshold)
+            if last_close > ema_20 and plus_di > minus_di and adx > ADX_THRESHOLD:
                 await context.bot.send_message(
                     chat_id=chat_id,
                     text=(
                         f"\U0001f504 REVERSE to Long for {symbol}\n"
+                        f"Price ({last_close}) > 20 EMA ({ema_20:.6g})\n"
                         f"+DI ({plus_di:.2f}) > -DI ({minus_di:.2f}) | ADX: {adx:.2f} > {ADX_THRESHOLD}\n"
                         f"Opening Long..."
                     )
@@ -1918,7 +1936,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                     chat_id=chat_id,
                     text=(
                         f"\U0001f7e1 GOING FLAT for {symbol}\n"
-                        f"No reverse signal (need: +DI > -DI AND ADX > {ADX_THRESHOLD})\n"
+                        f"No reverse signal (need: Price > 20 EMA + +DI > -DI + ADX > {ADX_THRESHOLD})\n"
                         f"+DI: {plus_di:.2f} | -DI: {minus_di:.2f} | ADX: {adx:.2f}\n"
                         f"Waiting for next entry signal..."
                     )
@@ -1930,21 +1948,15 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     # ──────────────────────────────────────────────
     # 3. INITIAL TRADE ENTRY (no open position)
-    #    5-layer filter:
-    #      1. ADX > 23
-    #      2. EMA + DI alignment
+    #    4-layer filter:
+    #      1. ADX > 24
+    #      2. EMA + DI alignment (30-min chart)
     #      3. RSI NOT in extreme zone (not > 70 for longs, not < 30 for shorts)
     #      4. NO opposing RSI divergence
-    #      5. Volume > 1.5x 20-period average
     # ──────────────────────────────────────────────
     if current_open_trade_side is None:
-        # Filter 1a: ADX must be above threshold
+        # Filter 1: ADX must be above threshold
         if adx < ADX_THRESHOLD:
-            return
-
-        # Filter 5: Volume must exceed 1.5x 20-period average
-        if volume_ratio < VOLUME_FILTER_MULT:
-            print(f"[FILTER] {symbol}: Entry blocked — volume too low (ratio={volume_ratio:.2f}, need>{VOLUME_FILTER_MULT})")
             return
 
         new_trend = None
@@ -1980,8 +1992,8 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
             msg = (
                 f"{ts} \u2014 {symbol} ENTRY SIGNAL: <b>{new_trend.upper()}</b>\n"
                 f"Last Close: {last_close} | 20 EMA: {ema_20:.6g}\n"
-                f"+DI: {plus_di:.2f} | -DI: {minus_di:.2f} | ADX: {adx:.2f} (prev2: {adx_prev2:.2f})\n"
-                f"RSI: {rsi:.2f} | Vol Ratio: {volume_ratio:.2f}x | Divergence: {rsi_divergence or 'None'}\n"
+                f"+DI: {plus_di:.2f} | -DI: {minus_di:.2f} | ADX: {adx:.2f}\n"
+                f"RSI: {rsi:.2f} | Divergence: {rsi_divergence or 'None'}\n"
                 f"Direction: {side_text}"
             )
             await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
@@ -2074,14 +2086,14 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
 
         report_msg = (
             f"Still monitoring {symbol}\n"
-            f"\u2022 Entry: 5-layer filter (ADX>{ADX_THRESHOLD}+rising, EMA+DI, RSI, Divergence, Volume)\n"
-            f"\u2022 Exit: Price crosses EMA + DI crossover required\n"
-            f"\u2022 Reverse: Only if DI + ADX confirm, else FLAT\n"
+            f"\u2022 Entry: 4-layer filter (ADX>{ADX_THRESHOLD}, EMA+DI, RSI, Divergence)\n"
+            f"\u2022 Exit: Long exits when Price < 20 EMA AND -DI > +DI | Short exits when Price > 20 EMA AND +DI > -DI\n"
+            f"\u2022 Reverse: Only if ADX > {ADX_THRESHOLD} + EMA/DI alignment, else FLAT\n"
             f"\u2022 SL: 30% at {SL_STAGE1_ATR_MULT}x ATR + 70% at {STOP_LOSS_ATR_MULT}x ATR (server SL always active)\n"
             f"\u2022 Trail: 60% at {TRAILING_ACTIVATE_ATR}x ATR, then 30% at 1x ATR, 10% rides\n"
             f"\u2022 WebSocket prices + polling every {POLL_INTERVAL_SECONDS}s\n"
-            f"\u2022 20 EMA: {ema_20:.6g} | +DI: {plus_di:.2f} | -DI: {minus_di:.2f} | ADX: {adx:.2f} (prev2: {adx_prev2:.2f})\n"
-            f"\u2022 RSI: {rsi:.2f} | Vol Ratio: {volume_ratio:.2f}x | Divergence: {rsi_divergence or 'None'}\n"
+            f"\u2022 20 EMA: {ema_20:.6g} | +DI: {plus_di:.2f} | -DI: {minus_di:.2f} | ADX: {adx:.2f}\n"
+            f"\u2022 RSI: {rsi:.2f} | Divergence: {rsi_divergence or 'None'}\n"
             f"\u2022 Last Close: {last_close} | Current Price: {current_price}\n"
             f"\u2022 {symbol} state: {current_market_state}\n"
             f"\u2022 {trade_status}"
@@ -2153,18 +2165,14 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             rsi_divergence = indicators["rsi_divergence"]
             volume_ratio = indicators["volume_ratio"]
 
-            # 5-layer entry filter for instant trade
+            # 4-layer entry filter for instant trade
             entry_blocked = False
             block_reason = ""
 
-            # Filter 1a: ADX threshold
+            # Filter 1: ADX threshold
             if adx < ADX_THRESHOLD:
                 entry_blocked = True
                 block_reason = f"ADX ({adx:.2f}) < {ADX_THRESHOLD} — market is sideways"
-            # Filter 5: Volume
-            elif volume_ratio < VOLUME_FILTER_MULT:
-                entry_blocked = True
-                block_reason = f"Volume too low (ratio={volume_ratio:.2f}, need>{VOLUME_FILTER_MULT})"
 
             if entry_blocked:
                 await update.message.reply_text(
@@ -2249,9 +2257,9 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(
         f"Monitoring {symbol}!\n"
         f"\u2022 {qty_info}\n"
-        f"\u2022 Entry filters: ADX > {ADX_THRESHOLD} + EMA/DI alignment + RSI filter + Divergence filter + Volume > {VOLUME_FILTER_MULT}x avg\n"
-        f"\u2022 Exit: Price crosses 20 EMA + DI crossover required\n"
-        f"\u2022 Reverse only if DI + ADX confirm, else FLAT\n"
+        f"\u2022 Entry filters: ADX > {ADX_THRESHOLD} + EMA/DI alignment + RSI filter + Divergence filter\n"
+        f"\u2022 Exit: Long exits when Price < 20 EMA AND -DI > +DI | Short exits when Price > 20 EMA AND +DI > -DI\n"
+        f"\u2022 Reverse only if ADX > {ADX_THRESHOLD} + EMA/DI alignment, else FLAT\n"
         f"\u2022 SL: 30% at {SL_STAGE1_ATR_MULT}x ATR + 70% at {STOP_LOSS_ATR_MULT}x ATR (server-side SL always active)\n"
         f"\u2022 Trail: 60% at {TRAILING_ACTIVATE_ATR}x ATR profit ({TRAILING_STOP_ATR}x ATR dist), then 30% ({TRAILING_STOP_ATR_STAGE2}x ATR dist), 10% rides until EMA+DI exit\n"
         f"\u2022 WebSocket real-time price feeds + polling every {POLL_INTERVAL_SECONDS}s\n"
@@ -2318,18 +2326,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("\u26d4 Unauthorized. This bot is private.")
         return
     await update.message.reply_text(
-        "Bot ready! (v7 - 5-Layer Filter + WebSocket + State Persistence)\n\n"
+        "Bot ready! (v7 - 4-Layer Filter + WebSocket + State Persistence)\n\n"
         "Commands:\n"
         "1. /start - Display this message\n"
         "2. /add_symbol <symbol> - Start monitoring with auto-sizing (20% balance)\n"
         "3. /add_symbol <symbol> <quantity> - INSTANT TRADE + Manual quantity monitoring\n"
         "4. /remove_symbol <symbol> - Stop monitoring a symbol\n\n"
-        "v7 Entry Filters (ALL must pass):\n"
+        "Entry Filters (ALL must pass):\n"
         f"\u2022 1. ADX > {ADX_THRESHOLD}\n"
-        "\u2022 2. EMA + DI alignment (Price vs 20 EMA + DI direction)\n"
+        "\u2022 2. Long: Price > 20 EMA (30m) + (+DI > -DI) | Short: Price < 20 EMA (30m) + (-DI > +DI)\n"
         f"\u2022 3. RSI NOT extreme (not > {RSI_OVERBOUGHT} for longs, not < {RSI_OVERSOLD} for shorts)\n"
-        "\u2022 4. NO opposing RSI divergence\n"
-        f"\u2022 5. Volume > {VOLUME_FILTER_MULT}x 20-period average\n\n"
+        "\u2022 4. NO opposing divergence (no bearish div for longs, no bullish div for shorts)\n\n"
         "Stop-Loss (Tiered):\n"
         f"\u2022 Tier 1: 30% closed INSTANTLY at {SL_STAGE1_ATR_MULT}x ATR loss\n"
         f"\u2022 Tier 2: Remaining 70% closed at {STOP_LOSS_ATR_MULT}x ATR loss (server-side, always active)\n\n"
@@ -2337,7 +2344,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"\u2022 At {TRAILING_ACTIVATE_ATR}x ATR profit: Stage 1 trail activates on {TRAILING_CLOSE_PCT*100:.0f}%\n"
         f"\u2022 Stage 1 trail: {TRAILING_STOP_ATR}x ATR distance. Bybit closes {TRAILING_CLOSE_PCT*100:.0f}% INSTANTLY when hit\n"
         f"\u2022 Stage 2 trail: After 60% closed, 30% gets trail ({TRAILING_STOP_ATR_STAGE2}x ATR distance)\n"
+        f"\u2022 Stage 2 trail will never be placed below entry price (long) or above entry price (short)\n"
         f"\u2022 Remaining 10% protected by server-side SL + exits on EMA+DI crossover\n\n"
+        "Exit Rules:\n"
+        "\u2022 Long exits: Price < 20 EMA (30m) AND -DI > +DI\n"
+        "\u2022 Short exits: Price > 20 EMA (30m) AND +DI > -DI\n\n"
+        "Reversal Rules:\n"
+        f"\u2022 ADX > {ADX_THRESHOLD} + EMA/DI alignment required\n"
+        "\u2022 Long reversal: Price > 20 EMA + (+DI > -DI) | Short reversal: Price < 20 EMA + (-DI > +DI)\n"
+        "\u2022 If conditions not met, bot goes FLAT\n\n"
         "Infrastructure:\n"
         "\u2022 WebSocket real-time price feeds (REST fallback)\n"
         f"\u2022 State persistence: {STATE_FILE} (crash recovery)\n"
