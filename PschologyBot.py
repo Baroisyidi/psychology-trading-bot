@@ -243,7 +243,7 @@ symbol_original_qty: dict[str, Optional[float]] = {}   # Original position qty a
 #  Constants
 # ────────────────────────────────────────────────
 ATR_MULTIPLIER = 1.5        # Legacy (kept for reference)
-ADX_THRESHOLD = 24           # Only trade when ADX > 24 (trending)
+ADX_THRESHOLD = 22           # Only trade when ADX > 22 (trending)
 STOP_LOSS_ATR_MULT = 2.0    # Ultimate stop-loss at 2x ATR from entry (closes remaining 70%)
 SL_STAGE1_ATR_MULT = 1.5    # First tier SL at 1.5x ATR (closes 30%)
 SL_STAGE1_CLOSE_PCT = 0.30  # Close 30% of position at first SL level
@@ -315,7 +315,7 @@ async def get_all_indicators(
     - adx, adx_prev2 (ADX 2 candles ago for rising check)
     - rsi
     - macd_line, signal_line, macd_histogram, prev_macd_histogram
-    - macd_hist_increasing (bool), macd_hist_decreasing (bool)
+    - macd_hist_dying_long (bool), macd_hist_dying_short (bool)
     - current_price (live tick via WebSocket or REST)
     - last_close (closed candle price - used for decisions)
     - last_candle_ts (for dedup)
@@ -411,11 +411,13 @@ async def get_all_indicators(
         prev_macd_histogram = float(df["macd_histogram"].iloc[-2]) if len(df) >= 2 else macd_histogram
         prev2_macd_histogram = float(df["macd_histogram"].iloc[-3]) if len(df) >= 3 else prev_macd_histogram
 
-        # Histogram momentum: check last 2 bars direction
-        # For longs: histogram should be increasing (current > previous)
-        # For shorts: histogram should be decreasing (current < previous)
-        macd_hist_increasing = (macd_histogram > prev_macd_histogram)
-        macd_hist_decreasing = (macd_histogram < prev_macd_histogram)
+        # Histogram momentum: block only on 2+ consecutive declining/rising bars
+        # For longs: block if histogram declined for 2 consecutive bars (dying momentum)
+        #   e.g., 5 -> 3 -> 1 = blocked, but 5 -> 4 -> 6 = allowed
+        # For shorts: block if histogram rose for 2 consecutive bars (dying downward momentum)
+        #   e.g., -5 -> -3 -> -1 = blocked, but -5 -> -4 -> -6 = allowed
+        macd_hist_dying_long = (macd_histogram < prev_macd_histogram) and (prev_macd_histogram < prev2_macd_histogram)
+        macd_hist_dying_short = (macd_histogram > prev_macd_histogram) and (prev_macd_histogram > prev2_macd_histogram)
 
         # Detect DI crossover on the latest candle
         prev_diff = prev_plus_di - prev_minus_di
@@ -456,8 +458,9 @@ async def get_all_indicators(
             "signal_line": signal_line,
             "macd_histogram": macd_histogram,
             "prev_macd_histogram": prev_macd_histogram,
-            "macd_hist_increasing": macd_hist_increasing,
-            "macd_hist_decreasing": macd_hist_decreasing,
+            "prev2_macd_histogram": prev2_macd_histogram,
+            "macd_hist_dying_long": macd_hist_dying_long,
+            "macd_hist_dying_short": macd_hist_dying_short,
             "current_price": current_price,
             "last_close": last_close,
             "last_candle_ts": last_candle_ts,
@@ -1123,8 +1126,9 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
     signal_line = indicators["signal_line"]
     macd_histogram = indicators["macd_histogram"]
     prev_macd_histogram = indicators["prev_macd_histogram"]
-    macd_hist_increasing = indicators["macd_hist_increasing"]
-    macd_hist_decreasing = indicators["macd_hist_decreasing"]
+    prev2_macd_histogram = indicators["prev2_macd_histogram"]
+    macd_hist_dying_long = indicators["macd_hist_dying_long"]
+    macd_hist_dying_short = indicators["macd_hist_dying_short"]
     plus_di = indicators["plus_di"]
     minus_di = indicators["minus_di"]
     di_crossed = indicators["di_crossed"]
@@ -1965,9 +1969,9 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
             if macd_line <= signal_line:
                 print(f"[FILTER] {symbol}: Long entry blocked — MACD Line ({macd_line:.6g}) <= Signal Line ({signal_line:.6g})")
                 return
-            # Filter 5: MACD histogram must be increasing for longs
-            if not macd_hist_increasing:
-                print(f"[FILTER] {symbol}: Long entry blocked — MACD histogram declining ({prev_macd_histogram:.6g} -> {macd_histogram:.6g}), momentum dying")
+            # Filter 5: Block only if MACD histogram declined 2+ consecutive bars (dying momentum)
+            if macd_hist_dying_long:
+                print(f"[FILTER] {symbol}: Long entry blocked — MACD histogram declining 2+ bars ({prev2_macd_histogram:.6g} -> {prev_macd_histogram:.6g} -> {macd_histogram:.6g}), momentum dying")
                 return
             new_trend = "upward"
             side = "Buy"
@@ -1981,9 +1985,9 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
             if macd_line >= signal_line:
                 print(f"[FILTER] {symbol}: Short entry blocked — MACD Line ({macd_line:.6g}) >= Signal Line ({signal_line:.6g})")
                 return
-            # Filter 5: MACD histogram must be decreasing for shorts
-            if not macd_hist_decreasing:
-                print(f"[FILTER] {symbol}: Short entry blocked — MACD histogram rising ({prev_macd_histogram:.6g} -> {macd_histogram:.6g}), momentum dying")
+            # Filter 5: Block only if MACD histogram rose 2+ consecutive bars (dying short momentum)
+            if macd_hist_dying_short:
+                print(f"[FILTER] {symbol}: Short entry blocked — MACD histogram rising 2+ bars ({prev2_macd_histogram:.6g} -> {prev_macd_histogram:.6g} -> {macd_histogram:.6g}), momentum dying")
                 return
             new_trend = "downward"
             side = "Sell"
@@ -2170,8 +2174,8 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             signal_line = indicators["signal_line"]
             macd_histogram = indicators["macd_histogram"]
             prev_macd_histogram = indicators["prev_macd_histogram"]
-            macd_hist_increasing = indicators["macd_hist_increasing"]
-            macd_hist_decreasing = indicators["macd_hist_decreasing"]
+            macd_hist_dying_long = indicators["macd_hist_dying_long"]
+            macd_hist_dying_short = indicators["macd_hist_dying_short"]
 
             # 5-layer entry filter for instant trade
             entry_blocked = False
@@ -2197,9 +2201,9 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                     elif macd_line <= signal_line:
                         entry_blocked = True
                         block_reason = f"MACD Line ({macd_line:.6g}) <= Signal Line ({signal_line:.6g})"
-                    elif not macd_hist_increasing:
+                    elif macd_hist_dying_long:
                         entry_blocked = True
-                        block_reason = f"MACD histogram declining ({prev_macd_histogram:.6g} -> {macd_histogram:.6g}), momentum dying"
+                        block_reason = f"MACD histogram declining 2+ bars ({prev_macd_histogram:.6g} -> {macd_histogram:.6g}), momentum dying"
                     else:
                         side = "Buy"
                 elif last_close < ema_20 and minus_di > plus_di:
@@ -2209,9 +2213,9 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                     elif macd_line >= signal_line:
                         entry_blocked = True
                         block_reason = f"MACD Line ({macd_line:.6g}) >= Signal Line ({signal_line:.6g})"
-                    elif not macd_hist_decreasing:
+                    elif macd_hist_dying_short:
                         entry_blocked = True
-                        block_reason = f"MACD histogram rising ({prev_macd_histogram:.6g} -> {macd_histogram:.6g}), momentum dying"
+                        block_reason = f"MACD histogram rising 2+ bars ({prev_macd_histogram:.6g} -> {macd_histogram:.6g}), momentum dying"
                     else:
                         side = "Sell"
 
@@ -2352,7 +2356,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "\u2022 2. Long: Price > 20 EMA (30m) + (+DI > -DI) | Short: Price < 20 EMA (30m) + (-DI > +DI)\n"
         f"\u2022 3. RSI NOT extreme (not > {RSI_OVERBOUGHT} for longs, not < {RSI_OVERSOLD} for shorts)\n"
         "\u2022 4. Long: MACD Line > Signal Line | Short: MACD Line < Signal Line\n"
-        "\u2022 5. Long: MACD histogram increasing | Short: MACD histogram decreasing (momentum check)\n\n"
+        "\u2022 5. Block if MACD histogram declines 2+ consecutive bars (longs) or rises 2+ bars (shorts)\n\n"
         "Stop-Loss (Tiered):\n"
         f"\u2022 Tier 1: 30% closed INSTANTLY at {SL_STAGE1_ATR_MULT}x ATR loss\n"
         f"\u2022 Tier 2: Remaining 70% closed at {STOP_LOSS_ATR_MULT}x ATR loss (server-side, always active)\n\n"
