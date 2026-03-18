@@ -152,6 +152,8 @@ def save_state():
             "symbol_sl1_qty": symbol_sl1_qty,
             "symbol_sl1_taken": symbol_sl1_taken,
             "symbol_original_qty": symbol_original_qty,
+            "symbol_macd_partial_closed": symbol_macd_partial_closed,
+            "symbol_macd_partial_qty": symbol_macd_partial_qty,
         }
         with open(STATE_FILE, "w") as f:
             json.dump(state, f, indent=2, default=str)
@@ -197,6 +199,8 @@ def load_state():
         symbol_sl1_qty.update({k: v for k, v in state.get("symbol_sl1_qty", {}).items()})
         symbol_sl1_taken.update({k: v for k, v in state.get("symbol_sl1_taken", {}).items()})
         symbol_original_qty.update({k: v for k, v in state.get("symbol_original_qty", {}).items()})
+        symbol_macd_partial_closed.update({k: v for k, v in state.get("symbol_macd_partial_closed", {}).items()})
+        symbol_macd_partial_qty.update({k: v for k, v in state.get("symbol_macd_partial_qty", {}).items()})
 
         print(f"[STATE] Loaded state from {STATE_FILE} — {len(monitored_symbols)} symbols restored")
         return True
@@ -238,6 +242,10 @@ symbol_sl1_order_id: dict[str, Optional[str]] = {}     # Conditional order for 3
 symbol_sl1_qty: dict[str, Optional[float]] = {}        # Qty for the 30% SL order
 symbol_sl1_taken: dict[str, bool] = {}                 # Has 30% SL at 1.5x ATR been taken?
 symbol_original_qty: dict[str, Optional[float]] = {}   # Original position qty at entry
+
+# MACD-based partial exit tracking
+symbol_macd_partial_closed: dict[str, bool] = {}       # Whether 60% was closed due to MACD crossover
+symbol_macd_partial_qty: dict[str, Optional[float]] = {} # Qty that was closed (to add back)
 
 # ────────────────────────────────────────────────
 #  Constants
@@ -717,6 +725,9 @@ def _clear_risk_state(symbol: str) -> None:
     symbol_sl1_qty[symbol] = None
     symbol_sl1_taken[symbol] = False
     symbol_original_qty[symbol] = None
+    # MACD partial exit
+    symbol_macd_partial_closed[symbol] = False
+    symbol_macd_partial_qty[symbol] = None
     save_state()
 
 
@@ -744,6 +755,9 @@ def _set_entry_risk_state(symbol: str, entry_price: float, atr: float) -> None:
     symbol_sl1_qty[symbol] = None
     symbol_sl1_taken[symbol] = False
     symbol_original_qty[symbol] = None
+    # MACD partial exit
+    symbol_macd_partial_closed[symbol] = False
+    symbol_macd_partial_qty[symbol] = None
     save_state()
 
 
@@ -1805,7 +1819,126 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                         print(f"[STAGE2-RETRY] {symbol}: Stage 2 trail placed (retry) at {stage2_trail_price:.6g}")
 
     # ──────────────────────────────────────────────
-    # 2. EXIT + POSSIBLE REVERSAL (Decoupled)
+    # 2. MACD-BASED PARTIAL EXIT RULES
+    #    - Long: MACD crosses below Signal → close 60%, crosses back above → add back 60%
+    #    - Short: MACD crosses above Signal → close 60%, crosses back below → add back 60%
+    #    Only applies when trailing stop is NOT active (to avoid conflicts)
+    #    Does NOT trigger if exit conditions are already met (let exit handle it)
+    # ──────────────────────────────────────────────
+    if current_open_trade_side is not None:
+        trailing_is_active = symbol_trailing_active.get(symbol, False)
+        macd_partial_closed = symbol_macd_partial_closed.get(symbol, False)
+
+        if current_open_trade_side == "Buy" and not trailing_is_active:
+            # Check if exit conditions are met — if so, skip MACD partial (exit will handle)
+            exit_conditions_met = (last_close < ema_20 and minus_di > plus_di)
+
+            if not exit_conditions_met:
+                if not macd_partial_closed and macd_line < signal_line:
+                    # MACD crossed below Signal → close 60% of long position
+                    pos_qty = await get_position_size(symbol)
+                    if pos_qty:
+                        close_qty = pos_qty * 0.60
+                        min_qty, _, qty_step, _ = await get_instrument_constraints(symbol)
+                        close_qty = round_qty_to_step(close_qty, qty_step, min_qty)
+
+                        closed = await close_partial_position(symbol, side_to_close="Buy", close_pct=0.60)
+                        if closed:
+                            symbol_macd_partial_closed[symbol] = True
+                            symbol_macd_partial_qty[symbol] = closed
+                            save_state()
+                            await context.bot.send_message(
+                                chat_id=chat_id,
+                                text=(
+                                    f"\U0001f4c9 MACD PARTIAL EXIT for {symbol} (Long)\n"
+                                    f"MACD Line ({macd_line:.6g}) < Signal Line ({signal_line:.6g})\n"
+                                    f"Closed 60% of position ({closed} qty)\n"
+                                    f"Remaining 40% still in Long trade.\n"
+                                    f"If MACD crosses back above Signal, 60% will be added back."
+                                )
+                            )
+
+                elif macd_partial_closed and macd_line > signal_line:
+                    # MACD crossed back above Signal → add back the 60% that was closed
+                    add_back_qty = symbol_macd_partial_qty.get(symbol)
+                    if add_back_qty and add_back_qty > 0:
+                        result = await place_trade(symbol, side="Buy", manual_qty_override=add_back_qty)
+                        if result and "error" not in result:
+                            symbol_macd_partial_closed[symbol] = False
+                            symbol_macd_partial_qty[symbol] = None
+                            save_state()
+                            await context.bot.send_message(
+                                chat_id=chat_id,
+                                text=(
+                                    f"\U0001f4c8 MACD RE-ENTRY for {symbol} (Long)\n"
+                                    f"MACD Line ({macd_line:.6g}) > Signal Line ({signal_line:.6g})\n"
+                                    f"Added back 60% ({add_back_qty} qty) to Long position.\n"
+                                    f"Full position restored."
+                                )
+                            )
+                        else:
+                            err = result.get("error", "Unknown") if result else "Unknown"
+                            await context.bot.send_message(
+                                chat_id=chat_id,
+                                text=f"\u26a0\ufe0f {symbol}: Failed to add back 60% on MACD re-cross: {err}"
+                            )
+
+        elif current_open_trade_side == "Sell" and not trailing_is_active:
+            # Check if exit conditions are met — if so, skip MACD partial (exit will handle)
+            exit_conditions_met = (last_close > ema_20 and plus_di > minus_di)
+
+            if not exit_conditions_met:
+                if not macd_partial_closed and macd_line > signal_line:
+                    # MACD crossed above Signal → close 60% of short position
+                    pos_qty = await get_position_size(symbol)
+                    if pos_qty:
+                        close_qty = pos_qty * 0.60
+                        min_qty, _, qty_step, _ = await get_instrument_constraints(symbol)
+                        close_qty = round_qty_to_step(close_qty, qty_step, min_qty)
+
+                        closed = await close_partial_position(symbol, side_to_close="Sell", close_pct=0.60)
+                        if closed:
+                            symbol_macd_partial_closed[symbol] = True
+                            symbol_macd_partial_qty[symbol] = closed
+                            save_state()
+                            await context.bot.send_message(
+                                chat_id=chat_id,
+                                text=(
+                                    f"\U0001f4c9 MACD PARTIAL EXIT for {symbol} (Short)\n"
+                                    f"MACD Line ({macd_line:.6g}) > Signal Line ({signal_line:.6g})\n"
+                                    f"Closed 60% of position ({closed} qty)\n"
+                                    f"Remaining 40% still in Short trade.\n"
+                                    f"If MACD crosses back below Signal, 60% will be added back."
+                                )
+                            )
+
+                elif macd_partial_closed and macd_line < signal_line:
+                    # MACD crossed back below Signal → add back the 60% that was closed
+                    add_back_qty = symbol_macd_partial_qty.get(symbol)
+                    if add_back_qty and add_back_qty > 0:
+                        result = await place_trade(symbol, side="Sell", manual_qty_override=add_back_qty)
+                        if result and "error" not in result:
+                            symbol_macd_partial_closed[symbol] = False
+                            symbol_macd_partial_qty[symbol] = None
+                            save_state()
+                            await context.bot.send_message(
+                                chat_id=chat_id,
+                                text=(
+                                    f"\U0001f4c8 MACD RE-ENTRY for {symbol} (Short)\n"
+                                    f"MACD Line ({macd_line:.6g}) < Signal Line ({signal_line:.6g})\n"
+                                    f"Added back 60% ({add_back_qty} qty) to Short position.\n"
+                                    f"Full position restored."
+                                )
+                            )
+                        else:
+                            err = result.get("error", "Unknown") if result else "Unknown"
+                            await context.bot.send_message(
+                                chat_id=chat_id,
+                                text=f"\u26a0\ufe0f {symbol}: Failed to add back 60% on MACD re-cross: {err}"
+                            )
+
+    # ──────────────────────────────────────────────
+    # 3. EXIT + POSSIBLE REVERSAL (Decoupled)
     #    Exit requires: price crosses EMA AND DI crossover.
     #    Reverse ONLY if DI + ADX confirm. Otherwise go FLAT.
     # ──────────────────────────────────────────────
@@ -1944,9 +2077,9 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
     # ──────────────────────────────────────────────
-    # 3. INITIAL TRADE ENTRY (no open position)
+    # 4. INITIAL TRADE ENTRY (no open position)
     #    5-layer filter:
-    #      1. ADX > 24
+    #      1. ADX > 22
     #      2. EMA + DI alignment (30-min chart)
     #      3. RSI NOT in extreme zone (not > 70 for longs, not < 30 for shorts)
     #      4. MACD Line vs Signal Line alignment
@@ -2029,7 +2162,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
             save_state()
 
     # ──────────────────────────────────────────────
-    # 4. 30-Minute Status Report
+    # 5. 30-Minute Status Report
     # ──────────────────────────────────────────────
     current_time = time.time()
     last_report_time = context.job.data.get("last_report_time", 0)
@@ -2090,6 +2223,13 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
             risk_info += f"\n\u2022 Stop-Loss: {sl_status}"
             risk_info += f"\n\u2022 Server-Side SL: {'SET' if server_sl else 'Not set'}"
             risk_info += f"\n\u2022 Server-Side TS: {'SET' if server_ts else 'Not set'}"
+            # MACD partial exit status
+            macd_partial_flag = symbol_macd_partial_closed.get(symbol, False)
+            macd_partial_qty_val = symbol_macd_partial_qty.get(symbol)
+            if macd_partial_flag and macd_partial_qty_val:
+                risk_info += f"\n\u2022 MACD Partial: 60% CLOSED ({macd_partial_qty_val} qty) — waiting for re-cross to add back"
+            else:
+                risk_info += "\n\u2022 MACD Partial: Not triggered"
 
         report_msg = (
             f"Still monitoring {symbol}\n"
@@ -2097,6 +2237,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
             f"\u2022 Exit: Long exits when Price < 20 EMA AND -DI > +DI | Short exits when Price > 20 EMA AND +DI > -DI\n"
             f"\u2022 Reverse: Only if ADX > {ADX_THRESHOLD} + EMA/DI + MACD alignment, else FLAT\n"
             f"\u2022 SL: 30% at {SL_STAGE1_ATR_MULT}x ATR + 70% at {STOP_LOSS_ATR_MULT}x ATR (server SL always active)\n"
+            f"\u2022 MACD Partial: Close 60% on adverse MACD cross, add back on re-cross\n"
             f"\u2022 Trail: 60% at {TRAILING_ACTIVATE_ATR}x ATR, then 30% at 1x ATR, 10% rides\n"
             f"\u2022 WebSocket prices + polling every {POLL_INTERVAL_SECONDS}s\n"
             f"\u2022 20 EMA: {ema_20:.6g} | +DI: {plus_di:.2f} | -DI: {minus_di:.2f} | ADX: {adx:.2f}\n"
@@ -2280,6 +2421,7 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"\u2022 Exit: Long exits when Price < 20 EMA AND -DI > +DI | Short exits when Price > 20 EMA AND +DI > -DI\n"
         f"\u2022 Reverse only if ADX > {ADX_THRESHOLD} + EMA/DI + MACD alignment, else FLAT\n"
         f"\u2022 SL: 30% at {SL_STAGE1_ATR_MULT}x ATR + 70% at {STOP_LOSS_ATR_MULT}x ATR (server-side SL always active)\n"
+        f"\u2022 MACD Partial: Close 60% on adverse MACD cross, add back on favorable re-cross\n"
         f"\u2022 Trail: 60% at {TRAILING_ACTIVATE_ATR}x ATR profit ({TRAILING_STOP_ATR}x ATR dist), then 30% ({TRAILING_STOP_ATR_STAGE2}x ATR dist), 10% rides until EMA+DI exit\n"
         f"\u2022 WebSocket real-time price feeds + polling every {POLL_INTERVAL_SECONDS}s\n"
         f"\u2022 State persistence: crash recovery via {STATE_FILE}\n"
@@ -2327,7 +2469,8 @@ async def remove_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                         symbol_trail_order_id, symbol_trail_qty, symbol_trail_price,
                         symbol_stage2_active, symbol_stage2_taken, symbol_trail2_order_id,
                         symbol_trail2_qty, symbol_trail2_price, symbol_peak_stage2,
-                        symbol_sl1_order_id, symbol_sl1_qty, symbol_sl1_taken, symbol_original_qty]:
+                        symbol_sl1_order_id, symbol_sl1_qty, symbol_sl1_taken, symbol_original_qty,
+                        symbol_macd_partial_closed, symbol_macd_partial_qty]:
         if symbol in state_dict:
             del state_dict[symbol]
 
@@ -2345,7 +2488,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("\u26d4 Unauthorized. This bot is private.")
         return
     await update.message.reply_text(
-        "Bot ready! (v8 - 5-Layer Filter + MACD + WebSocket + State Persistence)\n\n"
+        "Bot ready! (v9 - 5-Layer Filter + MACD Partial Exit + WebSocket + State Persistence)\n\n"
         "Commands:\n"
         "1. /start - Display this message\n"
         "2. /add_symbol <symbol> - Start monitoring with auto-sizing (20% balance)\n"
@@ -2357,6 +2500,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"\u2022 3. RSI NOT extreme (not > {RSI_OVERBOUGHT} for longs, not < {RSI_OVERSOLD} for shorts)\n"
         "\u2022 4. Long: MACD Line > Signal Line | Short: MACD Line < Signal Line\n"
         "\u2022 5. Block if MACD histogram declines 2+ consecutive bars (longs) or rises 2+ bars (shorts)\n\n"
+        "Partial Exit Rules (MACD-based):\n"
+        "\u2022 Long: If MACD Line crosses below Signal Line \u2192 close 60% of position\n"
+        "\u2022 If MACD crosses back above Signal \u2192 add back 60% to restore full position\n"
+        "\u2022 Short: If MACD Line crosses above Signal Line \u2192 close 60% of position\n"
+        "\u2022 If MACD crosses back below Signal \u2192 add back 60% to restore full position\n\n"
         "Stop-Loss (Tiered):\n"
         f"\u2022 Tier 1: 30% closed INSTANTLY at {SL_STAGE1_ATR_MULT}x ATR loss\n"
         f"\u2022 Tier 2: Remaining 70% closed at {STOP_LOSS_ATR_MULT}x ATR loss (server-side, always active)\n\n"
