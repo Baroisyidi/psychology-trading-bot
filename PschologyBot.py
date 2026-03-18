@@ -555,6 +555,52 @@ async def get_macd_10min(symbol: str) -> Optional[dict]:
         return None
 
 
+async def get_macd_15min(symbol: str) -> Optional[dict]:
+    """
+    Fetch 15-minute klines and compute MACD (12, 26, 9).
+    Returns the current (forming) candle's MACD/Signal values for entry filter checks.
+    """
+    try:
+        resp = await asyncio.to_thread(
+            bybit_session.get_kline,
+            category="linear",
+            symbol=symbol,
+            interval="15",
+            limit=60,
+        )
+        klines = resp["result"]["list"]
+        if not klines:
+            raise ValueError("No 15-min klines returned")
+
+        df = pd.DataFrame(
+            klines,
+            columns=["timestamp", "open", "high", "low", "close", "volume", "turnover"],
+        ).iloc[::-1].reset_index(drop=True)
+        df["close"] = pd.to_numeric(df["close"], errors="coerce")
+
+        if df["close"].isna().any():
+            raise ValueError("Invalid 15-min prices")
+
+        # MACD (12, 26, 9)
+        df["ema_12"] = df["close"].ewm(span=12, adjust=False).mean()
+        df["ema_26"] = df["close"].ewm(span=26, adjust=False).mean()
+        df["macd_line"] = df["ema_12"] - df["ema_26"]
+        df["signal_line"] = df["macd_line"].ewm(span=9, adjust=False).mean()
+
+        # Current (forming) candle — used for entry filters
+        current_macd = float(df["macd_line"].iloc[-1])
+        current_signal = float(df["signal_line"].iloc[-1])
+
+        return {
+            "macd_15m_current": current_macd,
+            "signal_15m_current": current_signal,
+        }
+
+    except Exception as exc:
+        print(f"Error in get_macd_15min for {symbol}: {exc}")
+        return None
+
+
 async def get_open_position_side(symbol: str) -> Optional[str]:
     try:
         positions_resp = await asyncio.to_thread(
@@ -1228,16 +1274,19 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
     di_cross_type = indicators["di_cross_type"]
     last_candle_ts = indicators["last_candle_ts"]
 
-    # Fetch 10-minute MACD for entry/reversal/partial exit decisions
+    # Fetch 10-minute MACD for partial exit/re-entry decisions (closed-candle confirmation)
     macd_10m_indicators = await get_macd_10min(symbol)
-    if macd_10m_indicators:
-        macd_line_10m = macd_10m_indicators["macd_10m_current"]
-        signal_line_10m = macd_10m_indicators["signal_10m_current"]
+
+    # Fetch 15-minute MACD for entry filter checks
+    macd_15m_indicators = await get_macd_15min(symbol)
+    if macd_15m_indicators:
+        macd_line_15m = macd_15m_indicators["macd_15m_current"]
+        signal_line_15m = macd_15m_indicators["signal_15m_current"]
     else:
-        # Fallback to 30-min MACD if 10-min fetch fails
-        macd_line_10m = macd_line
-        signal_line_10m = signal_line
-        print(f"[WARN] {symbol}: 10-min MACD fetch failed, falling back to 30-min MACD")
+        # Fallback to 30-min MACD if 15-min fetch fails
+        macd_line_15m = macd_line
+        signal_line_15m = signal_line
+        print(f"[WARN] {symbol}: 15-min MACD fetch failed, falling back to 30-min MACD")
 
     chat_id = context.job.chat_id if context.job else CHAT_ID
 
@@ -2079,15 +2128,14 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
             if symbol in symbol_manual_quantities and symbol_manual_quantities[symbol] is not None:
                 manual_override = closed_qty
 
-            # Check if we should REVERSE to Short (requires: Price < 20 EMA AND -DI > +DI AND ADX > threshold AND MACD < Signal on 10m)
-            if last_close < ema_20 and minus_di > plus_di and adx > ADX_THRESHOLD and macd_line_10m < signal_line_10m:
+            # Check if we should REVERSE to Short (requires: Price < 20 EMA AND -DI > +DI AND ADX > threshold)
+            if last_close < ema_20 and minus_di > plus_di and adx > ADX_THRESHOLD:
                 await context.bot.send_message(
                     chat_id=chat_id,
                     text=(
                         f"\U0001f504 REVERSE to Short for {symbol}\n"
                         f"Price ({last_close}) < 20 EMA ({ema_20:.6g})\n"
                         f"-DI ({minus_di:.2f}) > +DI ({plus_di:.2f}) | ADX: {adx:.2f} > {ADX_THRESHOLD}\n"
-                        f"MACD 10m: {macd_line_10m:.6g} < Signal 10m: {signal_line_10m:.6g}\n"
                         f"Opening Short..."
                     )
                 )
@@ -2115,9 +2163,8 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                     chat_id=chat_id,
                     text=(
                         f"\U0001f7e1 GOING FLAT for {symbol}\n"
-                        f"No reverse signal (need: Price < 20 EMA + -DI > +DI + ADX > {ADX_THRESHOLD} + MACD < Signal on 10m)\n"
+                        f"No reverse signal (need: Price < 20 EMA + -DI > +DI + ADX > {ADX_THRESHOLD})\n"
                         f"+DI: {plus_di:.2f} | -DI: {minus_di:.2f} | ADX: {adx:.2f}\n"
-                        f"MACD 10m: {macd_line_10m:.6g} | Signal 10m: {signal_line_10m:.6g}\n"
                         f"Waiting for next entry signal..."
                     )
                 )
@@ -2145,15 +2192,14 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
             if symbol in symbol_manual_quantities and symbol_manual_quantities[symbol] is not None:
                 manual_override = closed_qty
 
-            # Check if we should REVERSE to Long (requires: Price > 20 EMA AND +DI > -DI AND ADX > threshold AND MACD > Signal on 10m)
-            if last_close > ema_20 and plus_di > minus_di and adx > ADX_THRESHOLD and macd_line_10m > signal_line_10m:
+            # Check if we should REVERSE to Long (requires: Price > 20 EMA AND +DI > -DI AND ADX > threshold)
+            if last_close > ema_20 and plus_di > minus_di and adx > ADX_THRESHOLD:
                 await context.bot.send_message(
                     chat_id=chat_id,
                     text=(
                         f"\U0001f504 REVERSE to Long for {symbol}\n"
                         f"Price ({last_close}) > 20 EMA ({ema_20:.6g})\n"
                         f"+DI ({plus_di:.2f}) > -DI ({minus_di:.2f}) | ADX: {adx:.2f} > {ADX_THRESHOLD}\n"
-                        f"MACD 10m: {macd_line_10m:.6g} > Signal 10m: {signal_line_10m:.6g}\n"
                         f"Opening Long..."
                     )
                 )
@@ -2181,9 +2227,8 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                     chat_id=chat_id,
                     text=(
                         f"\U0001f7e1 GOING FLAT for {symbol}\n"
-                        f"No reverse signal (need: Price > 20 EMA + +DI > -DI + ADX > {ADX_THRESHOLD} + MACD > Signal on 10m)\n"
+                        f"No reverse signal (need: Price > 20 EMA + +DI > -DI + ADX > {ADX_THRESHOLD})\n"
                         f"+DI: {plus_di:.2f} | -DI: {minus_di:.2f} | ADX: {adx:.2f}\n"
-                        f"MACD 10m: {macd_line_10m:.6g} | Signal 10m: {signal_line_10m:.6g}\n"
                         f"Waiting for next entry signal..."
                     )
                 )
@@ -2198,7 +2243,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
     #      1. ADX > 22
     #      2. EMA + DI alignment (30-min chart)
     #      3. RSI NOT in extreme zone (not > 70 for longs, not < 30 for shorts)
-    #      4. MACD Line vs Signal Line alignment (10-min chart)
+    #      4. MACD Line vs Signal Line alignment (15-min chart)
     # ──────────────────────────────────────────────
     if current_open_trade_side is None:
         # Filter 1: ADX must be above threshold
@@ -2213,9 +2258,9 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
             if rsi > RSI_OVERBOUGHT:
                 print(f"[FILTER] {symbol}: Long entry blocked — RSI overbought ({rsi:.2f} > {RSI_OVERBOUGHT})")
                 return
-            # Filter 4: MACD Line must be above Signal Line (10-min chart) for longs
-            if macd_line_10m <= signal_line_10m:
-                print(f"[FILTER] {symbol}: Long entry blocked — MACD Line 10m ({macd_line_10m:.6g}) <= Signal Line 10m ({signal_line_10m:.6g})")
+            # Filter 4: MACD Line must be above Signal Line (15-min chart) for longs
+            if macd_line_15m <= signal_line_15m:
+                print(f"[FILTER] {symbol}: Long entry blocked — MACD Line 15m ({macd_line_15m:.6g}) <= Signal Line 15m ({signal_line_15m:.6g})")
                 return
             new_trend = "upward"
             side = "Buy"
@@ -2225,9 +2270,9 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
             if rsi < RSI_OVERSOLD:
                 print(f"[FILTER] {symbol}: Short entry blocked — RSI oversold ({rsi:.2f} < {RSI_OVERSOLD})")
                 return
-            # Filter 4: MACD Line must be below Signal Line (10-min chart) for shorts
-            if macd_line_10m >= signal_line_10m:
-                print(f"[FILTER] {symbol}: Short entry blocked — MACD Line 10m ({macd_line_10m:.6g}) >= Signal Line 10m ({signal_line_10m:.6g})")
+            # Filter 4: MACD Line must be below Signal Line (15-min chart) for shorts
+            if macd_line_15m >= signal_line_15m:
+                print(f"[FILTER] {symbol}: Short entry blocked — MACD Line 15m ({macd_line_15m:.6g}) >= Signal Line 15m ({signal_line_15m:.6g})")
                 return
             new_trend = "downward"
             side = "Sell"
@@ -2239,7 +2284,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                 f"{ts} \u2014 {symbol} ENTRY SIGNAL: <b>{new_trend.upper()}</b>\n"
                 f"Last Close: {last_close} | 20 EMA: {ema_20:.6g}\n"
                 f"+DI: {plus_di:.2f} | -DI: {minus_di:.2f} | ADX: {adx:.2f}\n"
-                f"RSI: {rsi:.2f} | MACD 10m: {macd_line_10m:.6g} / Signal 10m: {signal_line_10m:.6g}\n"
+                f"RSI: {rsi:.2f} | MACD 15m: {macd_line_15m:.6g} / Signal 15m: {signal_line_15m:.6g}\n"
                 f"MACD Hist (30m): {macd_histogram:.6g} (prev: {prev_macd_histogram:.6g})\n"
                 f"Direction: {side_text}"
             )
@@ -2425,16 +2470,16 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             macd_hist_dying_long = indicators["macd_hist_dying_long"]
             macd_hist_dying_short = indicators["macd_hist_dying_short"]
 
-            # Fetch 10-minute MACD for entry filter
-            macd_10m_instant = await get_macd_10min(symbol)
-            if macd_10m_instant:
-                macd_line_10m = macd_10m_instant["macd_10m_current"]
-                signal_line_10m = macd_10m_instant["signal_10m_current"]
+            # Fetch 15-minute MACD for entry filter
+            macd_15m_instant = await get_macd_15min(symbol)
+            if macd_15m_instant:
+                macd_line_15m = macd_15m_instant["macd_15m_current"]
+                signal_line_15m = macd_15m_instant["signal_15m_current"]
             else:
-                macd_line_10m = macd_line
-                signal_line_10m = signal_line
+                macd_line_15m = macd_line
+                signal_line_15m = signal_line
 
-            # 5-layer entry filter for instant trade
+            # 4-layer entry filter for instant trade
             entry_blocked = False
             block_reason = ""
 
@@ -2455,18 +2500,18 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                     if rsi > RSI_OVERBOUGHT:
                         entry_blocked = True
                         block_reason = f"RSI overbought ({rsi:.2f} > {RSI_OVERBOUGHT})"
-                    elif macd_line_10m <= signal_line_10m:
+                    elif macd_line_15m <= signal_line_15m:
                         entry_blocked = True
-                        block_reason = f"MACD Line 10m ({macd_line_10m:.6g}) <= Signal Line 10m ({signal_line_10m:.6g})"
+                        block_reason = f"MACD Line 15m ({macd_line_15m:.6g}) <= Signal Line 15m ({signal_line_15m:.6g})"
                     else:
                         side = "Buy"
                 elif last_close < ema_20 and minus_di > plus_di:
                     if rsi < RSI_OVERSOLD:
                         entry_blocked = True
                         block_reason = f"RSI oversold ({rsi:.2f} < {RSI_OVERSOLD})"
-                    elif macd_line_10m >= signal_line_10m:
+                    elif macd_line_15m >= signal_line_15m:
                         entry_blocked = True
-                        block_reason = f"MACD Line 10m ({macd_line_10m:.6g}) >= Signal Line 10m ({signal_line_10m:.6g})"
+                        block_reason = f"MACD Line 15m ({macd_line_15m:.6g}) >= Signal Line 15m ({signal_line_15m:.6g})"
                     else:
                         side = "Sell"
 
@@ -2489,7 +2534,7 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                     await update.message.reply_text(
                         f"\U0001f4ca {symbol}: Last Close={last_close} | 20 EMA={ema_20:.6g}\n"
                         f"+DI: {plus_di:.2f} | -DI: {minus_di:.2f} | ADX: {adx:.2f}\n"
-                        f"MACD 10m: {macd_line_10m:.6g} / Signal 10m: {signal_line_10m:.6g} | Hist (30m): {macd_histogram:.6g}\n"
+                        f"MACD 15m: {macd_line_15m:.6g} / Signal 15m: {signal_line_15m:.6g} | Hist (30m): {macd_histogram:.6g}\n"
                         f"Direction: {side_text}"
                     )
 
@@ -2599,7 +2644,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("\u26d4 Unauthorized. This bot is private.")
         return
     await update.message.reply_text(
-        "Bot ready! (v10 - 5-Layer Filter + 10-min MACD + WebSocket + State Persistence)\n\n"
+        "Bot ready! (v11 - 4-Layer Filter + 15-min MACD Entry + 10-min MACD Partial Exit + WebSocket)\n\n"
         "Commands:\n"
         "1. /start - Display this message\n"
         "2. /add_symbol <symbol> - Start monitoring with auto-sizing (20% balance)\n"
@@ -2609,7 +2654,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"\u2022 1. ADX > {ADX_THRESHOLD}\n"
         "\u2022 2. Long: Price > 20 EMA (30m) + (+DI > -DI) | Short: Price < 20 EMA (30m) + (-DI > +DI)\n"
         f"\u2022 3. RSI NOT extreme (not > {RSI_OVERBOUGHT} for longs, not < {RSI_OVERSOLD} for shorts)\n"
-        "\u2022 4. Long: MACD Line > Signal Line based on a 10 minutes chart of the coin | Short: MACD Line < Signal Line based on a 10 minutes chart of the coin\n"
+        "\u2022 4. Long: MACD Line > Signal Line based on a 15 minutes chart of the coin | Short: MACD Line < Signal Line based on a 15 minutes chart of the coin\n\n"
         "Partial Exit Rules (MACD-based, 10-min closed-candle confirmation):\n"
         "\u2022 Long: If MACD crosses below Signal on a CLOSED 10-min candle \u2192 close 60%\n"
         "\u2022 If MACD crosses back above Signal on a CLOSED 10-min candle \u2192 add back 60%\n"
@@ -2630,8 +2675,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "\u2022 Short exits: Price > 20 EMA (30m) AND +DI > -DI\n\n"
         "Reversal Rules:\n"
         f"\u2022 ADX > {ADX_THRESHOLD} + EMA/DI alignment required\n"
-        "\u2022 Long reversal: Price > 20 EMA + (+DI > -DI) + MACD > Signal (10-min chart)\n"
-        "\u2022 Short reversal: Price < 20 EMA + (-DI > +DI) + MACD < Signal (10-min chart)\n"
+        "\u2022 Long reversal: Price > 20 EMA + (+DI > -DI)\n"
+        "\u2022 Short reversal: Price < 20 EMA + (-DI > +DI)\n"
         "\u2022 If conditions not met, bot goes FLAT\n\n"
         "Infrastructure:\n"
         "\u2022 WebSocket real-time price feeds (REST fallback)\n"
