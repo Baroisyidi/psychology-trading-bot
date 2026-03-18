@@ -2194,12 +2194,11 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     # ──────────────────────────────────────────────
     # 4. INITIAL TRADE ENTRY (no open position)
-    #    5-layer filter:
+    #    4-layer filter:
     #      1. ADX > 22
     #      2. EMA + DI alignment (30-min chart)
     #      3. RSI NOT in extreme zone (not > 70 for longs, not < 30 for shorts)
     #      4. MACD Line vs Signal Line alignment (10-min chart)
-    #      5. MACD histogram momentum (increasing for longs, decreasing for shorts)
     # ──────────────────────────────────────────────
     if current_open_trade_side is None:
         # Filter 1: ADX must be above threshold
@@ -2218,10 +2217,6 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
             if macd_line_10m <= signal_line_10m:
                 print(f"[FILTER] {symbol}: Long entry blocked — MACD Line 10m ({macd_line_10m:.6g}) <= Signal Line 10m ({signal_line_10m:.6g})")
                 return
-            # Filter 5: Block only if MACD histogram declined 2+ consecutive bars (dying momentum)
-            if macd_hist_dying_long:
-                print(f"[FILTER] {symbol}: Long entry blocked — MACD histogram declining 2+ bars ({prev2_macd_histogram:.6g} -> {prev_macd_histogram:.6g} -> {macd_histogram:.6g}), momentum dying")
-                return
             new_trend = "upward"
             side = "Buy"
         # Short: last_close < 20 EMA AND -DI > +DI
@@ -2233,10 +2228,6 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
             # Filter 4: MACD Line must be below Signal Line (10-min chart) for shorts
             if macd_line_10m >= signal_line_10m:
                 print(f"[FILTER] {symbol}: Short entry blocked — MACD Line 10m ({macd_line_10m:.6g}) >= Signal Line 10m ({signal_line_10m:.6g})")
-                return
-            # Filter 5: Block only if MACD histogram rose 2+ consecutive bars (dying short momentum)
-            if macd_hist_dying_short:
-                print(f"[FILTER] {symbol}: Short entry blocked — MACD histogram rising 2+ bars ({prev2_macd_histogram:.6g} -> {prev_macd_histogram:.6g} -> {macd_histogram:.6g}), momentum dying")
                 return
             new_trend = "downward"
             side = "Sell"
@@ -2467,9 +2458,6 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                     elif macd_line_10m <= signal_line_10m:
                         entry_blocked = True
                         block_reason = f"MACD Line 10m ({macd_line_10m:.6g}) <= Signal Line 10m ({signal_line_10m:.6g})"
-                    elif macd_hist_dying_long:
-                        entry_blocked = True
-                        block_reason = f"MACD histogram declining 2+ bars ({prev_macd_histogram:.6g} -> {macd_histogram:.6g}), momentum dying"
                     else:
                         side = "Buy"
                 elif last_close < ema_20 and minus_di > plus_di:
@@ -2479,9 +2467,6 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                     elif macd_line_10m >= signal_line_10m:
                         entry_blocked = True
                         block_reason = f"MACD Line 10m ({macd_line_10m:.6g}) >= Signal Line 10m ({signal_line_10m:.6g})"
-                    elif macd_hist_dying_short:
-                        entry_blocked = True
-                        block_reason = f"MACD histogram rising 2+ bars ({prev_macd_histogram:.6g} -> {macd_histogram:.6g}), momentum dying"
                     else:
                         side = "Sell"
 
@@ -2625,7 +2610,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "\u2022 2. Long: Price > 20 EMA (30m) + (+DI > -DI) | Short: Price < 20 EMA (30m) + (-DI > +DI)\n"
         f"\u2022 3. RSI NOT extreme (not > {RSI_OVERBOUGHT} for longs, not < {RSI_OVERSOLD} for shorts)\n"
         "\u2022 4. Long: MACD Line > Signal Line based on a 10 minutes chart of the coin | Short: MACD Line < Signal Line based on a 10 minutes chart of the coin\n"
-        "\u2022 5. Block if MACD histogram declines 2+ consecutive bars (longs) or rises 2+ bars (shorts)\n\n"
         "Partial Exit Rules (MACD-based, 10-min closed-candle confirmation):\n"
         "\u2022 Long: If MACD crosses below Signal on a CLOSED 10-min candle \u2192 close 60%\n"
         "\u2022 If MACD crosses back above Signal on a CLOSED 10-min candle \u2192 add back 60%\n"
