@@ -248,7 +248,7 @@ symbol_original_qty: dict[str, Optional[float]] = {}   # Original position qty a
 # MACD-based partial exit tracking
 symbol_macd_partial_closed: dict[str, bool] = {}       # Whether 60% was closed due to MACD crossover
 symbol_macd_partial_qty: dict[str, Optional[float]] = {} # Qty that was closed (to add back)
-symbol_macd_last_action_candle: dict[str, Optional[str]] = {}  # Timestamp of last 5-min candle acted upon (prevents re-triggering)
+symbol_macd_last_action_candle: dict[str, Optional[str]] = {}  # Timestamp of last 10-min candle acted upon (prevents re-triggering)
 
 # ────────────────────────────────────────────────
 #  Constants
@@ -1958,14 +1958,14 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                         print(f"[STAGE2-RETRY] {symbol}: Stage 2 trail placed (retry) at {stage2_trail_price:.6g}")
 
     # ──────────────────────────────────────────────
-    # 2. MACD-BASED PARTIAL EXIT RULES (5-MIN CLOSED-CANDLE CONFIRMATION)
-    #    Uses 5-minute chart MACD with CLOSED candle crossover confirmation.
+    # 2. MACD-BASED PARTIAL EXIT RULES (10-MIN CLOSED-CANDLE CONFIRMATION)
+    #    Uses 10-minute chart MACD with CLOSED candle crossover confirmation.
     #    This prevents whipsaw from intra-candle noise — the bot only acts when
-    #    a confirmed crossover is detected on a fully closed 5-min candle.
-    #    - Long: Bearish MACD cross on closed 5m candle → close 60%
-    #            Bullish MACD cross on closed 5m candle → add back 60%
-    #    - Short: Bullish MACD cross on closed 5m candle → close 60%
-    #             Bearish MACD cross on closed 5m candle → add back 60%
+    #    a confirmed crossover is detected on a fully closed 10-min candle.
+    #    - Long: Bearish MACD cross on closed 10m candle → close 60%
+    #            Bullish MACD cross on closed 10m candle → add back 60%
+    #    - Short: Bullish MACD cross on closed 10m candle → close 60%
+    #             Bearish MACD cross on closed 10m candle → add back 60%
     #    Only applies when trailing stop is NOT active (to avoid conflicts)
     #    Does NOT trigger if exit conditions are already met (let exit handle it)
     # ──────────────────────────────────────────────
@@ -2239,11 +2239,11 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     # ──────────────────────────────────────────────
     # 4. INITIAL TRADE ENTRY (no open position)
-    #    4-layer filter:
+    #    4-layer filter (ALL must pass):
     #      1. ADX > 22
-    #      2. EMA + DI alignment (30-min chart)
-    #      3. RSI NOT in extreme zone (not > 70 for longs, not < 30 for shorts)
-    #      4. MACD Line vs Signal Line alignment (15-min chart)
+    #      2. Long: Price > 20 EMA (30m) + (+DI > -DI) | Short: Price < 20 EMA (30m) + (-DI > +DI)
+    #      3. RSI NOT extreme (not > 70 for longs, not < 30 for shorts)
+    #      4. Long: MACD Line > Signal Line (15m) | Short: MACD Line < Signal Line (15m)
     # ──────────────────────────────────────────────
     if current_open_trade_side is None:
         # Filter 1: ADX must be above threshold
@@ -2385,9 +2385,9 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
 
         report_msg = (
             f"Still monitoring {symbol}\n"
-            f"\u2022 Entry: 5-layer filter (ADX>{ADX_THRESHOLD}, EMA+DI, RSI, MACD Line/Signal, MACD Hist momentum)\n"
+            f"\u2022 Entry: 4-layer filter (ADX>{ADX_THRESHOLD}, EMA+DI, RSI, MACD 15m Line/Signal)\n"
             f"\u2022 Exit: Long exits when Price < 20 EMA AND -DI > +DI | Short exits when Price > 20 EMA AND +DI > -DI\n"
-            f"\u2022 Reverse: Only if ADX > {ADX_THRESHOLD} + EMA/DI + MACD alignment, else FLAT\n"
+            f"\u2022 Reverse: Only if ADX > {ADX_THRESHOLD} + EMA/DI alignment, else FLAT\n"
             f"\u2022 SL: 30% at {SL_STAGE1_ATR_MULT}x ATR + 70% at {STOP_LOSS_ATR_MULT}x ATR (server SL always active)\n"
             f"\u2022 MACD Partial: Close 60% on adverse MACD cross, add back on re-cross\n"
             f"\u2022 Trail: 60% at {TRAILING_ACTIVATE_ATR}x ATR, then 30% at 1x ATR, 10% rides\n"
@@ -2572,9 +2572,9 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(
         f"Monitoring {symbol}!\n"
         f"\u2022 {qty_info}\n"
-        f"\u2022 Entry filters: ADX > {ADX_THRESHOLD} + EMA/DI + RSI + MACD Line/Signal + MACD Histogram momentum\n"
+        f"\u2022 Entry filters: ADX > {ADX_THRESHOLD} + EMA/DI (30m) + RSI + MACD Line/Signal (15m)\n"
         f"\u2022 Exit: Long exits when Price < 20 EMA AND -DI > +DI | Short exits when Price > 20 EMA AND +DI > -DI\n"
-        f"\u2022 Reverse only if ADX > {ADX_THRESHOLD} + EMA/DI + MACD alignment, else FLAT\n"
+        f"\u2022 Reverse only if ADX > {ADX_THRESHOLD} + EMA/DI alignment, else FLAT\n"
         f"\u2022 SL: 30% at {SL_STAGE1_ATR_MULT}x ATR + 70% at {STOP_LOSS_ATR_MULT}x ATR (server-side SL always active)\n"
         f"\u2022 MACD Partial: Close 60% on adverse MACD cross, add back on favorable re-cross\n"
         f"\u2022 Trail: 60% at {TRAILING_ACTIVATE_ATR}x ATR profit ({TRAILING_STOP_ATR}x ATR dist), then 30% ({TRAILING_STOP_ATR_STAGE2}x ATR dist), 10% rides until EMA+DI exit\n"
@@ -2644,7 +2644,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("\u26d4 Unauthorized. This bot is private.")
         return
     await update.message.reply_text(
-        "Bot ready! (v11 - 4-Layer Filter + 15-min MACD Entry + 10-min MACD Partial Exit + WebSocket)\n\n"
+        "Bot ready! (v12 - 4-Layer Filter + 15-min MACD Entry + 10-min MACD Partial Exit + WebSocket)\n\n"
         "Commands:\n"
         "1. /start - Display this message\n"
         "2. /add_symbol <symbol> - Start monitoring with auto-sizing (20% balance)\n"
