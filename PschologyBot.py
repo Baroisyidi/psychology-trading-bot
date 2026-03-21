@@ -240,9 +240,9 @@ symbol_trail2_price: dict[str, Optional[float]] = {}   # Stage 2 trail trigger p
 symbol_peak_stage2: dict[str, Optional[float]] = {}    # Peak price tracking for stage 2
 
 # Tiered stop-loss tracking
-symbol_sl1_order_id: dict[str, Optional[str]] = {}     # Conditional order for 30% at 1.5x ATR
-symbol_sl1_qty: dict[str, Optional[float]] = {}        # Qty for the 30% SL order
-symbol_sl1_taken: dict[str, bool] = {}                 # Has 30% SL at 1.5x ATR been taken?
+symbol_sl1_order_id: dict[str, Optional[str]] = {}     # Conditional order for 50% at 0.5x ATR
+symbol_sl1_qty: dict[str, Optional[float]] = {}        # Qty for the 50% SL order
+symbol_sl1_taken: dict[str, bool] = {}                 # Has 50% SL at 0.5x ATR been taken?
 symbol_original_qty: dict[str, Optional[float]] = {}   # Original position qty at entry
 
 # MACD-based partial exit tracking
@@ -256,9 +256,9 @@ symbol_macd_last_action_candle: dict[str, Optional[str]] = {}  # Timestamp of la
 ATR_MULTIPLIER = 1.5        # Legacy (kept for reference)
 ADX_THRESHOLD = 22           # Only trade when ADX > 22 (trending)
 ADX_REVERSAL_THRESHOLD = 24  # Reversal requires ADX > 24
-STOP_LOSS_ATR_MULT = 2.0    # Ultimate stop-loss at 2x ATR from entry (closes remaining 70%)
-SL_STAGE1_ATR_MULT = 1.5    # First tier SL at 1.5x ATR (closes 30%)
-SL_STAGE1_CLOSE_PCT = 0.30  # Close 30% of position at first SL level
+STOP_LOSS_ATR_MULT = 1.0    # Ultimate stop-loss at 1x ATR from entry (closes remaining 50%)
+SL_STAGE1_ATR_MULT = 0.5    # First tier SL at 0.5x ATR (closes 50%)
+SL_STAGE1_CLOSE_PCT = 0.50  # Close 50% of position at first SL level
 TRAILING_ACTIVATE_ATR = 1.5  # Activate trailing stop after 1.5x ATR profit
 TRAILING_STOP_ATR = 1.0      # Stage 1 trailing stop distance: 1x ATR from peak
 TRAILING_STOP_ATR_STAGE2 = 1.0  # Stage 2 trailing stop distance: 1x ATR from peak
@@ -1106,7 +1106,7 @@ async def cancel_stage2_trail_order(symbol: str) -> bool:
 
 
 async def cancel_sl1_order(symbol: str) -> bool:
-    """Cancel the SL stage 1 (30% at 1.5x ATR) conditional order."""
+    """Cancel the SL stage 1 (50% at 0.5x ATR) conditional order."""
     order_id = symbol_sl1_order_id.get(symbol)
     if not order_id:
         return True
@@ -1247,9 +1247,9 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
     # ──────────────────────────────────────────────
     # 1. RISK MANAGEMENT: Multi-stage trailing + tiered stop-loss
     #    STOP-LOSS (price goes against us):
-    #      - Server-side SL at 2x ATR (safety net, closes remaining 70%)
-    #      - Conditional order at 1.5x ATR closes 30% INSTANTLY
-    #      - If price continues to 2x ATR, server SL closes remaining 70%
+    #      - Server-side SL at 1x ATR (safety net, closes remaining 50%)
+    #      - Conditional order at 0.5x ATR closes 50% INSTANTLY
+    #      - If price continues to 1x ATR, server SL closes remaining 50%
     #    TRAILING STOP (price goes in our favor):
     #      - Stage 1: At 1.5x ATR profit, trail on 60%. Bybit closes INSTANTLY when hit.
     #      - Stage 2: After 60% closed, trail on 30% (1x ATR distance). Bybit closes INSTANTLY.
@@ -1281,7 +1281,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                 sl_price = entry_price + (STOP_LOSS_ATR_MULT * entry_atr)
             await set_server_stop_loss(symbol, current_open_trade_side, sl_price)
 
-        # Ensure SL1 conditional order (30% at 1.5x ATR) is placed — skip if trailing active or SL1 already taken/set
+        # Ensure SL1 conditional order (50% at 0.5x ATR) is placed — skip if trailing active or SL1 already taken/set
         if not symbol_sl1_order_id.get(symbol) and not symbol_sl1_taken.get(symbol, False) and not symbol_trailing_active.get(symbol, False) and not symbol_partial_taken.get(symbol, False):
             pos_qty = await get_position_size(symbol)
             if pos_qty:
@@ -1296,7 +1296,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                     symbol_sl1_order_id[symbol] = sl1_order_id
                     symbol_sl1_qty[symbol] = round_qty_to_step(sl1_qty, qty_step, min_qty)
                     symbol_original_qty[symbol] = pos_qty
-                    print(f"[SL-TIER1] {symbol}: Placed 30% SL order ({symbol_sl1_qty[symbol]}) at {sl1_price:.6g} (1.5x ATR)")
+                    print(f"[SL-TIER1] {symbol}: Placed 50% SL order ({symbol_sl1_qty[symbol]}) at {sl1_price:.6g} (0.5x ATR)")
 
         # Update peak price tracking using REAL-TIME price (not last_close)
         peak = symbol_peak_price.get(symbol, entry_price)
@@ -1306,7 +1306,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
             peak = min(peak, current_price)
         symbol_peak_price[symbol] = peak
 
-        # ── TIERED STOP-LOSS: Detect SL1 (30% at 1.5x ATR) fill ──
+        # ── TIERED STOP-LOSS: Detect SL1 (50% at 0.5x ATR) fill ──
         # Only check if SL1 order was placed and not yet confirmed as taken, and trailing not active
         sl1_taken = symbol_sl1_taken.get(symbol, False)
         if not sl1_taken and symbol_sl1_order_id.get(symbol) and not symbol_trailing_active.get(symbol, False):
@@ -1327,9 +1327,9 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                         chat_id=chat_id,
                         text=(
                             f"\U0001f6d1 SL TIER 1 HIT for {symbol} ({side_label})\n"
-                            f"30% closed at 1.5x ATR loss\n"
+                            f"50% closed at 0.5x ATR loss\n"
                             f"Entry: {entry_price:.6g} | Current: {current_price:.6g}\n"
-                            f"Remaining 70% protected by server SL at 2x ATR ({STOP_LOSS_ATR_MULT}x ATR)\n"
+                            f"Remaining 50% protected by server SL at 1x ATR ({STOP_LOSS_ATR_MULT}x ATR)\n"
                             f"If price recovers, trailing can still activate."
                         )
                     )
@@ -1362,7 +1362,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                             f"\U0001f6d1 STOP-LOSS HIT for {symbol} (Long) [Backup check]\n"
                             f"Entry: {entry_price} | Stop: {stop_loss_price_full:.6g}\n"
                             f"Current Price: {current_price} | ATR: {entry_atr:.6g}\n"
-                            f"Loss at 2x ATR. Closing remaining position.\n"
+                            f"Loss at 1x ATR. Closing remaining position.\n"
                             f"(Server-side SL should have fired first)"
                         )
                     )
@@ -1372,7 +1372,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                     symbol_open_trade_side[symbol] = None
                     return
 
-                # Check 1.5x ATR (30% close) — backup if conditional order missed
+                # Check 0.5x ATR (50% close) — backup if conditional order missed
                 if not sl1_taken:
                     stop_loss_price_30 = entry_price - (SL_STAGE1_ATR_MULT * entry_atr)
                     if current_price <= stop_loss_price_30:
@@ -1380,7 +1380,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                             chat_id=chat_id,
                             text=(
                                 f"\U0001f6d1 SL TIER 1 (Backup) for {symbol} (Long)\n"
-                                f"Closing 30% at 1.5x ATR loss\n"
+                                f"Closing 50% at 0.5x ATR loss\n"
                                 f"Entry: {entry_price} | Current: {current_price}"
                             )
                         )
@@ -1399,7 +1399,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                             f"\U0001f6d1 STOP-LOSS HIT for {symbol} (Short) [Backup check]\n"
                             f"Entry: {entry_price} | Stop: {stop_loss_price_full:.6g}\n"
                             f"Current Price: {current_price} | ATR: {entry_atr:.6g}\n"
-                            f"Loss at 2x ATR. Closing remaining position.\n"
+                            f"Loss at 1x ATR. Closing remaining position.\n"
                             f"(Server-side SL should have fired first)"
                         )
                     )
@@ -1409,7 +1409,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                     symbol_open_trade_side[symbol] = None
                     return
 
-                # Check 1.5x ATR (30% close) — backup if conditional order missed
+                # Check 0.5x ATR (50% close) — backup if conditional order missed
                 if not sl1_taken:
                     stop_loss_price_30 = entry_price + (SL_STAGE1_ATR_MULT * entry_atr)
                     if current_price >= stop_loss_price_30:
@@ -1417,7 +1417,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                             chat_id=chat_id,
                             text=(
                                 f"\U0001f6d1 SL TIER 1 (Backup) for {symbol} (Short)\n"
-                                f"Closing 30% at 1.5x ATR loss\n"
+                                f"Closing 50% at 0.5x ATR loss\n"
                                 f"Entry: {entry_price} | Current: {current_price}"
                             )
                         )
@@ -2315,9 +2315,9 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
             risk_info += f"\n\u2022 Trailing Stop: {trailing_status}"
             # SL status
             if sl1_taken_flag:
-                sl_status = f'Tier 1 HIT (30% closed at 1.5x ATR). Tier 2 at 2x ATR protects remaining 70%'
+                sl_status = f'Tier 1 HIT (50% closed at 0.5x ATR). Tier 2 at 1x ATR protects remaining 50%'
             else:
-                sl_status = f"Tier 1: {'SET' if symbol_sl1_order_id.get(symbol) else 'Not set'} (30% @ 1.5x ATR) | Tier 2: {'SET' if server_sl else 'Not set'} (70% @ 2x ATR)"
+                sl_status = f"Tier 1: {'SET' if symbol_sl1_order_id.get(symbol) else 'Not set'} (50% @ 0.5x ATR) | Tier 2: {'SET' if server_sl else 'Not set'} (50% @ 1x ATR)"
             risk_info += f"\n\u2022 Stop-Loss: {sl_status}"
             risk_info += f"\n\u2022 Server-Side SL: {'SET' if server_sl else 'Not set'}"
             risk_info += f"\n\u2022 Server-Side TS: {'SET' if server_ts else 'Not set'}"
@@ -2334,7 +2334,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
             f"\u2022 Entry: 4-layer filter (ADX>{ADX_THRESHOLD}, EMA (30m), RSI, MACD 30m Line/Signal)\n"
             f"\u2022 Exit: Long exits when Price < 20 EMA AND MACD < Signal (30m) | Short exits when Price > 20 EMA AND MACD > Signal (30m)\n"
             f"\u2022 Reverse: Only if ADX > {ADX_REVERSAL_THRESHOLD} + EMA/MACD alignment (30m), else FLAT\n"
-            f"\u2022 SL: 30% at {SL_STAGE1_ATR_MULT}x ATR + 70% at {STOP_LOSS_ATR_MULT}x ATR (server SL always active)\n"
+            f"\u2022 SL: 50% at {SL_STAGE1_ATR_MULT}x ATR + 50% at {STOP_LOSS_ATR_MULT}x ATR (server SL always active)\n"
             f"\u2022 MACD Partial: Close 60% on adverse MACD cross, add back on re-cross\n"
             f"\u2022 Trail: 60% at {TRAILING_ACTIVATE_ATR}x ATR, then 30% at 1x ATR, 10% rides\n"
             f"\u2022 WebSocket prices + polling every {POLL_INTERVAL_SECONDS}s\n"
@@ -2512,7 +2512,7 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"\u2022 Entry filters: ADX > {ADX_THRESHOLD} + EMA (30m) + RSI + MACD Line/Signal (30m)\n"
         f"\u2022 Exit: Long exits when Price < 20 EMA AND MACD < Signal (30m) | Short exits when Price > 20 EMA AND MACD > Signal (30m)\n"
         f"\u2022 Reverse only if ADX > {ADX_REVERSAL_THRESHOLD} + EMA/MACD alignment (30m), else FLAT\n"
-        f"\u2022 SL: 30% at {SL_STAGE1_ATR_MULT}x ATR + 70% at {STOP_LOSS_ATR_MULT}x ATR (server-side SL always active)\n"
+        f"\u2022 SL: 50% at {SL_STAGE1_ATR_MULT}x ATR + 50% at {STOP_LOSS_ATR_MULT}x ATR (server-side SL always active)\n"
         f"\u2022 MACD Partial: Close 60% on adverse MACD cross, add back on favorable re-cross\n"
         f"\u2022 Trail: 60% at {TRAILING_ACTIVATE_ATR}x ATR profit ({TRAILING_STOP_ATR}x ATR dist), then 30% ({TRAILING_STOP_ATR_STAGE2}x ATR dist), 10% rides until Exit Rules exit\n"
         f"\u2022 WebSocket real-time price feeds + polling every {POLL_INTERVAL_SECONDS}s\n"
@@ -2599,8 +2599,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "\u2022 If MACD crosses back below Signal on a CLOSED 10-min candle \u2192 add back 60%\n"
         "\u2022 Prevents whipsaw: only acts on confirmed crossovers, not intra-candle noise\n\n"
         "Stop-Loss (Tiered):\n"
-        f"\u2022 Tier 1: 30% closed INSTANTLY at {SL_STAGE1_ATR_MULT}x ATR loss\n"
-        f"\u2022 Tier 2: Remaining 70% closed at {STOP_LOSS_ATR_MULT}x ATR loss (server-side, always active)\n\n"
+        f"\u2022 Tier 1: 50% closed INSTANTLY at {SL_STAGE1_ATR_MULT}x ATR loss\n"
+        f"\u2022 Tier 2: Remaining 50% closed at {STOP_LOSS_ATR_MULT}x ATR loss (server-side, always active)\n\n"
         "Trailing Stop (Multi-Stage):\n"
         f"\u2022 At {TRAILING_ACTIVATE_ATR}x ATR profit: Stage 1 trail activates on {TRAILING_CLOSE_PCT*100:.0f}%\n"
         f"\u2022 Stage 1 trail: {TRAILING_STOP_ATR}x ATR distance. Bybit closes {TRAILING_CLOSE_PCT*100:.0f}% INSTANTLY when hit\n"
