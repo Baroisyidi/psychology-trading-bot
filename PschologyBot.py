@@ -1,10 +1,10 @@
-
 import os
 import json
 import asyncio
 import random
 import time
 import threading
+import numpy as np
 import pandas as pd
 from datetime import datetime
 from typing import Optional, Tuple, List, Dict
@@ -119,6 +119,160 @@ def get_ws_price(symbol: str) -> Optional[float]:
     with ws_prices_lock:
         return ws_prices.get(symbol)
 
+
+# ────────────────────────────────────────────────
+#  Strategy Constants (from BybitStrategyBacktester_v29)
+# ────────────────────────────────────────────────
+# Indicator periods
+EMA_FAST = 8
+EMA_MID = 21
+EMA_SLOW = 50
+EMA_TREND = 100
+RSI_PERIOD = 14
+STOCH_RSI_PERIOD = 14
+STOCH_RSI_SMOOTH = 3
+BB_PERIOD = 20
+BB_STD = 2.0
+VOLUME_MA_PERIOD = 20
+ROC_PERIOD = 10
+CONSOLIDATION_BARS = 15
+
+# Default tunable parameters (v29 strategy)
+DEFAULT_PARAMS = {
+    # Stop Loss
+    "sl_atr": 2.5,
+    # Trailing Stop
+    "trail_atr": 1.8,
+    "trail_strong": 2.2,
+    "trail_vstrong": 2.8,
+    "trail_tighten_tp1": 0.85,
+    "trail_tighten_tp2": 0.70,
+    # Take Profit
+    "tp0_atr": 0.7,
+    "tp1_atr": 1.5,
+    "tp2_atr": 3.5,
+    "tp3_atr": 6.0,
+    "tp0_pct": 0.10,
+    "tp1_pct": 0.20,
+    "tp2_pct": 0.20,
+    "tp3_pct": 0.20,
+    # Entry thresholds
+    "sig_threshold": 5,
+    "sig_strong": 4,
+    "sig_vstrong": 3,
+    # ADX thresholds
+    "adx_entry": 18,
+    "adx_strong": 28,
+    "adx_vstrong": 42,
+    "adx_4h_regime": 16,
+    # Cooldown
+    "cooldown_bars": 2,
+    "cooldown_loss": 4,
+    "cooldown_streak": 8,
+    # RSI thresholds
+    "rsi_ob": 72,
+    "rsi_os": 28,
+    "rsi_mr_high": 75,
+    "rsi_mr_low": 25,
+    # BB squeeze
+    "bb_squeeze": 0.03,
+    # Equity management
+    "dd_reduce": 20.0,
+    "dd_small": 30.0,
+    "dd_pause": 40.0,
+    "size_reduced": 0.5,
+    "size_small": 0.25,
+    # Time-based exit
+    "flat_bars": 15,
+    "flat_threshold": 0.3,
+    # Max loss cap
+    "max_loss": 4.5,
+    # Win streak
+    "win_streak_bonus": 0.15,
+    # Volatility floor
+    "min_atr_pct": 0.3,
+    # Mean reversion position size
+    "mr_size": 0.6,
+}
+
+# Per-Coin Deep-Optimized Overrides (from v29 grid search)
+COIN_OVERRIDES = {
+    "TURTLEUSDT": {
+        "sl_atr": 3.0, "trail_atr": 1.575, "trail_strong": 2.2, "trail_vstrong": 2.8,
+        "trail_tighten_tp1": 0.95, "trail_tighten_tp2": 0.70,
+        "tp0_atr": 0.2, "tp1_atr": 1.5, "tp2_atr": 3.5, "tp3_atr": 6.0,
+        "tp0_pct": 0.10, "tp1_pct": 0.20, "tp2_pct": 0.20, "tp3_pct": 0.20,
+        "sig_threshold": 2, "sig_strong": 4, "sig_vstrong": 3,
+        "adx_entry": 18, "adx_4h_regime": 16,
+        "cooldown_bars": 0, "cooldown_loss": 4, "cooldown_streak": 8,
+        "max_loss": 4.75, "dd_pause": 60.0, "dd_small": 30.0, "dd_reduce": 20.0,
+        "win_streak_bonus": 0.15, "min_atr_pct": 0.3,
+    },
+    "DEXEUSDT": {
+        "sl_atr": 6.0, "trail_atr": 2.2, "trail_strong": 5.0, "trail_vstrong": 6.0,
+        "tp0_atr": 2.0, "tp1_atr": 4.0, "tp2_atr": 8.0, "tp3_atr": 15.0,
+        "sig_threshold": 3, "sig_strong": 3, "sig_vstrong": 2,
+        "adx_entry": 18, "adx_4h_regime": 16,
+        "max_loss": 8.0, "dd_pause": 80.0, "dd_small": 60.0, "dd_reduce": 40.0,
+        "win_streak_bonus": 0.15, "min_atr_pct": 0.3,
+    },
+    "RDNTUSDT": {
+        "sl_atr": 1.0, "trail_atr": 1.89, "trail_strong": 2.2, "trail_vstrong": 2.8,
+        "tp0_atr": 0.2, "tp1_atr": 3.0, "tp2_atr": 3.5, "tp3_atr": 6.0,
+        "sig_threshold": 5, "sig_strong": 4, "sig_vstrong": 3,
+        "adx_entry": 10, "adx_4h_regime": 16,
+        "max_loss": 10.0, "dd_pause": 40.0, "dd_small": 30.0, "dd_reduce": 20.0,
+        "win_streak_bonus": 0.15, "min_atr_pct": 0.3,
+    },
+}
+
+POLL_INTERVAL_SECONDS = 10  # Poll every 10 seconds
+
+def get_symbol_params(symbol: str) -> dict:
+    """Get the tunable parameters for a symbol, with per-coin overrides."""
+    params = DEFAULT_PARAMS.copy()
+    if symbol in COIN_OVERRIDES:
+        params.update(COIN_OVERRIDES[symbol])
+    return params
+
+
+# ────────────────────────────────────────────────
+#  Global state
+# ────────────────────────────────────────────────
+symbol_trends: dict[str, Optional[str]] = {}
+monitored_symbols: list[str] = []
+symbol_open_trade_side: dict[str, Optional[str]] = {}
+symbol_manual_quantities: dict[str, Optional[float]] = {}
+
+# Per-symbol risk management tracking
+symbol_entry_price: dict[str, Optional[float]] = {}
+symbol_entry_atr: dict[str, Optional[float]] = {}
+symbol_peak_price: dict[str, Optional[float]] = {}       # highest (long) or lowest (short) since entry
+symbol_lowest_since_entry: dict[str, Optional[float]] = {}
+symbol_highest_since_entry: dict[str, Optional[float]] = {}
+symbol_trailing_sl: dict[str, Optional[float]] = {}      # current trailing stop price
+symbol_sl_price: dict[str, Optional[float]] = {}          # current stop-loss price
+symbol_server_sl_set: dict[str, bool] = {}
+
+# Take-profit tracking
+symbol_tp0_hit: dict[str, bool] = {}
+symbol_tp1_hit: dict[str, bool] = {}
+symbol_tp2_hit: dict[str, bool] = {}
+symbol_tp3_hit: dict[str, bool] = {}
+symbol_position_size_pct: dict[str, float] = {}  # remaining position as fraction of original (1.0 = full)
+symbol_original_qty: dict[str, Optional[float]] = {}
+
+# Cooldown & streak tracking
+symbol_cooldown: dict[str, int] = {}
+symbol_consecutive_losses: dict[str, int] = {}
+symbol_consecutive_wins: dict[str, int] = {}
+symbol_bars_in_trade: dict[str, int] = {}
+symbol_last_candle_ts: dict[str, Optional[str]] = {}  # track candle changes for bar counting
+
+# Equity curve tracking
+symbol_peak_equity: dict[str, float] = {}
+
+
 # ────────────────────────────────────────────────
 #  State Persistence (JSON)
 # ────────────────────────────────────────────────
@@ -135,26 +289,23 @@ def save_state():
             "symbol_entry_price": symbol_entry_price,
             "symbol_entry_atr": symbol_entry_atr,
             "symbol_peak_price": symbol_peak_price,
-            "symbol_trailing_active": symbol_trailing_active,
-            "symbol_partial_taken": symbol_partial_taken,
+            "symbol_lowest_since_entry": symbol_lowest_since_entry,
+            "symbol_highest_since_entry": symbol_highest_since_entry,
+            "symbol_trailing_sl": symbol_trailing_sl,
+            "symbol_sl_price": symbol_sl_price,
             "symbol_server_sl_set": symbol_server_sl_set,
-            "symbol_server_ts_set": symbol_server_ts_set,
-            "symbol_trail_order_id": symbol_trail_order_id,
-            "symbol_trail_qty": symbol_trail_qty,
-            "symbol_trail_price": symbol_trail_price,
-            "symbol_stage2_active": symbol_stage2_active,
-            "symbol_stage2_taken": symbol_stage2_taken,
-            "symbol_trail2_order_id": symbol_trail2_order_id,
-            "symbol_trail2_qty": symbol_trail2_qty,
-            "symbol_trail2_price": symbol_trail2_price,
-            "symbol_peak_stage2": symbol_peak_stage2,
-            "symbol_sl1_order_id": symbol_sl1_order_id,
-            "symbol_sl1_qty": symbol_sl1_qty,
-            "symbol_sl1_taken": symbol_sl1_taken,
+            "symbol_tp0_hit": symbol_tp0_hit,
+            "symbol_tp1_hit": symbol_tp1_hit,
+            "symbol_tp2_hit": symbol_tp2_hit,
+            "symbol_tp3_hit": symbol_tp3_hit,
+            "symbol_position_size_pct": symbol_position_size_pct,
             "symbol_original_qty": symbol_original_qty,
-            "symbol_macd_partial_closed": symbol_macd_partial_closed,
-            "symbol_macd_partial_qty": symbol_macd_partial_qty,
-            "symbol_macd_last_action_candle": symbol_macd_last_action_candle,
+            "symbol_cooldown": symbol_cooldown,
+            "symbol_consecutive_losses": symbol_consecutive_losses,
+            "symbol_consecutive_wins": symbol_consecutive_wins,
+            "symbol_bars_in_trade": symbol_bars_in_trade,
+            "symbol_last_candle_ts": symbol_last_candle_ts,
+            "symbol_peak_equity": symbol_peak_equity,
         }
         with open(STATE_FILE, "w") as f:
             json.dump(state, f, indent=2, default=str)
@@ -172,37 +323,33 @@ def load_state():
         with open(STATE_FILE, "r") as f:
             state = json.load(f)
 
-        # Restore all state dicts
         symbol_trends.update(state.get("symbol_trends", {}))
         loaded_symbols = state.get("monitored_symbols", [])
         for s in loaded_symbols:
             if s not in monitored_symbols:
                 monitored_symbols.append(s)
         symbol_open_trade_side.update(state.get("symbol_open_trade_side", {}))
-        symbol_manual_quantities.update({k: v for k, v in state.get("symbol_manual_quantities", {}).items()})
-        symbol_entry_price.update({k: v for k, v in state.get("symbol_entry_price", {}).items()})
-        symbol_entry_atr.update({k: v for k, v in state.get("symbol_entry_atr", {}).items()})
-        symbol_peak_price.update({k: v for k, v in state.get("symbol_peak_price", {}).items()})
-        symbol_trailing_active.update({k: v for k, v in state.get("symbol_trailing_active", {}).items()})
-        symbol_partial_taken.update({k: v for k, v in state.get("symbol_partial_taken", {}).items()})
-        symbol_server_sl_set.update({k: v for k, v in state.get("symbol_server_sl_set", {}).items()})
-        symbol_server_ts_set.update({k: v for k, v in state.get("symbol_server_ts_set", {}).items()})
-        symbol_trail_order_id.update({k: v for k, v in state.get("symbol_trail_order_id", {}).items()})
-        symbol_trail_qty.update({k: v for k, v in state.get("symbol_trail_qty", {}).items()})
-        symbol_trail_price.update({k: v for k, v in state.get("symbol_trail_price", {}).items()})
-        symbol_stage2_active.update({k: v for k, v in state.get("symbol_stage2_active", {}).items()})
-        symbol_stage2_taken.update({k: v for k, v in state.get("symbol_stage2_taken", {}).items()})
-        symbol_trail2_order_id.update({k: v for k, v in state.get("symbol_trail2_order_id", {}).items()})
-        symbol_trail2_qty.update({k: v for k, v in state.get("symbol_trail2_qty", {}).items()})
-        symbol_trail2_price.update({k: v for k, v in state.get("symbol_trail2_price", {}).items()})
-        symbol_peak_stage2.update({k: v for k, v in state.get("symbol_peak_stage2", {}).items()})
-        symbol_sl1_order_id.update({k: v for k, v in state.get("symbol_sl1_order_id", {}).items()})
-        symbol_sl1_qty.update({k: v for k, v in state.get("symbol_sl1_qty", {}).items()})
-        symbol_sl1_taken.update({k: v for k, v in state.get("symbol_sl1_taken", {}).items()})
-        symbol_original_qty.update({k: v for k, v in state.get("symbol_original_qty", {}).items()})
-        symbol_macd_partial_closed.update({k: v for k, v in state.get("symbol_macd_partial_closed", {}).items()})
-        symbol_macd_partial_qty.update({k: v for k, v in state.get("symbol_macd_partial_qty", {}).items()})
-        symbol_macd_last_action_candle.update({k: v for k, v in state.get("symbol_macd_last_action_candle", {}).items()})
+        symbol_manual_quantities.update(state.get("symbol_manual_quantities", {}))
+        symbol_entry_price.update(state.get("symbol_entry_price", {}))
+        symbol_entry_atr.update(state.get("symbol_entry_atr", {}))
+        symbol_peak_price.update(state.get("symbol_peak_price", {}))
+        symbol_lowest_since_entry.update(state.get("symbol_lowest_since_entry", {}))
+        symbol_highest_since_entry.update(state.get("symbol_highest_since_entry", {}))
+        symbol_trailing_sl.update(state.get("symbol_trailing_sl", {}))
+        symbol_sl_price.update(state.get("symbol_sl_price", {}))
+        symbol_server_sl_set.update(state.get("symbol_server_sl_set", {}))
+        symbol_tp0_hit.update(state.get("symbol_tp0_hit", {}))
+        symbol_tp1_hit.update(state.get("symbol_tp1_hit", {}))
+        symbol_tp2_hit.update(state.get("symbol_tp2_hit", {}))
+        symbol_tp3_hit.update(state.get("symbol_tp3_hit", {}))
+        symbol_position_size_pct.update({k: float(v) for k, v in state.get("symbol_position_size_pct", {}).items()})
+        symbol_original_qty.update(state.get("symbol_original_qty", {}))
+        symbol_cooldown.update({k: int(v) for k, v in state.get("symbol_cooldown", {}).items()})
+        symbol_consecutive_losses.update({k: int(v) for k, v in state.get("symbol_consecutive_losses", {}).items()})
+        symbol_consecutive_wins.update({k: int(v) for k, v in state.get("symbol_consecutive_wins", {}).items()})
+        symbol_bars_in_trade.update({k: int(v) for k, v in state.get("symbol_bars_in_trade", {}).items()})
+        symbol_last_candle_ts.update(state.get("symbol_last_candle_ts", {}))
+        symbol_peak_equity.update({k: float(v) for k, v in state.get("symbol_peak_equity", {}).items()})
 
         print(f"[STATE] Loaded state from {STATE_FILE} — {len(monitored_symbols)} symbols restored")
         return True
@@ -210,64 +357,10 @@ def load_state():
         print(f"[STATE] Failed to load state: {e}")
         return False
 
-# ────────────────────────────────────────────────
-#  Global state
-# ────────────────────────────────────────────────
-symbol_trends: dict[str, Optional[str]] = {}
-monitored_symbols: list[str] = []
-symbol_open_trade_side: dict[str, Optional[str]] = {}
-symbol_manual_quantities: dict[str, Optional[float]] = {}
-symbol_last_di_cross_candle: dict[str, Optional[str]] = {}
-
-# Per-symbol risk management tracking
-symbol_entry_price: dict[str, Optional[float]] = {}
-symbol_entry_atr: dict[str, Optional[float]] = {}
-symbol_peak_price: dict[str, Optional[float]] = {}
-symbol_trailing_active: dict[str, bool] = {}
-symbol_partial_taken: dict[str, bool] = {}  # Track if 60% trailing profit has been taken
-symbol_server_sl_set: dict[str, bool] = {}  # Track if server-side stop-loss is active
-symbol_server_ts_set: dict[str, bool] = {}  # Track if server-side trailing stop is active
-symbol_trail_order_id: dict[str, Optional[str]] = {}  # Conditional order ID for 60% trailing SL
-symbol_trail_qty: dict[str, Optional[float]] = {}     # 60% qty under trailing stop order
-symbol_trail_price: dict[str, Optional[float]] = {}   # Current trailing stop trigger price
-
-# Stage 2 trailing stop (30% of original position, after 60% closed)
-symbol_stage2_active: dict[str, bool] = {}             # Is stage 2 trailing active?
-symbol_stage2_taken: dict[str, bool] = {}              # Has stage 2 trail been filled?
-symbol_trail2_order_id: dict[str, Optional[str]] = {}  # Conditional order ID for stage 2 trail
-symbol_trail2_qty: dict[str, Optional[float]] = {}     # Stage 2 trail qty
-symbol_trail2_price: dict[str, Optional[float]] = {}   # Stage 2 trail trigger price
-symbol_peak_stage2: dict[str, Optional[float]] = {}    # Peak price tracking for stage 2
-
-# Tiered stop-loss tracking
-symbol_sl1_order_id: dict[str, Optional[str]] = {}     # Conditional order for 50% at 0.5x ATR
-symbol_sl1_qty: dict[str, Optional[float]] = {}        # Qty for the 50% SL order
-symbol_sl1_taken: dict[str, bool] = {}                 # Has 50% SL at 0.5x ATR been taken?
-symbol_original_qty: dict[str, Optional[float]] = {}   # Original position qty at entry
-
-# MACD-based partial exit tracking
-symbol_macd_partial_closed: dict[str, bool] = {}       # Whether 60% was closed due to MACD crossover
-symbol_macd_partial_qty: dict[str, Optional[float]] = {} # Qty that was closed (to add back)
-symbol_macd_last_action_candle: dict[str, Optional[str]] = {}  # Timestamp of last 10-min candle acted upon (prevents re-triggering)
 
 # ────────────────────────────────────────────────
-#  Constants
+#  Motivational Quotes
 # ────────────────────────────────────────────────
-ATR_MULTIPLIER = 1.5        # Legacy (kept for reference)
-ADX_THRESHOLD = 22           # Only trade when ADX > 22 (trending)
-ADX_REVERSAL_THRESHOLD = 24  # Reversal requires ADX > 24
-STOP_LOSS_ATR_MULT = 1.0    # Ultimate stop-loss at 1x ATR from entry (closes remaining 50%)
-SL_STAGE1_ATR_MULT = 0.5    # First tier SL at 0.5x ATR (closes 50%)
-SL_STAGE1_CLOSE_PCT = 0.50  # Close 50% of position at first SL level
-TRAILING_ACTIVATE_ATR = 1.5  # Activate trailing stop after 1.5x ATR profit
-TRAILING_STOP_ATR = 1.0      # Stage 1 trailing stop distance: 1x ATR from peak
-TRAILING_STOP_ATR_STAGE2 = 1.0  # Stage 2 trailing stop distance: 1x ATR from peak
-TRAILING_CLOSE_PCT = 0.60    # Close 60% of position on stage 1 trail
-TRAILING_STAGE2_PCT = 0.75   # Close 75% of remaining 40% (= 30% of original) on stage 2
-POLL_INTERVAL_SECONDS = 10   # Poll every 10 seconds (faster for risk management)
-RSI_OVERBOUGHT = 70          # Block long entries when RSI > 70
-RSI_OVERSOLD = 30            # Block short entries when RSI < 30
-
 MOTIVATIONAL_QUOTES = [
     "\u201cThe market doesn\u2019t reward intelligence \U0001f9e0 \u2014 it rewards discipline \U0001f9f1.\nSmart traders survive, disciplined traders compound.\u201d",
     "\u201cConsistency \U0001f501 beats luck \U0001f3b2 every single time.\nWhat you repeat daily becomes your edge.\u201d",
@@ -316,21 +409,19 @@ async def get_current_price(symbol: str) -> Optional[float]:
 async def get_all_indicators(
     symbol: str,
     interval: str = "30",
-    limit: int = 100,
+    limit: int = 200,
 ) -> Optional[dict]:
     """
-    Returns a dict with all trading indicators:
-    - atr, ema_20
-    - plus_di, minus_di (current candle)
-    - prev_plus_di, prev_minus_di (previous candle)
-    - di_crossed (bool), di_cross_type ("bullish"/"bearish"/None)
-    - adx, adx_prev2 (ADX 2 candles ago for rising check)
-    - rsi
-    - macd_line, signal_line, macd_histogram, prev_macd_histogram
-    - macd_hist_dying_long (bool), macd_hist_dying_short (bool)
-    - current_price (live tick via WebSocket or REST)
-    - last_close (closed candle price - used for decisions)
-    - last_candle_ts (for dedup)
+    Returns a dict with all v29 trading indicators computed from 30-min Bybit klines:
+    - ATR, ATR%, EMAs (8/21/50/100), EMA slopes
+    - DMI (+DI/-DI), ADX
+    - RSI, Stochastic RSI (K/D)
+    - MACD histogram + prev
+    - Bollinger Bands (upper/lower/width/width_min)
+    - Volume ratio, ROC, VWAP
+    - trend_score (-4 to +4)
+    - swing_high, swing_low (20-bar)
+    - current_price (live), last_close, last_candle_ts
     """
     try:
         resp = await asyncio.to_thread(
@@ -348,131 +439,154 @@ async def get_all_indicators(
             klines,
             columns=["timestamp", "open", "high", "low", "close", "volume", "turnover"],
         ).iloc[::-1].reset_index(drop=True)
-        df["high"] = pd.to_numeric(df["high"], errors="coerce")
-        df["low"] = pd.to_numeric(df["low"], errors="coerce")
-        df["close"] = pd.to_numeric(df["close"], errors="coerce")
-        df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
+
+        for col in ["open", "high", "low", "close", "volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
         if df["close"].isna().any():
             raise ValueError("Invalid prices")
 
-        # 1. ATR (14) using Wilder's smoothing
+        # ATR (14)
         df["prev_close"] = df["close"].shift(1)
         df["tr1"] = df["high"] - df["low"]
         df["tr2"] = (df["high"] - df["prev_close"]).abs()
         df["tr3"] = (df["low"] - df["prev_close"]).abs()
         df["tr"] = df[["tr1", "tr2", "tr3"]].max(axis=1)
         df["atr"] = df["tr"].ewm(alpha=1/14, min_periods=14).mean()
-        atr = float(df["atr"].iloc[-1])
+        df["atr_pct"] = (df["atr"] / df["close"]) * 100
 
-        # 2. 20 EMA (30-minute chart)
-        df["ema_20"] = df["close"].ewm(span=20, adjust=False).mean()
-        ema_20 = float(df["ema_20"].iloc[-1])
+        # EMAs
+        df["ema_fast"] = df["close"].ewm(span=EMA_FAST, adjust=False).mean()
+        df["ema_mid"] = df["close"].ewm(span=EMA_MID, adjust=False).mean()
+        df["ema_slow"] = df["close"].ewm(span=EMA_SLOW, adjust=False).mean()
+        df["ema_trend"] = df["close"].ewm(span=EMA_TREND, adjust=False).mean()
+        df["ema_fast_slope"] = (df["ema_fast"] - df["ema_fast"].shift(5)) / df["ema_fast"].shift(5) * 100
 
-        # 3. DMI: +DI / -DI (14-period, Wilder's smoothing)
+        # DMI / ADX
         df["up_move"] = df["high"] - df["high"].shift(1)
         df["down_move"] = df["low"].shift(1) - df["low"]
-
         df["+dm"] = 0.0
         df["-dm"] = 0.0
-        plus_dm_mask = (df["up_move"] > df["down_move"]) & (df["up_move"] > 0)
-        minus_dm_mask = (df["down_move"] > df["up_move"]) & (df["down_move"] > 0)
-        df.loc[plus_dm_mask, "+dm"] = df.loc[plus_dm_mask, "up_move"]
-        df.loc[minus_dm_mask, "-dm"] = df.loc[minus_dm_mask, "down_move"]
-
-        df["+dm_smooth"] = df["+dm"].ewm(alpha=1/14, min_periods=14).mean()
-        df["-dm_smooth"] = df["-dm"].ewm(alpha=1/14, min_periods=14).mean()
-
-        df["+di"] = (df["+dm_smooth"] / df["atr"]) * 100
-        df["-di"] = (df["-dm_smooth"] / df["atr"]) * 100
-
-        plus_di = float(df["+di"].iloc[-1])
-        minus_di = float(df["-di"].iloc[-1])
-        prev_plus_di = float(df["+di"].iloc[-2])
-        prev_minus_di = float(df["-di"].iloc[-2])
-
-        # 4. ADX (Average Directional Index) - 14-period Wilder's smoothing of DX
+        plus_mask = (df["up_move"] > df["down_move"]) & (df["up_move"] > 0)
+        minus_mask = (df["down_move"] > df["up_move"]) & (df["down_move"] > 0)
+        df.loc[plus_mask, "+dm"] = df.loc[plus_mask, "up_move"]
+        df.loc[minus_mask, "-dm"] = df.loc[minus_mask, "down_move"]
+        df["+dm_s"] = df["+dm"].ewm(alpha=1/14, min_periods=14).mean()
+        df["-dm_s"] = df["-dm"].ewm(alpha=1/14, min_periods=14).mean()
+        df["+di"] = (df["+dm_s"] / df["atr"]) * 100
+        df["-di"] = (df["-dm_s"] / df["atr"]) * 100
         di_sum = df["+di"] + df["-di"]
-        di_sum = di_sum.replace(0, float('nan'))
+        di_sum = di_sum.replace(0, float("nan"))
         df["dx"] = (abs(df["+di"] - df["-di"]) / di_sum) * 100
         df["adx"] = df["dx"].ewm(alpha=1/14, min_periods=14).mean()
-        adx = float(df["adx"].iloc[-1])
-        # ADX value from 2 candles ago (for reference/logging)
-        adx_prev2 = float(df["adx"].iloc[-3]) if len(df) >= 3 else adx
 
-        # 5. RSI (14-period, Wilder's smoothing)
+        # RSI
         delta = df["close"].diff()
         gain = delta.where(delta > 0, 0.0)
-        loss = (-delta.where(delta < 0, 0.0))
-        avg_gain = gain.ewm(alpha=1/14, min_periods=14).mean()
-        avg_loss = loss.ewm(alpha=1/14, min_periods=14).mean()
-        rs = avg_gain / avg_loss.replace(0, float('nan'))
+        loss_vals = (-delta.where(delta < 0, 0.0))
+        avg_gain = gain.ewm(alpha=1/RSI_PERIOD, min_periods=RSI_PERIOD).mean()
+        avg_loss = loss_vals.ewm(alpha=1/RSI_PERIOD, min_periods=RSI_PERIOD).mean()
+        rs = avg_gain / avg_loss.replace(0, float("nan"))
         df["rsi"] = 100 - (100 / (1 + rs))
-        rsi = float(df["rsi"].iloc[-1]) if not pd.isna(df["rsi"].iloc[-1]) else 50.0
 
-        # 6. MACD (12, 26, 9)
-        df["ema_12"] = df["close"].ewm(span=12, adjust=False).mean()
-        df["ema_26"] = df["close"].ewm(span=26, adjust=False).mean()
-        df["macd_line"] = df["ema_12"] - df["ema_26"]
-        df["signal_line"] = df["macd_line"].ewm(span=9, adjust=False).mean()
-        df["macd_histogram"] = df["macd_line"] - df["signal_line"]
+        # Stochastic RSI
+        rsi_min = df["rsi"].rolling(STOCH_RSI_PERIOD).min()
+        rsi_max = df["rsi"].rolling(STOCH_RSI_PERIOD).max()
+        rsi_range = rsi_max - rsi_min
+        rsi_range = rsi_range.replace(0, float("nan"))
+        df["stoch_rsi_k"] = ((df["rsi"] - rsi_min) / rsi_range * 100).rolling(STOCH_RSI_SMOOTH).mean()
+        df["stoch_rsi_d"] = df["stoch_rsi_k"].rolling(STOCH_RSI_SMOOTH).mean()
 
-        macd_line = float(df["macd_line"].iloc[-1])
-        signal_line = float(df["signal_line"].iloc[-1])
-        macd_histogram = float(df["macd_histogram"].iloc[-1])
-        prev_macd_histogram = float(df["macd_histogram"].iloc[-2]) if len(df) >= 2 else macd_histogram
-        prev2_macd_histogram = float(df["macd_histogram"].iloc[-3]) if len(df) >= 3 else prev_macd_histogram
+        # MACD
+        df["macd_ema12"] = df["close"].ewm(span=12, adjust=False).mean()
+        df["macd_ema26"] = df["close"].ewm(span=26, adjust=False).mean()
+        df["macd_line"] = df["macd_ema12"] - df["macd_ema26"]
+        df["macd_signal"] = df["macd_line"].ewm(span=9, adjust=False).mean()
+        df["macd_hist"] = df["macd_line"] - df["macd_signal"]
+        df["macd_hist_prev"] = df["macd_hist"].shift(1)
 
-        # Histogram momentum: block only on 2+ consecutive declining/rising bars
-        # For longs: block if histogram declined for 2 consecutive bars (dying momentum)
-        #   e.g., 5 -> 3 -> 1 = blocked, but 5 -> 4 -> 6 = allowed
-        # For shorts: block if histogram rose for 2 consecutive bars (dying downward momentum)
-        #   e.g., -5 -> -3 -> -1 = blocked, but -5 -> -4 -> -6 = allowed
-        macd_hist_dying_long = (macd_histogram < prev_macd_histogram) and (prev_macd_histogram < prev2_macd_histogram)
-        macd_hist_dying_short = (macd_histogram > prev_macd_histogram) and (prev_macd_histogram > prev2_macd_histogram)
+        # Bollinger Bands
+        df["bb_mid"] = df["close"].rolling(BB_PERIOD).mean()
+        df["bb_std"] = df["close"].rolling(BB_PERIOD).std()
+        df["bb_upper"] = df["bb_mid"] + BB_STD * df["bb_std"]
+        df["bb_lower"] = df["bb_mid"] - BB_STD * df["bb_std"]
+        df["bb_width"] = (df["bb_upper"] - df["bb_lower"]) / df["bb_mid"]
+        df["bb_width_min"] = df["bb_width"].rolling(CONSOLIDATION_BARS).min()
 
-        # Detect DI crossover on the latest candle
-        prev_diff = prev_plus_di - prev_minus_di
-        curr_diff = plus_di - minus_di
+        # Volume
+        df["vol_ma"] = df["volume"].rolling(VOLUME_MA_PERIOD).mean()
+        df["vol_ratio"] = df["volume"] / df["vol_ma"].replace(0, float("nan"))
 
-        di_crossed = False
-        di_cross_type = None
-        if prev_diff <= 0 and curr_diff > 0:
-            di_crossed = True
-            di_cross_type = "bullish"
-        elif prev_diff >= 0 and curr_diff < 0:
-            di_crossed = True
-            di_cross_type = "bearish"
+        # ROC
+        df["roc"] = (df["close"] - df["close"].shift(ROC_PERIOD)) / df["close"].shift(ROC_PERIOD) * 100
+
+        # VWAP (48-bar rolling)
+        typical_price = (df["high"] + df["low"] + df["close"]) / 3
+        cum_tp_vol = (typical_price * df["volume"]).rolling(48).sum()
+        cum_vol = df["volume"].rolling(48).sum().replace(0, float("nan"))
+        df["vwap"] = cum_tp_vol / cum_vol
+
+        # Trend score
+        df["trend_score"] = 0
+        df.loc[df["ema_fast"] > df["ema_mid"], "trend_score"] += 1
+        df.loc[df["ema_mid"] > df["ema_slow"], "trend_score"] += 1
+        df.loc[df["ema_slow"] > df["ema_trend"], "trend_score"] += 1
+        df.loc[df["close"] > df["ema_fast"], "trend_score"] += 1
+        df.loc[df["ema_fast"] < df["ema_mid"], "trend_score"] -= 1
+        df.loc[df["ema_mid"] < df["ema_slow"], "trend_score"] -= 1
+        df.loc[df["ema_slow"] < df["ema_trend"], "trend_score"] -= 1
+        df.loc[df["close"] < df["ema_fast"], "trend_score"] -= 1
+
+        # Swing high/low (20-bar)
+        df["swing_high"] = df["high"].rolling(20, center=False).max()
+        df["swing_low"] = df["low"].rolling(20, center=False).min()
+
+        # Previous values for crossover detection
+        df["prev_ema_fast"] = df["ema_fast"].shift(1)
+        df["prev_ema_mid"] = df["ema_mid"].shift(1)
+
+        # Extract last row values (second-to-last = last CLOSED candle)
+        last = df.iloc[-2]  # Last closed candle
+        curr_forming = df.iloc[-1]  # Currently forming candle
 
         last_candle_ts = str(df["timestamp"].iloc[-1])
+        last_close = float(last["close"])
 
-        # Last closed candle price (used for all trading decisions)
-        last_close = float(df["close"].iloc[-2])
-
-        # Current price from WebSocket (instant) or REST ticker (fallback)
         current_price = await get_current_price(symbol)
         if current_price is None:
-            current_price = last_close  # ultimate fallback
+            current_price = last_close
+
+        def safe(val):
+            return float(val) if not pd.isna(val) else None
 
         return {
-            "atr": atr,
-            "ema_20": ema_20,
-            "plus_di": plus_di,
-            "minus_di": minus_di,
-            "prev_plus_di": prev_plus_di,
-            "prev_minus_di": prev_minus_di,
-            "di_crossed": di_crossed,
-            "di_cross_type": di_cross_type,
-            "adx": adx,
-            "adx_prev2": adx_prev2,
-            "rsi": rsi,
-            "macd_line": macd_line,
-            "signal_line": signal_line,
-            "macd_histogram": macd_histogram,
-            "prev_macd_histogram": prev_macd_histogram,
-            "prev2_macd_histogram": prev2_macd_histogram,
-            "macd_hist_dying_long": macd_hist_dying_long,
-            "macd_hist_dying_short": macd_hist_dying_short,
+            "atr": safe(last["atr"]),
+            "atr_pct": safe(last["atr_pct"]),
+            "ema_fast": safe(last["ema_fast"]),
+            "ema_mid": safe(last["ema_mid"]),
+            "ema_slow": safe(last["ema_slow"]),
+            "ema_trend": safe(last["ema_trend"]),
+            "ema_fast_slope": safe(last["ema_fast_slope"]),
+            "prev_ema_fast": safe(last["prev_ema_fast"]),
+            "prev_ema_mid": safe(last["prev_ema_mid"]),
+            "plus_di": safe(last["+di"]),
+            "minus_di": safe(last["-di"]),
+            "adx": safe(last["adx"]),
+            "rsi": safe(last["rsi"]) or 50.0,
+            "stoch_rsi_k": safe(last["stoch_rsi_k"]) or 50.0,
+            "stoch_rsi_d": safe(last["stoch_rsi_d"]) or 50.0,
+            "macd_hist": safe(last["macd_hist"]) or 0.0,
+            "macd_hist_prev": safe(last["macd_hist_prev"]) or 0.0,
+            "bb_upper": safe(last["bb_upper"]),
+            "bb_lower": safe(last["bb_lower"]),
+            "bb_width": safe(last["bb_width"]),
+            "bb_width_min": safe(last["bb_width_min"]),
+            "vol_ratio": safe(last["vol_ratio"]) or 1.0,
+            "roc": safe(last["roc"]) or 0.0,
+            "vwap": safe(last["vwap"]),
+            "trend_score": int(last["trend_score"]) if not pd.isna(last["trend_score"]) else 0,
+            "swing_high": safe(last["swing_high"]),
+            "swing_low": safe(last["swing_low"]),
             "current_price": current_price,
             "last_close": last_close,
             "last_candle_ts": last_candle_ts,
@@ -483,2216 +597,1303 @@ async def get_all_indicators(
         return None
 
 
-async def get_macd_10min(symbol: str) -> Optional[dict]:
+async def compute_higher_tf(symbol: str) -> dict:
     """
-    Fetch 10-minute klines and compute MACD (12, 26, 9).
-    Returns:
-    - Current (forming) candle's MACD/Signal values (for entry filter & reversal checks)
-    - Last two CLOSED candles' MACD/Signal values + crossover detection (for partial exit/re-entry)
-    This prevents whipsaw from intra-candle noise for partial exits,
-    while still allowing instant entry/reversal filter checks.
+    Compute higher-timeframe trend signals (1H and 4H).
+    Returns trend direction for each TF based on EMA20/50 + MACD.
     """
+    result = {"htf_1h_trend": 0, "htf_4h_trend": 0}
+    for interval, key in [("60", "htf_1h_trend"), ("240", "htf_4h_trend")]:
+        try:
+            resp = await asyncio.to_thread(
+                bybit_session.get_kline,
+                category="linear",
+                symbol=symbol,
+                interval=interval,
+                limit=100,
+            )
+            klines = resp["result"]["list"]
+            if not klines or len(klines) < 60:
+                continue
+
+            df = pd.DataFrame(
+                klines,
+                columns=["timestamp", "open", "high", "low", "close", "volume", "turnover"],
+            ).iloc[::-1].reset_index(drop=True)
+            for col in ["open", "high", "low", "close", "volume"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
+            ema20 = df["close"].ewm(span=20, adjust=False).mean()
+            ema50 = df["close"].ewm(span=50, adjust=False).mean()
+            macd_line = df["close"].ewm(span=12, adjust=False).mean() - df["close"].ewm(span=26, adjust=False).mean()
+            macd_signal = macd_line.ewm(span=9, adjust=False).mean()
+
+            last = df.iloc[-2]  # Last closed candle
+            last_idx = len(df) - 2
+            trend = 0
+            if ema20.iloc[last_idx] > ema50.iloc[last_idx]:
+                trend += 1
+            else:
+                trend -= 1
+            if macd_line.iloc[last_idx] > macd_signal.iloc[last_idx]:
+                trend += 1
+            else:
+                trend -= 1
+            result[key] = trend
+        except Exception as e:
+            print(f"[HTF] Error computing {interval}m for {symbol}: {e}")
+    return result
+
+
+# ────────────────────────────────────────────────
+#  Infrastructure: Position & Order Management (preserved from v14)
+# ────────────────────────────────────────────────
+
+def get_open_position_side(symbol: str) -> Optional[str]:
+    """Check Bybit for an open position. Returns 'Buy', 'Sell', or None."""
     try:
-        resp = await asyncio.to_thread(
-            bybit_session.get_kline,
-            category="linear",
-            symbol=symbol,
-            interval="10",
-            limit=60,
-        )
-        klines = resp["result"]["list"]
-        if not klines:
-            raise ValueError("No 10-min klines returned")
-
-        df = pd.DataFrame(
-            klines,
-            columns=["timestamp", "open", "high", "low", "close", "volume", "turnover"],
-        ).iloc[::-1].reset_index(drop=True)
-        df["close"] = pd.to_numeric(df["close"], errors="coerce")
-
-        if df["close"].isna().any():
-            raise ValueError("Invalid 10-min prices")
-
-        # MACD (12, 26, 9)
-        df["ema_12"] = df["close"].ewm(span=12, adjust=False).mean()
-        df["ema_26"] = df["close"].ewm(span=26, adjust=False).mean()
-        df["macd_line"] = df["ema_12"] - df["ema_26"]
-        df["signal_line"] = df["macd_line"].ewm(span=9, adjust=False).mean()
-
-        # Current (forming) candle — used for entry filters and reversal checks
-        current_macd = float(df["macd_line"].iloc[-1])
-        current_signal = float(df["signal_line"].iloc[-1])
-
-        # Use iloc[-2] = last CLOSED candle, iloc[-3] = candle before that
-        # iloc[-1] is the currently forming (incomplete) candle — ignored for crossover detection
-        prev_macd = float(df["macd_line"].iloc[-3])
-        prev_signal = float(df["signal_line"].iloc[-3])
-        last_macd = float(df["macd_line"].iloc[-2])
-        last_signal = float(df["signal_line"].iloc[-2])
-        last_closed_ts = str(df["timestamp"].iloc[-2])
-
-        # Detect confirmed crossovers on closed candles
-        # Bullish crossover: MACD was below Signal, now above
-        bullish_cross = (prev_macd <= prev_signal) and (last_macd > last_signal)
-        # Bearish crossover: MACD was above Signal, now below
-        bearish_cross = (prev_macd >= prev_signal) and (last_macd < last_signal)
-
-        return {
-            # Current (forming) candle values — for entry/reversal filter checks
-            "macd_10m_current": current_macd,
-            "signal_10m_current": current_signal,
-            # Last closed candle values — for crossover confirmation
-            "macd_10m": last_macd,
-            "signal_10m": last_signal,
-            "prev_macd_10m": prev_macd,
-            "prev_signal_10m": prev_signal,
-            "bullish_cross_10m": bullish_cross,
-            "bearish_cross_10m": bearish_cross,
-            "last_closed_ts_10m": last_closed_ts,
-        }
-
-    except Exception as exc:
-        print(f"Error in get_macd_10min for {symbol}: {exc}")
-        return None
-
-
-async def get_macd_45min(symbol: str) -> Optional[dict]:
-    """
-    Fetch 15-minute klines and aggregate into 45-minute candles, then compute MACD (12, 26, 9).
-    Returns MACD Line and Signal Line values for entry/exit/reversal decisions.
-    Since Bybit doesn't natively support 45-min intervals, we construct them from 15-min data.
-    """
-    try:
-        resp = await asyncio.to_thread(
-            bybit_session.get_kline,
-            category="linear",
-            symbol=symbol,
-            interval="15",
-            limit=200,  # ~200 15-min candles = ~50 hours = ~66 45-min candles (enough for MACD 12,26,9)
-        )
-        klines = resp["result"]["list"]
-        if not klines:
-            raise ValueError("No 15-min klines returned")
-
-        df = pd.DataFrame(
-            klines,
-            columns=["timestamp", "open", "high", "low", "close", "volume", "turnover"],
-        ).iloc[::-1].reset_index(drop=True)
-
-        df["timestamp_dt"] = pd.to_datetime(df["timestamp"].astype(int), unit="ms", utc=True)
-        df["open"] = pd.to_numeric(df["open"], errors="coerce")
-        df["high"] = pd.to_numeric(df["high"], errors="coerce")
-        df["low"] = pd.to_numeric(df["low"], errors="coerce")
-        df["close"] = pd.to_numeric(df["close"], errors="coerce")
-        df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
-
-        if df["close"].isna().any():
-            raise ValueError("Invalid 15-min prices")
-
-        # Aggregate 15-min candles into 45-min candles using pandas resample
-        df = df.set_index("timestamp_dt")
-        df_45 = df.resample("45min", origin="epoch").agg({
-            "open": "first",
-            "high": "max",
-            "low": "min",
-            "close": "last",
-            "volume": "sum",
-        }).dropna().reset_index()
-
-        if len(df_45) < 30:
-            raise ValueError(f"Not enough 45-min candles for MACD ({len(df_45)})")
-
-        # MACD (12, 26, 9)
-        df_45["ema_12"] = df_45["close"].ewm(span=12, adjust=False).mean()
-        df_45["ema_26"] = df_45["close"].ewm(span=26, adjust=False).mean()
-        df_45["macd_line"] = df_45["ema_12"] - df_45["ema_26"]
-        df_45["signal_line"] = df_45["macd_line"].ewm(span=9, adjust=False).mean()
-
-        macd_line_45m = float(df_45["macd_line"].iloc[-1])
-        signal_line_45m = float(df_45["signal_line"].iloc[-1])
-
-        return {
-            "macd_line_45m": macd_line_45m,
-            "signal_line_45m": signal_line_45m,
-        }
-
-    except Exception as exc:
-        print(f"Error in get_macd_45min for {symbol}: {exc}")
-        return None
-
-
-
-
-async def get_open_position_side(symbol: str) -> Optional[str]:
-    try:
-        positions_resp = await asyncio.to_thread(
-            bybit_session.get_positions,
-            category="linear",
-            symbol=symbol
-        )
-        positions = positions_resp["result"]["list"]
+        resp = bybit_session.get_positions(category="linear", symbol=symbol, settleCoin="USDT")
+        positions = resp.get("result", {}).get("list", [])
         for pos in positions:
-            if float(pos["size"]) > 0:
-                return pos["side"]
+            size = float(pos.get("size", 0))
+            if size > 0:
+                return pos.get("side")
         return None
     except Exception as e:
-        print(f"Error getting open position for {symbol}: {e}")
+        print(f"Error getting position side for {symbol}: {e}")
         return None
 
-async def get_instrument_constraints(symbol: str) -> Tuple[float, float, float, float]:
+def get_instrument_constraints(symbol: str) -> dict:
+    """Fetch instrument tick size and lot size constraints from Bybit."""
     try:
-        info = await asyncio.to_thread(
-            bybit_session.get_instruments_info,
-            category="linear",
-            symbol=symbol
-        )
-        if info["retCode"] != 0:
-            raise ValueError(info["retMsg"])
-
-        instrument = info["result"]["list"][0]
-        lot_filter = instrument["lotSizeFilter"]
-        min_qty = float(lot_filter["minOrderQty"])
-        max_qty = float(lot_filter["maxMktOrderQty"])
-        qty_step = float(lot_filter["qtyStep"])
-        min_notional = float(lot_filter.get("minNotionalValue", 5.0))
-
-        print(f"[DEBUG] {symbol} constraints -> min_qty={min_qty}, max_qty={max_qty}, qty_step={qty_step}, min_notional={min_notional}")
-
-        return min_qty, max_qty, qty_step, min_notional
-
+        resp = bybit_session.get_instruments_info(category="linear", symbol=symbol)
+        instruments = resp["result"]["list"]
+        if not instruments:
+            return {}
+        info = instruments[0]
+        lot_filter = info.get("lotSizeFilter", {})
+        price_filter = info.get("priceFilter", {})
+        return {
+            "qtyStep": lot_filter.get("qtyStep", "0.001"),
+            "minOrderQty": lot_filter.get("minOrderQty", "0.001"),
+            "tickSize": price_filter.get("tickSize", "0.01"),
+        }
     except Exception as e:
-        print(f"Failed to get constraints for {symbol}: {e}")
-        return 0.001, 1000000.0, 0.001, 5.0
+        print(f"Error getting instrument constraints for {symbol}: {e}")
+        return {}
 
-def round_qty_to_step(qty: float, qty_step: float, min_qty: float) -> float:
-    """Round quantity DOWN to the nearest valid step increment, ensuring it meets the minimum."""
-    if qty_step > 0:
-        qty = (qty // qty_step) * qty_step
-    return max(qty, min_qty)
+def round_qty_to_step(qty: float, step: float) -> float:
+    """Round quantity down to the nearest valid step."""
+    if step <= 0:
+        return qty
+    return float(int(qty / step) * step)
 
-def format_qty_str(qty: float, qty_step: float) -> str:
-    """Format quantity as a string with the correct decimal precision derived from qtyStep."""
-    if qty_step >= 1:
-        return str(int(qty))
-    step_str = f"{qty_step:.10f}".rstrip('0')
-    decimals = len(step_str.split('.')[1]) if '.' in step_str else 0
+def format_qty_str(qty: float, step: str) -> str:
+    """Format quantity string to match step precision."""
+    decimals = len(step.rstrip('0').split('.')[-1]) if '.' in step else 0
     return f"{qty:.{decimals}f}"
 
-async def get_trade_qty(symbol: str) -> float:
+def get_trade_qty(symbol: str, side: str, manual_qty: Optional[float] = None) -> Optional[str]:
+    """Calculate the order quantity based on 95% of available wallet balance (or manual qty)."""
     try:
-        if symbol in symbol_manual_quantities and symbol_manual_quantities[symbol] is not None:
-            manual_qty = symbol_manual_quantities[symbol]
-            min_qty, max_qty, qty_step, _ = await get_instrument_constraints(symbol)
-            return round_qty_to_step(manual_qty, qty_step, min_qty)
+        constraints = get_instrument_constraints(symbol)
+        if not constraints:
+            return None
 
-        balance_resp = await asyncio.to_thread(
-            bybit_session.get_wallet_balance,
-            accountType="UNIFIED"
-        )
-        if balance_resp["retCode"] != 0:
-            raise ValueError(f"Balance API error: {balance_resp['retMsg']}")
-        result = balance_resp["result"]
-        if not result["list"]:
-            raise ValueError("No account data in response")
-        account = result["list"][0]
-        total_avail_usd_str = account.get("totalAvailableBalance", "0")
-        total_avail_usd = float(total_avail_usd_str)
+        step = float(constraints["qtyStep"])
+        min_qty = float(constraints["minOrderQty"])
+        step_str = constraints["qtyStep"]
 
-        current_price = await get_current_price(symbol)
-        min_qty, max_qty, qty_step, min_notional = await get_instrument_constraints(symbol)
+        if manual_qty is not None:
+            qty = round_qty_to_step(manual_qty, step)
+            if qty < min_qty:
+                print(f"[{symbol}] Manual qty {manual_qty} below minimum {min_qty}")
+                return None
+            return format_qty_str(qty, step_str)
 
-        if current_price is None or current_price <= 0:
-            return min_qty
-
-        risk_amount_usd = total_avail_usd * 0.20
-        risk_amount_usd = max(risk_amount_usd, min_notional + 1.0)
-
-        raw_qty = risk_amount_usd / current_price
-
-        if qty_step > 0:
-            adjusted_qty = max(min_qty, (raw_qty // qty_step) * qty_step)
+        # Get current price
+        ws_price = get_ws_price(symbol)
+        if ws_price:
+            price = ws_price
         else:
-            adjusted_qty = max(min_qty, raw_qty)
+            try:
+                ticker = bybit_session.get_tickers(category="linear", symbol=symbol)
+                price = float(ticker["result"]["list"][0]["lastPrice"])
+            except Exception:
+                return None
 
-        if adjusted_qty * current_price < min_notional:
-            adjusted_qty = (min_notional / current_price) + qty_step
-            if qty_step > 0:
-                adjusted_qty = (adjusted_qty // qty_step) * qty_step
-            adjusted_qty = max(min_qty, adjusted_qty)
+        # Get available balance
+        try:
+            balance_resp = bybit_session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
+            coins = balance_resp["result"]["list"][0].get("coin", [])
+            available = 0.0
+            for c in coins:
+                if c["coin"] == "USDT":
+                    available = float(c.get("availableToWithdraw", 0))
+                    break
+        except Exception:
+            return None
 
-        return adjusted_qty
-    except Exception as exc:
-        print(f"Failed to calculate qty for {symbol}: {exc}")
-        min_qty, _, _, _ = await get_instrument_constraints(symbol)
-        return min_qty
+        notional = available * 0.95
+        qty = notional / price
+        qty = round_qty_to_step(qty, step)
 
-async def close_position(symbol: str, side_to_close: str = "Buy") -> Optional[float]:
-    """
-    Closes the position and returns the total closed quantity.
-    Also clears risk management state for the symbol.
-    """
+        if qty < min_qty:
+            print(f"[{symbol}] Calculated qty {qty} below minimum {min_qty}")
+            return None
+
+        return format_qty_str(qty, step_str)
+
+    except Exception as e:
+        print(f"Error calculating qty for {symbol}: {e}")
+        return None
+
+async def close_position(symbol: str, side: str, bot=None) -> bool:
+    """Close an open position entirely via market order."""
     try:
-        positions_resp = await asyncio.to_thread(
-            bybit_session.get_positions,
-            category="linear",
-            symbol=symbol
-        )
-        positions = positions_resp["result"]["list"]
-
+        close_side = "Sell" if side == "Buy" else "Buy"
+        resp = bybit_session.get_positions(category="linear", symbol=symbol, settleCoin="USDT")
+        positions = resp.get("result", {}).get("list", [])
+        qty_str = None
         for pos in positions:
-            if pos["side"] == side_to_close and float(pos["size"]) > 0:
-                close_side = "Sell" if side_to_close == "Buy" else "Buy"
-                total_qty = float(pos["size"])
+            if pos.get("side") == side and float(pos.get("size", 0)) > 0:
+                qty_str = pos["size"]
+                break
 
-                min_qty, max_qty, qty_step, _ = await get_instrument_constraints(symbol)
+        if not qty_str:
+            print(f"[{symbol}] No open {side} position to close")
+            return False
 
-                remaining_qty = total_qty
+        result = bybit_session.place_order(
+            category="linear",
+            symbol=symbol,
+            side=close_side,
+            orderType="Market",
+            qty=qty_str,
+            reduceOnly=True,
+        )
+        if result.get("retCode") == 0:
+            print(f"[{symbol}] Closed {side} position ({qty_str})")
+            return True
+        else:
+            print(f"[{symbol}] Failed to close position: {result}")
+            return False
+    except Exception as e:
+        print(f"[{symbol}] Error closing position: {e}")
+        return False
 
-                while remaining_qty > 0:
-                    current_batch_qty = min(remaining_qty, max_qty)
-                    current_batch_qty = round_qty_to_step(current_batch_qty, qty_step, min_qty)
-
-                    qty_str = format_qty_str(current_batch_qty, qty_step)
-
-                    order = await asyncio.to_thread(
-                        bybit_session.place_order,
-                        category="linear",
-                        symbol=symbol,
-                        side=close_side,
-                        orderType="Market",
-                        qty=qty_str,
-                        reduceOnly=True,
-                    )
-
-                    if order.get("retCode") != 0:
-                        print(f"Close order batch failed for {symbol}: {order.get('retMsg')}")
-                        return None
-
-                    remaining_qty -= current_batch_qty
-
-                    if remaining_qty > 0:
-                        await asyncio.sleep(0.5)
-
-                # Clear risk management state on close
-                _clear_risk_state(symbol)
-
-                return total_qty
-        return None
-    except Exception as exc:
-        print(f"Position close failed for {symbol}: {exc}")
-        return None
-
-
-async def close_partial_position(symbol: str, side_to_close: str = "Buy", close_pct: float = 0.50) -> Optional[float]:
-    """
-    Closes a percentage of the position (e.g., 50%) and returns the closed quantity.
-    Does NOT clear risk management state — the remaining position stays open.
-    """
+async def close_partial_position(symbol: str, side: str, fraction: float, bot=None) -> bool:
+    """Close a fraction of an open position via market order."""
     try:
-        positions_resp = await asyncio.to_thread(
-            bybit_session.get_positions,
-            category="linear",
-            symbol=symbol
-        )
-        positions = positions_resp["result"]["list"]
-
+        close_side = "Sell" if side == "Buy" else "Buy"
+        resp = bybit_session.get_positions(category="linear", symbol=symbol, settleCoin="USDT")
+        positions = resp.get("result", {}).get("list", [])
+        total_size = 0.0
         for pos in positions:
-            if pos["side"] == side_to_close and float(pos["size"]) > 0:
-                close_side = "Sell" if side_to_close == "Buy" else "Buy"
-                total_qty = float(pos["size"])
+            if pos.get("side") == side and float(pos.get("size", 0)) > 0:
+                total_size = float(pos["size"])
+                break
 
-                min_qty, max_qty, qty_step, _ = await get_instrument_constraints(symbol)
+        if total_size <= 0:
+            return False
 
-                # Calculate the partial quantity to close
-                partial_qty = total_qty * close_pct
-                partial_qty = round_qty_to_step(partial_qty, qty_step, min_qty)
+        constraints = get_instrument_constraints(symbol)
+        step = float(constraints.get("qtyStep", "0.001"))
+        step_str = constraints.get("qtyStep", "0.001")
+        min_qty = float(constraints.get("minOrderQty", "0.001"))
 
-                # If partial_qty equals total position (e.g., position too small to split), close all
-                if partial_qty >= total_qty:
-                    partial_qty = total_qty
+        close_qty = round_qty_to_step(total_size * fraction, step)
+        if close_qty < min_qty:
+            close_qty = min_qty
+        if close_qty > total_size:
+            close_qty = total_size
 
-                remaining_to_close = partial_qty
+        qty_str = format_qty_str(close_qty, step_str)
 
-                while remaining_to_close > 0:
-                    current_batch_qty = min(remaining_to_close, max_qty)
-                    current_batch_qty = round_qty_to_step(current_batch_qty, qty_step, min_qty)
-
-                    qty_str = format_qty_str(current_batch_qty, qty_step)
-
-                    order = await asyncio.to_thread(
-                        bybit_session.place_order,
-                        category="linear",
-                        symbol=symbol,
-                        side=close_side,
-                        orderType="Market",
-                        qty=qty_str,
-                        reduceOnly=True,
-                    )
-
-                    if order.get("retCode") != 0:
-                        print(f"Partial close batch failed for {symbol}: {order.get('retMsg')}")
-                        return None
-
-                    remaining_to_close -= current_batch_qty
-
-                    if remaining_to_close > 0:
-                        await asyncio.sleep(0.5)
-
-                print(f"[INFO] {symbol}: Partially closed {partial_qty} of {total_qty} ({close_pct*100:.0f}%)")
-                return partial_qty
-        return None
-    except Exception as exc:
-        print(f"Partial position close failed for {symbol}: {exc}")
-        return None
+        result = bybit_session.place_order(
+            category="linear",
+            symbol=symbol,
+            side=close_side,
+            orderType="Market",
+            qty=qty_str,
+            reduceOnly=True,
+        )
+        if result.get("retCode") == 0:
+            print(f"[{symbol}] Partial close {side}: {qty_str} ({fraction*100:.0f}%)")
+            return True
+        else:
+            print(f"[{symbol}] Failed partial close: {result}")
+            return False
+    except Exception as e:
+        print(f"[{symbol}] Error partial close: {e}")
+        return False
 
 
-def _clear_risk_state(symbol: str) -> None:
-    """Clear per-symbol risk management tracking after closing a position."""
+# ────────────────────────────────────────────────
+#  Risk State Management
+# ────────────────────────────────────────────────
+
+def _clear_risk_state(symbol: str):
+    """Clear all per-symbol risk/trade tracking state."""
     symbol_entry_price[symbol] = None
     symbol_entry_atr[symbol] = None
     symbol_peak_price[symbol] = None
-    symbol_trailing_active[symbol] = False
-    symbol_partial_taken[symbol] = False
+    symbol_lowest_since_entry[symbol] = None
+    symbol_highest_since_entry[symbol] = None
+    symbol_trailing_sl[symbol] = None
+    symbol_sl_price[symbol] = None
     symbol_server_sl_set[symbol] = False
-    symbol_server_ts_set[symbol] = False
-    symbol_trail_order_id[symbol] = None
-    symbol_trail_qty[symbol] = None
-    symbol_trail_price[symbol] = None
-    # Stage 2 trailing
-    symbol_stage2_active[symbol] = False
-    symbol_stage2_taken[symbol] = False
-    symbol_trail2_order_id[symbol] = None
-    symbol_trail2_qty[symbol] = None
-    symbol_trail2_price[symbol] = None
-    symbol_peak_stage2[symbol] = None
-    # Tiered stop-loss
-    symbol_sl1_order_id[symbol] = None
-    symbol_sl1_qty[symbol] = None
-    symbol_sl1_taken[symbol] = False
+    symbol_tp0_hit[symbol] = False
+    symbol_tp1_hit[symbol] = False
+    symbol_tp2_hit[symbol] = False
+    symbol_tp3_hit[symbol] = False
+    symbol_position_size_pct[symbol] = 1.0
     symbol_original_qty[symbol] = None
-    # MACD partial exit
-    symbol_macd_partial_closed[symbol] = False
-    symbol_macd_partial_qty[symbol] = None
-    symbol_macd_last_action_candle[symbol] = None
-    save_state()
+    symbol_bars_in_trade[symbol] = 0
+    symbol_last_candle_ts[symbol] = None
 
-
-def _set_entry_risk_state(symbol: str, entry_price: float, atr: float) -> None:
-    """Set per-symbol risk management tracking after opening a position."""
+def _set_entry_risk_state(symbol: str, entry_price: float, atr: float, side: str, qty: float, params: dict):
+    """Initialize risk state when entering a new trade."""
     symbol_entry_price[symbol] = entry_price
     symbol_entry_atr[symbol] = atr
     symbol_peak_price[symbol] = entry_price
-    symbol_trailing_active[symbol] = False
-    symbol_partial_taken[symbol] = False
-    symbol_server_sl_set[symbol] = False
-    symbol_server_ts_set[symbol] = False
-    symbol_trail_order_id[symbol] = None
-    symbol_trail_qty[symbol] = None
-    symbol_trail_price[symbol] = None
-    # Stage 2 trailing
-    symbol_stage2_active[symbol] = False
-    symbol_stage2_taken[symbol] = False
-    symbol_trail2_order_id[symbol] = None
-    symbol_trail2_qty[symbol] = None
-    symbol_trail2_price[symbol] = None
-    symbol_peak_stage2[symbol] = None
-    # Tiered stop-loss
-    symbol_sl1_order_id[symbol] = None
-    symbol_sl1_qty[symbol] = None
-    symbol_sl1_taken[symbol] = False
-    symbol_original_qty[symbol] = None
-    # MACD partial exit
-    symbol_macd_partial_closed[symbol] = False
-    symbol_macd_partial_qty[symbol] = None
-    symbol_macd_last_action_candle[symbol] = None
-    save_state()
+    symbol_lowest_since_entry[symbol] = entry_price
+    symbol_highest_since_entry[symbol] = entry_price
+    symbol_original_qty[symbol] = qty
+    symbol_position_size_pct[symbol] = 1.0
+    symbol_bars_in_trade[symbol] = 0
+    symbol_tp0_hit[symbol] = False
+    symbol_tp1_hit[symbol] = False
+    symbol_tp2_hit[symbol] = False
+    symbol_tp3_hit[symbol] = False
 
+    # Compute initial SL
+    sl_dist = atr * params["sl_atr"]
+    if side == "Buy":
+        raw_sl = entry_price - sl_dist
+        # Structural SL: use swing low if available
+        swing_low = symbol_lowest_since_entry.get(symbol, entry_price)
+        if swing_low and swing_low < entry_price:
+            structural_sl = swing_low - atr * 0.3
+            raw_sl = max(raw_sl, structural_sl)
+        # Max loss cap
+        max_loss_pct = params["max_loss"] / 100
+        floor_sl = entry_price * (1 - max_loss_pct)
+        sl_price = max(raw_sl, floor_sl)
+    else:
+        raw_sl = entry_price + sl_dist
+        swing_high = symbol_highest_since_entry.get(symbol, entry_price)
+        if swing_high and swing_high > entry_price:
+            structural_sl = swing_high + atr * 0.3
+            raw_sl = min(raw_sl, structural_sl)
+        max_loss_pct = params["max_loss"] / 100
+        ceil_sl = entry_price * (1 + max_loss_pct)
+        sl_price = min(raw_sl, ceil_sl)
 
-# ────────────────────────────────────────────────
-#  Server-Side Stop-Loss & Trailing Stop (Bybit)
-# ────────────────────────────────────────────────
+    symbol_sl_price[symbol] = sl_price
+    symbol_trailing_sl[symbol] = sl_price
 
-async def set_server_stop_loss(symbol: str, side: str, stop_price: float) -> bool:
-    """
-    Set a server-side stop-loss on Bybit for the full position.
-    Bybit's engine will execute this instantly when price hits the stop level.
-    """
+def set_server_stop_loss(symbol: str, side: str, sl_price: float) -> bool:
+    """Place a server-side stop-loss order on Bybit."""
     try:
-        resp = await asyncio.to_thread(
-            bybit_session.set_trading_stop,
+        resp = bybit_session.get_positions(category="linear", symbol=symbol, settleCoin="USDT")
+        positions = resp.get("result", {}).get("list", [])
+        qty_str = None
+        for pos in positions:
+            if pos.get("side") == side and float(pos.get("size", 0)) > 0:
+                qty_str = pos["size"]
+                break
+        if not qty_str:
+            return False
+
+        constraints = get_instrument_constraints(symbol)
+        tick_size = float(constraints.get("tickSize", "0.01"))
+        # Round SL to tick
+        sl_rounded = round(sl_price / tick_size) * tick_size
+        tick_decimals = len(constraints.get("tickSize", "0.01").rstrip('0').split('.')[-1]) if '.' in constraints.get("tickSize", "0.01") else 0
+        sl_str = f"{sl_rounded:.{tick_decimals}f}"
+
+        trigger_direction = 2 if side == "Buy" else 1  # 2=fall below, 1=rise above
+        close_side = "Sell" if side == "Buy" else "Buy"
+
+        result = bybit_session.place_order(
             category="linear",
             symbol=symbol,
-            stopLoss=str(stop_price),
-            slTriggerBy="LastPrice",
-            tpslMode="Full",
-            positionIdx=0,
+            side=close_side,
+            orderType="Market",
+            qty=qty_str,
+            reduceOnly=True,
+            triggerPrice=sl_str,
+            triggerDirection=trigger_direction,
+            orderFilter="StopOrder",
         )
-        if resp.get("retCode") == 0:
+        if result.get("retCode") == 0:
             symbol_server_sl_set[symbol] = True
-            print(f"[SERVER-SL] {symbol}: Stop-loss set at {stop_price:.6g} (Full position)")
+            print(f"[{symbol}] Server SL set at {sl_str}")
             return True
         else:
-            print(f"[SERVER-SL] {symbol}: Failed to set SL - {resp.get('retMsg')}")
+            print(f"[{symbol}] Failed to set server SL: {result}")
             return False
     except Exception as e:
-        print(f"[SERVER-SL] {symbol}: Error setting stop-loss: {e}")
+        print(f"[{symbol}] Error setting server SL: {e}")
         return False
 
-
-async def get_position_size(symbol: str) -> Optional[float]:
-    """Get current position size (qty) for a symbol. Returns None if no position."""
+def get_position_size(symbol: str) -> Optional[float]:
+    """Get current position size from Bybit."""
     try:
-        resp = await asyncio.to_thread(
-            bybit_session.get_positions,
-            category="linear",
-            symbol=symbol,
-        )
-        positions = resp.get("result", {}).get("list", [])
-        for pos in positions:
+        resp = bybit_session.get_positions(category="linear", symbol=symbol, settleCoin="USDT")
+        for pos in resp.get("result", {}).get("list", []):
             size = float(pos.get("size", 0))
             if size > 0:
                 return size
-        return None
+        return 0.0
     except Exception as e:
-        print(f"Error fetching position size for {symbol}: {e}")
+        print(f"[{symbol}] Error getting position size: {e}")
         return None
 
-
-async def get_position_entry_price(symbol: str) -> Optional[float]:
-    """Get the actual average entry price of the current position from Bybit.
-    This is the real fill price, not the candle close price at signal time."""
+def get_position_entry_price(symbol: str) -> Optional[float]:
+    """Get the entry price of the current position from Bybit."""
     try:
-        resp = await asyncio.to_thread(
-            bybit_session.get_positions,
-            category="linear",
-            symbol=symbol,
-        )
-        positions = resp.get("result", {}).get("list", [])
-        for pos in positions:
+        resp = bybit_session.get_positions(category="linear", symbol=symbol, settleCoin="USDT")
+        for pos in resp.get("result", {}).get("list", []):
             size = float(pos.get("size", 0))
             if size > 0:
-                avg_price = float(pos.get("avgPrice", 0))
-                if avg_price > 0:
-                    print(f"[INFO] {symbol}: Bybit avgPrice = {avg_price}")
-                    return avg_price
+                return float(pos.get("avgPrice", 0))
         return None
     except Exception as e:
-        print(f"Error fetching position entry price for {symbol}: {e}")
+        print(f"[{symbol}] Error getting entry price: {e}")
         return None
 
-
-async def place_trail_stop_order(symbol: str, side: str, qty: float, trigger_price: float) -> Optional[str]:
-    """
-    Place a conditional stop-market order for partial trailing close (60%).
-    Returns the order ID if successful, None otherwise.
-    - For Long positions: triggers when price FALLS BELOW trigger_price
-    - For Short positions: triggers when price RISES ABOVE trigger_price
-    """
-    close_side = "Sell" if side == "Buy" else "Buy"
-    # triggerDirection: 1 = trigger when price rises above, 2 = trigger when price falls below
-    trigger_dir = 2 if side == "Buy" else 1
-
+def cancel_all_symbol_orders(symbol: str):
+    """Cancel all open orders (conditional + active) for a symbol."""
     try:
-        # Round qty to instrument step size
-        min_qty, max_qty, qty_step, _ = await get_instrument_constraints(symbol)
-        rounded_qty = round_qty_to_step(qty, qty_step, min_qty)
-        qty_str = format_qty_str(rounded_qty, qty_step)
+        bybit_session.cancel_all_orders(category="linear", symbol=symbol)
+        print(f"[{symbol}] Cancelled all open orders")
+    except Exception as e:
+        print(f"[{symbol}] Error cancelling orders: {e}")
 
-        resp = await asyncio.to_thread(
-            bybit_session.place_order,
+
+async def place_trade(symbol: str, side: str, bot=None, manual_qty: Optional[float] = None) -> bool:
+    """Place a new trade (market order) and set initial risk state."""
+    try:
+        qty_str = get_trade_qty(symbol, side, manual_qty=manual_qty)
+        if not qty_str:
+            print(f"[{symbol}] Could not calculate qty for {side}")
+            return False
+
+        result = bybit_session.place_order(
             category="linear",
             symbol=symbol,
-            side=close_side,
+            side=side,
             orderType="Market",
             qty=qty_str,
-            triggerPrice=str(trigger_price),
-            triggerDirection=trigger_dir,
-            triggerBy="LastPrice",
-            reduceOnly=True,
         )
-        if resp.get("retCode") == 0:
-            order_id = resp.get("result", {}).get("orderId")
-            symbol_trail_order_id[symbol] = order_id
-            symbol_trail_qty[symbol] = rounded_qty
-            symbol_trail_price[symbol] = trigger_price
-            symbol_server_ts_set[symbol] = True
-            print(f"[TRAIL-ORDER] {symbol}: Conditional stop placed for {rounded_qty} @ {trigger_price:.6g} (order: {order_id})")
-            return order_id
-        else:
-            print(f"[TRAIL-ORDER] {symbol}: Failed to place - {resp.get('retMsg')}")
-            return None
-    except Exception as e:
-        print(f"[TRAIL-ORDER] {symbol}: Error placing trail order: {e}")
-        return None
-
-
-async def amend_trail_stop_price(symbol: str, new_trigger_price: float) -> bool:
-    """Update the trigger price of the trailing stop conditional order."""
-    order_id = symbol_trail_order_id.get(symbol)
-    if not order_id:
-        print(f"[TRAIL-ORDER] {symbol}: No trail order to amend")
-        return False
-    try:
-        resp = await asyncio.to_thread(
-            bybit_session.amend_order,
-            category="linear",
-            symbol=symbol,
-            orderId=order_id,
-            triggerPrice=str(new_trigger_price),
-        )
-        if resp.get("retCode") == 0:
-            symbol_trail_price[symbol] = new_trigger_price
-            print(f"[TRAIL-ORDER] {symbol}: Trail price updated to {new_trigger_price:.6g}")
+        if result.get("retCode") == 0:
+            print(f"[{symbol}] Placed {side} market order: {qty_str}")
             return True
         else:
-            print(f"[TRAIL-ORDER] {symbol}: Amend failed - {resp.get('retMsg')}")
+            print(f"[{symbol}] Order failed: {result}")
             return False
     except Exception as e:
-        print(f"[TRAIL-ORDER] {symbol}: Error amending: {e}")
+        print(f"[{symbol}] Error placing trade: {e}")
         return False
 
 
-async def cancel_trail_stop_order(symbol: str) -> bool:
-    """Cancel the active trailing stop conditional order."""
-    order_id = symbol_trail_order_id.get(symbol)
-    if not order_id:
-        return True  # Nothing to cancel
-    try:
-        resp = await asyncio.to_thread(
-            bybit_session.cancel_order,
-            category="linear",
-            symbol=symbol,
-            orderId=order_id,
-        )
-        if resp.get("retCode") == 0:
-            print(f"[TRAIL-ORDER] {symbol}: Trail stop order cancelled (order: {order_id})")
+def compute_entry_signals(ind: dict, htf: dict, params: dict) -> Tuple[int, int, str]:
+    """
+    Compute entry signal counts for long and short based on v29 strategy.
+    Returns (long_signals, short_signals, best_strategy_label).
+    """
+    trend_score = ind["trend_score"]
+    adx = ind["adx"]
+    rsi = ind["rsi"]
+    macd_hist = ind["macd_hist"]
+    macd_hist_prev = ind["macd_hist_prev"]
+    stoch_k = ind["stoch_rsi_k"]
+    stoch_d = ind["stoch_rsi_d"]
+    vol_ratio = ind["vol_ratio"]
+    roc = ind["roc"]
+    ema_fast_slope = ind["ema_fast_slope"] or 0.0
+    vwap = ind["vwap"]
+    price = ind["current_price"]
+    bb_upper = ind["bb_upper"]
+    bb_lower = ind["bb_lower"]
+    bb_width = ind["bb_width"]
+    bb_width_min = ind["bb_width_min"]
+    ema_fast = ind["ema_fast"]
+    ema_mid = ind["ema_mid"]
+    prev_ema_fast = ind["prev_ema_fast"]
+    prev_ema_mid = ind["prev_ema_mid"]
+
+    htf_1h = htf.get("htf_1h_trend", 0)
+    htf_4h = htf.get("htf_4h_trend", 0)
+
+    adx_entry = params["adx_entry"]
+    rsi_ob = params["rsi_ob"]
+    rsi_os = params["rsi_os"]
+    bb_squeeze = params["bb_squeeze"]
+    rsi_mr_high = params["rsi_mr_high"]
+    rsi_mr_low = params["rsi_mr_low"]
+
+    long_signals = 0
+    short_signals = 0
+    strategy_a_long = 0
+    strategy_a_short = 0
+    best_strategy = ""
+
+    # ────────────────────────────
+    # Strategy A: Trend Following (multi-signal scoring)
+    # ────────────────────────────
+    if adx is not None and adx >= adx_entry:
+        # Signal 1: Trend score
+        if trend_score >= 3: strategy_a_long += 1
+        if trend_score <= -3: strategy_a_short += 1
+
+        # Signal 2: HTF 1H trend
+        if htf_1h >= 1: strategy_a_long += 1
+        if htf_1h <= -1: strategy_a_short += 1
+
+        # Signal 3: HTF 4H trend
+        if htf_4h >= 1: strategy_a_long += 1
+        if htf_4h <= -1: strategy_a_short += 1
+
+        # Signal 4: MACD histogram rising
+        if macd_hist > 0 and macd_hist > macd_hist_prev: strategy_a_long += 1
+        if macd_hist < 0 and macd_hist < macd_hist_prev: strategy_a_short += 1
+
+        # Signal 5: RSI confirming
+        if 40 < rsi < rsi_ob: strategy_a_long += 1
+        if rsi_os < rsi < 60: strategy_a_short += 1
+
+        # Signal 6: VWAP
+        if vwap and price > vwap: strategy_a_long += 1
+        if vwap and price < vwap: strategy_a_short += 1
+
+        # Signal 7: ROC
+        if roc > 0: strategy_a_long += 1
+        if roc < 0: strategy_a_short += 1
+
+        # Signal 8: EMA slope
+        if ema_fast_slope > 0.05: strategy_a_long += 1
+        if ema_fast_slope < -0.05: strategy_a_short += 1
+
+        # Signal 9: Stoch RSI
+        if stoch_k > stoch_d and stoch_k < 80: strategy_a_long += 1
+        if stoch_k < stoch_d and stoch_k > 20: strategy_a_short += 1
+
+        # Signal 10: Volume confirmation
+        if vol_ratio > 1.2: 
+            strategy_a_long += 1
+            strategy_a_short += 1
+
+        # ADX-adaptive thresholds
+        adx_strong = params.get("adx_strong", 28)
+        adx_vstrong = params.get("adx_vstrong", 42)
+        sig_threshold = params["sig_threshold"]
+        sig_strong = params["sig_strong"]
+        sig_vstrong = params["sig_vstrong"]
+
+        if adx >= adx_vstrong:
+            threshold = sig_vstrong
+        elif adx >= adx_strong:
+            threshold = sig_strong
         else:
-            print(f"[TRAIL-ORDER] {symbol}: Cancel failed - {resp.get('retMsg')} (may already be filled)")
-        symbol_trail_order_id[symbol] = None
-        symbol_trail_qty[symbol] = None
-        symbol_trail_price[symbol] = None
-        symbol_server_ts_set[symbol] = False
-        return True
-    except Exception as e:
-        print(f"[TRAIL-ORDER] {symbol}: Error cancelling: {e}")
-        return False
+            threshold = sig_threshold
+
+        if strategy_a_long >= threshold:
+            long_signals = max(long_signals, strategy_a_long)
+            best_strategy = "A:Trend"
+        if strategy_a_short >= threshold:
+            short_signals = max(short_signals, strategy_a_short)
+            best_strategy = "A:Trend"
+
+    # ────────────────────────────
+    # Strategy B: BB Squeeze Breakout
+    # ────────────────────────────
+    if bb_width is not None and bb_width_min is not None and bb_width_min < bb_squeeze:
+        b_long = 0
+        b_short = 0
+        if bb_upper and price > bb_upper and rsi > 50 and trend_score >= 1:
+            b_long = 5
+        if bb_lower and price < bb_lower and rsi < 50 and trend_score <= -1:
+            b_short = 5
+        if b_long > long_signals:
+            long_signals = b_long
+            best_strategy = "B:BBSqueeze"
+        if b_short > short_signals:
+            short_signals = b_short
+            best_strategy = "B:BBSqueeze"
+
+    # ────────────────────────────
+    # Strategy C: Mean Reversion
+    # ────────────────────────────
+    if adx is not None and adx < adx_entry:
+        c_long = 0
+        c_short = 0
+        if bb_lower and price < bb_lower and rsi < rsi_mr_low and stoch_k < 20:
+            c_long = 5
+        if bb_upper and price > bb_upper and rsi > rsi_mr_high and stoch_k > 80:
+            c_short = 5
+        if c_long > long_signals:
+            long_signals = c_long
+            best_strategy = "C:MeanRev"
+        if c_short > short_signals:
+            short_signals = c_short
+            best_strategy = "C:MeanRev"
+
+    # ────────────────────────────
+    # Strategy D: EMA Crossover + Volume Surge
+    # ────────────────────────────
+    if prev_ema_fast is not None and prev_ema_mid is not None and ema_fast is not None and ema_mid is not None:
+        d_long = 0
+        d_short = 0
+        cross_up = prev_ema_fast <= prev_ema_mid and ema_fast > ema_mid
+        cross_down = prev_ema_fast >= prev_ema_mid and ema_fast < ema_mid
+        if cross_up and vol_ratio > 1.5 and rsi > 45 and trend_score >= 0:
+            d_long = 5
+        if cross_down and vol_ratio > 1.5 and rsi < 55 and trend_score <= 0:
+            d_short = 5
+        if d_long > long_signals:
+            long_signals = d_long
+            best_strategy = "D:EMACross"
+        if d_short > short_signals:
+            short_signals = d_short
+            best_strategy = "D:EMACross"
+
+    return long_signals, short_signals, best_strategy
 
 
-async def place_conditional_close_order(symbol: str, side: str, qty: float, trigger_price: float) -> Optional[str]:
+def compute_exit_signals(ind: dict, htf: dict, side: str) -> int:
     """
-    Place a server-side conditional stop-market order to close a portion of position.
-    Generic function used for SL tiers and stage 2 trailing.
-    Returns order_id if successful, None otherwise.
+    Count bearish (for longs) or bullish (for shorts) exit signals.
+    Returns signal count (exit when >= 3).
     """
-    close_side = "Sell" if side == "Buy" else "Buy"
-    trigger_dir = 2 if side == "Buy" else 1  # 2=falls below, 1=rises above
+    trend_score = ind["trend_score"]
+    rsi = ind["rsi"]
+    macd_hist = ind["macd_hist"]
+    macd_hist_prev = ind["macd_hist_prev"]
+    stoch_k = ind["stoch_rsi_k"]
+    ema_fast = ind["ema_fast"]
+    ema_mid = ind["ema_mid"]
+    price = ind["current_price"]
 
-    try:
-        min_qty, max_qty, qty_step, _ = await get_instrument_constraints(symbol)
-        rounded_qty = round_qty_to_step(qty, qty_step, min_qty)
-        qty_str = format_qty_str(rounded_qty, qty_step)
+    htf_1h = htf.get("htf_1h_trend", 0)
 
-        resp = await asyncio.to_thread(
-            bybit_session.place_order,
-            category="linear",
-            symbol=symbol,
-            side=close_side,
-            orderType="Market",
-            qty=qty_str,
-            triggerPrice=str(trigger_price),
-            triggerDirection=trigger_dir,
-            triggerBy="LastPrice",
-            reduceOnly=True,
-        )
-        if resp.get("retCode") == 0:
-            order_id = resp.get("result", {}).get("orderId")
-            print(f"[CONDITIONAL] {symbol}: Stop order placed for {rounded_qty} @ {trigger_price:.6g} (order: {order_id})")
-            return order_id
-        else:
-            print(f"[CONDITIONAL] {symbol}: Failed to place - {resp.get('retMsg')}")
-            return None
-    except Exception as e:
-        print(f"[CONDITIONAL] {symbol}: Error placing order: {e}")
-        return None
-
-
-async def amend_conditional_order(symbol: str, order_id: str, new_trigger_price: float) -> bool:
-    """Amend trigger price of any conditional order by ID."""
-    try:
-        resp = await asyncio.to_thread(
-            bybit_session.amend_order,
-            category="linear",
-            symbol=symbol,
-            orderId=order_id,
-            triggerPrice=str(new_trigger_price),
-        )
-        if resp.get("retCode") == 0:
-            print(f"[CONDITIONAL] {symbol}: Order {order_id} amended to {new_trigger_price:.6g}")
-            return True
-        else:
-            print(f"[CONDITIONAL] {symbol}: Amend failed - {resp.get('retMsg')}")
-            return False
-    except Exception as e:
-        print(f"[CONDITIONAL] {symbol}: Error amending: {e}")
-        return False
-
-
-async def cancel_conditional_order_by_id(symbol: str, order_id: str) -> bool:
-    """Cancel a specific conditional order by ID."""
-    try:
-        resp = await asyncio.to_thread(
-            bybit_session.cancel_order,
-            category="linear",
-            symbol=symbol,
-            orderId=order_id,
-        )
-        if resp.get("retCode") == 0:
-            print(f"[CONDITIONAL] {symbol}: Order {order_id} cancelled")
-            return True
-        else:
-            print(f"[CONDITIONAL] {symbol}: Cancel failed - {resp.get('retMsg')} (may already be filled)")
-            return False
-    except Exception as e:
-        print(f"[CONDITIONAL] {symbol}: Error cancelling order: {e}")
-        return False
-
-
-async def cancel_stage2_trail_order(symbol: str) -> bool:
-    """Cancel the stage 2 trailing stop conditional order."""
-    order_id = symbol_trail2_order_id.get(symbol)
-    if not order_id:
-        return True
-    await cancel_conditional_order_by_id(symbol, order_id)
-    symbol_trail2_order_id[symbol] = None
-    symbol_trail2_qty[symbol] = None
-    symbol_trail2_price[symbol] = None
-    symbol_stage2_active[symbol] = False
-    return True
-
-
-async def cancel_sl1_order(symbol: str) -> bool:
-    """Cancel the SL stage 1 (50% at 0.5x ATR) conditional order."""
-    order_id = symbol_sl1_order_id.get(symbol)
-    if not order_id:
-        return True
-    await cancel_conditional_order_by_id(symbol, order_id)
-    symbol_sl1_order_id[symbol] = None
-    symbol_sl1_qty[symbol] = None
-    return True
-
-
-async def cancel_server_stops(symbol: str) -> bool:
-    """
-    Cancel all server-side TP/SL/trailing stops + any conditional trail/SL orders.
-    """
-    # Cancel conditional orders first
-    await cancel_trail_stop_order(symbol)
-    await cancel_stage2_trail_order(symbol)
-    await cancel_sl1_order(symbol)
-    try:
-        resp = await asyncio.to_thread(
-            bybit_session.set_trading_stop,
-            category="linear",
-            symbol=symbol,
-            stopLoss="0",
-            trailingStop="0",
-            tpslMode="Full",
-            positionIdx=0,
-        )
-        if resp.get("retCode") == 0:
-            symbol_server_sl_set[symbol] = False
-            symbol_server_ts_set[symbol] = False
-            print(f"[SERVER] {symbol}: All server-side stops cancelled")
-            return True
-        else:
-            print(f"[SERVER] {symbol}: Failed to cancel stops - {resp.get('retMsg')}")
-            return False
-    except Exception as e:
-        print(f"[SERVER] {symbol}: Error cancelling stops: {e}")
-        return False
-
-
-async def place_trade(symbol: str, side: str = "Buy", manual_qty_override: Optional[float] = None) -> Optional[dict]:
-    """
-    Places a trade, optionally using a specific manual quantity override for reversals.
-    """
-    if manual_qty_override:
-        total_qty = manual_qty_override
+    count = 0
+    if side == "Buy":
+        # Bearish signals for long exit
+        if trend_score <= -2: count += 1
+        if rsi > 75: count += 1
+        if macd_hist < 0 and macd_hist < macd_hist_prev: count += 1
+        if stoch_k > 80 and stoch_k < (ind["stoch_rsi_d"] or 50): count += 1
+        if ema_fast and ema_mid and ema_fast < ema_mid: count += 1
+        if htf_1h <= -1: count += 1
+        if ema_fast and price < ema_fast: count += 1
     else:
-        total_qty = await get_trade_qty(symbol)
+        # Bullish signals for short exit
+        if trend_score >= 2: count += 1
+        if rsi < 25: count += 1
+        if macd_hist > 0 and macd_hist > macd_hist_prev: count += 1
+        if stoch_k < 20 and stoch_k > (ind["stoch_rsi_d"] or 50): count += 1
+        if ema_fast and ema_mid and ema_fast > ema_mid: count += 1
+        if htf_1h >= 1: count += 1
+        if ema_fast and price > ema_fast: count += 1
 
-    try:
-        min_qty, max_qty, qty_step, _ = await get_instrument_constraints(symbol)
-
-        total_qty = round_qty_to_step(total_qty, qty_step, min_qty)
-
-        remaining_qty = total_qty
-        successful_orders = []
-
-        print(f"[DEBUG] {symbol} place_trade -> total_qty={total_qty}, max_qty={max_qty}, qty_step={qty_step}")
-
-        while remaining_qty > 0:
-            current_batch_qty = min(remaining_qty, max_qty)
-            current_batch_qty = round_qty_to_step(current_batch_qty, qty_step, min_qty)
-
-            qty_str = format_qty_str(current_batch_qty, qty_step)
-
-            print(f"[DEBUG] {symbol} batch -> qty_str={qty_str}, remaining_after={remaining_qty - current_batch_qty}")
-
-            order = await asyncio.to_thread(
-                bybit_session.place_order,
-                category="linear",
-                symbol=symbol,
-                side=side,
-                orderType="Market",
-                qty=qty_str,
-            )
-
-            if order.get("retCode") != 0:
-                print(f"Trade order batch rejected for {symbol} (qty={qty_str}): {order.get('retMsg')}")
-                return {"error": order.get("retMsg"), "partial": len(successful_orders) > 0}
-
-            successful_orders.append(order.get("result"))
-            remaining_qty -= current_batch_qty
-
-            if remaining_qty > 0:
-                await asyncio.sleep(0.5)
-
-        return successful_orders[-1] if successful_orders else {"error": "No orders placed"}
-
-    except Exception as exc:
-        print(f"Trade placement failed for {symbol}: {exc}")
-        return {"error": str(exc)}
+    return count
 
 
-async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
-    symbol = context.job.data["symbol"]
-    previous_trend = symbol_trends.get(symbol, None)
-    current_open_trade_side = await get_open_position_side(symbol)
-    symbol_open_trade_side[symbol] = current_open_trade_side
+# ────────────────────────────────────────────────
+#  Core Trading Loop: monitor_symbol (v29 strategy)
+# ────────────────────────────────────────────────
 
-    indicators = await get_all_indicators(symbol)
-    if indicators is None:
-        print(f"Skipping monitoring for {symbol}: Could not fetch indicators")
-        return
+async def monitor_symbol(symbol: str, bot):
+    """
+    Main trading loop for a symbol. Implements the v29 backtester strategy:
+    - 4 entry strategies (Trend Following, BB Squeeze, Mean Reversion, EMA Crossover)
+    - Signal-based exits (bearish/bullish count >= 3)
+    - ATR-adaptive trailing stops with progressive tightening
+    - 4-level take-profit system (TP0-TP3)
+    - Equity curve management (drawdown-based sizing)
+    - Cooldown system (after losses)
+    """
+    last_status_time = 0
+    STATUS_INTERVAL = 1800  # 30 minutes
 
-    current_price = indicators["current_price"]
-    last_close = indicators["last_close"]       # CLOSED candle price (for decisions)
-    ema_20 = indicators["ema_20"]
-    atr = indicators["atr"]
-    adx = indicators["adx"]
-    adx_prev2 = indicators["adx_prev2"]
-    rsi = indicators["rsi"]
-    macd_line = indicators["macd_line"]
-    signal_line = indicators["signal_line"]
-    macd_histogram = indicators["macd_histogram"]
-    prev_macd_histogram = indicators["prev_macd_histogram"]
-    prev2_macd_histogram = indicators["prev2_macd_histogram"]
-    macd_hist_dying_long = indicators["macd_hist_dying_long"]
-    macd_hist_dying_short = indicators["macd_hist_dying_short"]
-    plus_di = indicators["plus_di"]
-    minus_di = indicators["minus_di"]
-    di_crossed = indicators["di_crossed"]
-    di_cross_type = indicators["di_cross_type"]
-    last_candle_ts = indicators["last_candle_ts"]
+    while symbol in monitored_symbols:
+        try:
+            params = get_symbol_params(symbol)
 
-    # Fetch 10-minute MACD for partial exit/re-entry decisions (closed-candle confirmation)
-    macd_10m_indicators = await get_macd_10min(symbol)
+            # ──────────────────────────────────
+            #  1. Fetch indicators + HTF trends
+            # ──────────────────────────────────
+            ind = await get_all_indicators(symbol, interval="30", limit=200)
+            if ind is None:
+                await asyncio.sleep(POLL_INTERVAL_SECONDS)
+                continue
 
-    # Fetch 45-minute MACD for entry/exit/reversal decisions
-    macd_45m_indicators = await get_macd_45min(symbol)
-    if macd_45m_indicators is None:
-        print(f"Skipping monitoring for {symbol}: Could not fetch 45-min MACD")
-        return
-    macd_line_45m = macd_45m_indicators["macd_line_45m"]
-    signal_line_45m = macd_45m_indicators["signal_line_45m"]
+            htf = await compute_higher_tf(symbol)
 
-    chat_id = context.job.chat_id if context.job else CHAT_ID
+            price = ind["current_price"]
+            atr = ind["atr"]
+            adx = ind["adx"]
+            atr_pct = ind["atr_pct"]
 
-    # Use CLOSED candle price for all market state decisions
-    if last_close > ema_20:
-        current_market_state = "ABOVE 20 EMA (Bullish)"
-    elif last_close < ema_20:
-        current_market_state = "BELOW 20 EMA (Bearish)"
-    else:
-        current_market_state = "AT 20 EMA (Neutral)"
+            if price is None or atr is None or adx is None:
+                await asyncio.sleep(POLL_INTERVAL_SECONDS)
+                continue
 
-    # ──────────────────────────────────────────────
-    # 1. RISK MANAGEMENT: Multi-stage trailing + tiered stop-loss
-    #    STOP-LOSS (price goes against us):
-    #      - Server-side SL at 1x ATR (safety net, closes remaining 50%)
-    #      - Conditional order at 0.5x ATR closes 50% INSTANTLY
-    #      - If price continues to 1x ATR, server SL closes remaining 50%
-    #    TRAILING STOP (price goes in our favor):
-    #      - Stage 1: At 1.5x ATR profit, trail on 60%. Bybit closes INSTANTLY when hit.
-    #      - Stage 2: After 60% closed, trail on 30% (1x ATR distance). Bybit closes INSTANTLY.
-    #      - Stage 3: Remaining 10% has NO trail — exits only on Exit Rules (EMA+MACD).
-    #    Uses current_price (real-time) for all risk checks
-    # ──────────────────────────────────────────────
-    if current_open_trade_side is not None:
-        entry_price = symbol_entry_price.get(symbol)
-        entry_atr = symbol_entry_atr.get(symbol)
+            # Volatility floor check
+            min_atr_pct = params.get("min_atr_pct", 0.3)
+            if atr_pct is not None and atr_pct < min_atr_pct:
+                # Too low volatility, skip this cycle
+                await asyncio.sleep(POLL_INTERVAL_SECONDS)
+                continue
 
-        # If we have a position but no tracked entry (e.g., bot restarted), set defaults
-        if entry_price is None or entry_atr is None:
-            entry_price = current_price
-            entry_atr = atr
-            _set_entry_risk_state(symbol, entry_price, entry_atr)
-            print(f"[INFO] {symbol}: Initialized risk state from current values (entry={entry_price}, atr={entry_atr})")
-            # Set server-side stop-loss for recovered position
-            if current_open_trade_side == "Buy":
-                sl_price = entry_price - (STOP_LOSS_ATR_MULT * entry_atr)
-            else:
-                sl_price = entry_price + (STOP_LOSS_ATR_MULT * entry_atr)
-            await set_server_stop_loss(symbol, current_open_trade_side, sl_price)
+            # Track bar changes (for bars_in_trade counting)
+            candle_ts = ind["last_candle_ts"]
+            prev_candle_ts = symbol_last_candle_ts.get(symbol)
+            new_candle = (candle_ts != prev_candle_ts) and (prev_candle_ts is not None)
+            symbol_last_candle_ts[symbol] = candle_ts
 
-        # Ensure server-side stop-loss is set (retry if not) — skip if trailing is active
-        if not symbol_server_sl_set.get(symbol, False) and not symbol_partial_taken.get(symbol, False) and not symbol_trailing_active.get(symbol, False):
-            if current_open_trade_side == "Buy":
-                sl_price = entry_price - (STOP_LOSS_ATR_MULT * entry_atr)
-            else:
-                sl_price = entry_price + (STOP_LOSS_ATR_MULT * entry_atr)
-            await set_server_stop_loss(symbol, current_open_trade_side, sl_price)
+            # Check current position state
+            current_side = symbol_open_trade_side.get(symbol)
+            actual_side = get_open_position_side(symbol)
 
-        # Ensure SL1 conditional order (50% at 0.5x ATR) is placed — skip if trailing active or SL1 already taken/set
-        if not symbol_sl1_order_id.get(symbol) and not symbol_sl1_taken.get(symbol, False) and not symbol_trailing_active.get(symbol, False) and not symbol_partial_taken.get(symbol, False):
-            pos_qty = await get_position_size(symbol)
-            if pos_qty:
-                sl1_qty = pos_qty * SL_STAGE1_CLOSE_PCT
-                if current_open_trade_side == "Buy":
-                    sl1_price = entry_price - (SL_STAGE1_ATR_MULT * entry_atr)
-                else:
-                    sl1_price = entry_price + (SL_STAGE1_ATR_MULT * entry_atr)
-                sl1_order_id = await place_conditional_close_order(symbol, current_open_trade_side, sl1_qty, sl1_price)
-                if sl1_order_id:
-                    min_qty, _, qty_step, _ = await get_instrument_constraints(symbol)
-                    symbol_sl1_order_id[symbol] = sl1_order_id
-                    symbol_sl1_qty[symbol] = round_qty_to_step(sl1_qty, qty_step, min_qty)
-                    symbol_original_qty[symbol] = pos_qty
-                    print(f"[SL-TIER1] {symbol}: Placed 50% SL order ({symbol_sl1_qty[symbol]}) at {sl1_price:.6g} (0.5x ATR)")
+            # Sync state: if position was closed externally
+            if current_side and not actual_side:
+                print(f"[{symbol}] Position was closed externally, clearing state")
+                _clear_risk_state(symbol)
+                symbol_open_trade_side[symbol] = None
+                symbol_trends[symbol] = None
+                current_side = None
+                save_state()
 
-        # Update peak price tracking using REAL-TIME price (not last_close)
-        peak = symbol_peak_price.get(symbol, entry_price)
-        if current_open_trade_side == "Buy":
-            peak = max(peak, current_price)
-        else:  # Sell
-            peak = min(peak, current_price)
-        symbol_peak_price[symbol] = peak
-
-        # ── TIERED STOP-LOSS: Detect SL1 (50% at 0.5x ATR) fill ──
-        # Only check if SL1 order was placed and not yet confirmed as taken, and trailing not active
-        sl1_taken = symbol_sl1_taken.get(symbol, False)
-        if not sl1_taken and symbol_sl1_order_id.get(symbol) and not symbol_trailing_active.get(symbol, False):
-            current_qty = await get_position_size(symbol)
-            original_qty = symbol_original_qty.get(symbol)
-            sl1_qty_val = symbol_sl1_qty.get(symbol)
-
-            if current_qty is not None and original_qty and sl1_qty_val:
-                # If position reduced by roughly the SL1 amount, SL1 has fired
-                if current_qty <= original_qty - (sl1_qty_val * 0.8):
-                    symbol_sl1_taken[symbol] = True
-                    sl1_taken = True
-                    symbol_sl1_order_id[symbol] = None
-                    symbol_sl1_qty[symbol] = None
+            # Sync state: if position exists but bot doesn't know about it
+            if actual_side and not current_side:
+                print(f"[{symbol}] Found existing {actual_side} position, syncing state")
+                entry_price = get_position_entry_price(symbol)
+                if entry_price:
+                    _set_entry_risk_state(symbol, entry_price, atr, actual_side, 0, params)
+                    symbol_open_trade_side[symbol] = actual_side
+                    symbol_trends[symbol] = "LONG" if actual_side == "Buy" else "SHORT"
+                    current_side = actual_side
                     save_state()
-                    side_label = "Long" if current_open_trade_side == "Buy" else "Short"
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=(
-                            f"\U0001f6d1 SL TIER 1 HIT for {symbol} ({side_label})\n"
-                            f"50% closed at 0.5x ATR loss\n"
-                            f"Entry: {entry_price:.6g} | Current: {current_price:.6g}\n"
-                            f"Remaining 50% protected by server SL at 1x ATR ({STOP_LOSS_ATR_MULT}x ATR)\n"
-                            f"If price recovers, trailing can still activate."
-                        )
-                    )
-            elif current_qty is None:
-                # Position fully gone — both SL tiers may have fired
-                symbol_sl1_taken[symbol] = True
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        f"\U0001f6d1 FULL STOP-LOSS for {symbol}\n"
-                        f"Position fully closed by stop-loss orders. Going FLAT."
-                    )
-                )
-                symbol_trends[symbol] = None
-                symbol_open_trade_side[symbol] = None
-                _clear_risk_state(symbol)
-                return
 
-        # ── CLIENT-SIDE BACKUP: ATR Stop-Loss Checks ──
-        # Server-side orders should fire first, but this is a safety net.
-        # Skip if trailing is active (SL was cancelled, trail order handles risk).
-        if not symbol_trailing_active.get(symbol, False) and not symbol_partial_taken.get(symbol, False):
-            if current_open_trade_side == "Buy":
-                # Check 2x ATR (full remaining close)
-                stop_loss_price_full = entry_price - (STOP_LOSS_ATR_MULT * entry_atr)
-                if current_price <= stop_loss_price_full:
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=(
-                            f"\U0001f6d1 STOP-LOSS HIT for {symbol} (Long) [Backup check]\n"
-                            f"Entry: {entry_price} | Stop: {stop_loss_price_full:.6g}\n"
-                            f"Current Price: {current_price} | ATR: {entry_atr:.6g}\n"
-                            f"Loss at 1x ATR. Closing remaining position.\n"
-                            f"(Server-side SL should have fired first)"
-                        )
-                    )
-                    await cancel_server_stops(symbol)
-                    await close_position(symbol, side_to_close="Buy")
-                    symbol_trends[symbol] = None
-                    symbol_open_trade_side[symbol] = None
-                    return
-
-                # Check 0.5x ATR (50% close) — backup if conditional order missed
-                if not sl1_taken:
-                    stop_loss_price_30 = entry_price - (SL_STAGE1_ATR_MULT * entry_atr)
-                    if current_price <= stop_loss_price_30:
-                        await context.bot.send_message(
-                            chat_id=chat_id,
-                            text=(
-                                f"\U0001f6d1 SL TIER 1 (Backup) for {symbol} (Long)\n"
-                                f"Closing 50% at 0.5x ATR loss\n"
-                                f"Entry: {entry_price} | Current: {current_price}"
-                            )
-                        )
-                        await cancel_sl1_order(symbol)
-                        await close_partial_position(symbol, side_to_close="Buy", close_pct=SL_STAGE1_CLOSE_PCT)
-                        symbol_sl1_taken[symbol] = True
-                        sl1_taken = True
-
-            elif current_open_trade_side == "Sell":
-                # Check 2x ATR (full remaining close)
-                stop_loss_price_full = entry_price + (STOP_LOSS_ATR_MULT * entry_atr)
-                if current_price >= stop_loss_price_full:
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=(
-                            f"\U0001f6d1 STOP-LOSS HIT for {symbol} (Short) [Backup check]\n"
-                            f"Entry: {entry_price} | Stop: {stop_loss_price_full:.6g}\n"
-                            f"Current Price: {current_price} | ATR: {entry_atr:.6g}\n"
-                            f"Loss at 1x ATR. Closing remaining position.\n"
-                            f"(Server-side SL should have fired first)"
-                        )
-                    )
-                    await cancel_server_stops(symbol)
-                    await close_position(symbol, side_to_close="Sell")
-                    symbol_trends[symbol] = None
-                    symbol_open_trade_side[symbol] = None
-                    return
-
-                # Check 0.5x ATR (50% close) — backup if conditional order missed
-                if not sl1_taken:
-                    stop_loss_price_30 = entry_price + (SL_STAGE1_ATR_MULT * entry_atr)
-                    if current_price >= stop_loss_price_30:
-                        await context.bot.send_message(
-                            chat_id=chat_id,
-                            text=(
-                                f"\U0001f6d1 SL TIER 1 (Backup) for {symbol} (Short)\n"
-                                f"Closing 50% at 0.5x ATR loss\n"
-                                f"Entry: {entry_price} | Current: {current_price}"
-                            )
-                        )
-                        await cancel_sl1_order(symbol)
-                        await close_partial_position(symbol, side_to_close="Sell", close_pct=SL_STAGE1_CLOSE_PCT)
-                        symbol_sl1_taken[symbol] = True
-                        sl1_taken = True
-
-        # ── TRAILING STOP: Multi-stage trailing ──
-        # Stage 1: At 1.5x ATR profit, trail on 60%. Bybit closes INSTANTLY when hit.
-        # Stage 2: After 60% closed, trail on 30% (1x ATR distance).
-        # Stage 3: Remaining 10% — no trail, exits on Exit Rules only.
-        trailing_active = symbol_trailing_active.get(symbol, False)
-        partial_taken = symbol_partial_taken.get(symbol, False)
-        stage2_active = symbol_stage2_active.get(symbol, False)
-        stage2_taken = symbol_stage2_taken.get(symbol, False)
-
-        if current_open_trade_side == "Buy":
-            unrealized_profit = peak - entry_price
-
-            # ── Stage 1: Activate 60% trail stop ──
-            if unrealized_profit >= TRAILING_ACTIVATE_ATR * entry_atr and not trailing_active:
-                symbol_trailing_active[symbol] = True
-                trailing_active = True
-                save_state()
-
-                pos_qty = await get_position_size(symbol)
-                if pos_qty:
-                    trail_qty = pos_qty * TRAILING_CLOSE_PCT
-                    trail_stop_price = peak - (TRAILING_STOP_ATR * entry_atr)
-
-                    # Cancel SL1 tier order (trailing now manages exit)
-                    # Keep server-side SL active to protect remaining 40% (and later 10%)
-                    await cancel_sl1_order(symbol)
-
-                    # Place conditional stop order for 60% at trail price
-                    order_id = await place_trail_stop_order(symbol, "Buy", trail_qty, trail_stop_price)
-
-                    if order_id:
-                        await context.bot.send_message(
-                            chat_id=chat_id,
-                            text=(
-                                f"\U0001f4c8 TRAILING ACTIVATED for {symbol} (Long)\n"
-                                f"Profit reached {TRAILING_ACTIVATE_ATR}x ATR ({unrealized_profit:.6g})\n"
-                                f"Peak: {peak:.6g} | Current: {current_price}\n"
-                                f"Stage 1: Trail on {TRAILING_CLOSE_PCT*100:.0f}% at {trail_stop_price:.6g} ({TRAILING_STOP_ATR}x ATR)\n"
-                                f"Trail moves UP as price rises. Bybit executes INSTANTLY when hit.\n"
-                                f"After 60% closed: 30% gets trail ({TRAILING_STOP_ATR_STAGE2}x ATR), 10% rides until Exit Rules."
-                            )
-                        )
-                    else:
-                        await context.bot.send_message(
-                            chat_id=chat_id,
-                            text=f"\u26a0\ufe0f {symbol}: Trail activated but failed to place stop order. Will retry."
-                        )
-
-            # ── Stage 1: Update trail price if peak moved (trail only moves UP for longs) ──
-            if trailing_active and not partial_taken:
-                current_trail = symbol_trail_price.get(symbol)
-                new_trail_price = peak - (TRAILING_STOP_ATR * entry_atr)
-
-                if current_trail is not None and new_trail_price > current_trail:
-                    success = await amend_trail_stop_price(symbol, new_trail_price)
-                    if not success:
-                        pass
-
-                # ── Detect if the 60% trail order has been filled ──
-                current_qty = await get_position_size(symbol)
-                trail_qty = symbol_trail_qty.get(symbol)
-                if current_qty is not None and trail_qty is not None:
-                    if trail_qty > 0 and current_qty <= trail_qty * 0.15:
-                        # Position is now ~0 — trail closed everything (too small to split)
-                        symbol_partial_taken[symbol] = True
-                        trail_price_display = symbol_trail_price.get(symbol, 0)
-                        await context.bot.send_message(
-                            chat_id=chat_id,
-                            text=(
-                                f"\U0001f3c1 TRAILING STOP HIT for {symbol} (Long)\n"
-                                f"Trail price: {trail_price_display:.6g}\n"
-                                f"Full position closed (too small to split). Going FLAT."
-                            )
-                        )
-                        symbol_trends[symbol] = None
-                        symbol_open_trade_side[symbol] = None
-                        _clear_risk_state(symbol)
-                        return
-                elif current_qty is None and trailing_active:
-                    symbol_partial_taken[symbol] = True
-                    trail_price_display = symbol_trail_price.get(symbol, 0)
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=(
-                            f"\U0001f3c1 TRAILING STOP HIT for {symbol} (Long)\n"
-                            f"Trail price: {trail_price_display:.6g}\n"
-                            f"Full position closed. Going FLAT."
-                        )
-                    )
-                    symbol_trends[symbol] = None
-                    symbol_open_trade_side[symbol] = None
-                    _clear_risk_state(symbol)
-                    return
-
-                # Check if trail order filled but position still exists = 60% was closed
-                if current_qty is not None and trail_qty is not None:
-                    order_id = symbol_trail_order_id.get(symbol)
-                    if order_id and current_qty < trail_qty:
-                        # 60% closed, 40% remains — activate stage 2
-                        symbol_partial_taken[symbol] = True
-                        partial_taken = True
-                        trail_price_display = symbol_trail_price.get(symbol, 0)
-                        symbol_trail_order_id[symbol] = None
-                        symbol_trail_qty[symbol] = None
-                        symbol_server_ts_set[symbol] = False
-                        save_state()
-
-                        await context.bot.send_message(
-                            chat_id=chat_id,
-                            text=(
-                                f"\U0001f3c1 STAGE 1 TRAIL closed {TRAILING_CLOSE_PCT*100:.0f}% for {symbol} (Long)\n"
-                                f"Trail price hit: {trail_price_display:.6g}\n"
-                                f"Now placing Stage 2 trail on 30% (1x ATR distance).\n"
-                                f"Remaining 10% will ride until Exit Rules exit."
-                            )
-                        )
-
-                        # ── Immediately activate Stage 2: trail on 30% (75% of remaining 40%) ──
-                        stage2_qty = current_qty * TRAILING_STAGE2_PCT
-                        # Stage 2 peak starts at current price (price just dropped to hit stage 1 trail)
-                        symbol_peak_stage2[symbol] = current_price
-                        stage2_trail_price = current_price - (TRAILING_STOP_ATR_STAGE2 * entry_atr)
-                        # Ensure stage 2 trail is never below entry price (would be a loss, not profit)
-                        if stage2_trail_price < entry_price:
-                            stage2_trail_price = entry_price
-                            print(f"[STAGE2] {symbol}: Trail price clamped to entry price {entry_price:.6g} (cannot trail below entry for longs)")
-
-                        s2_order_id = await place_conditional_close_order(symbol, "Buy", stage2_qty, stage2_trail_price)
-                        if s2_order_id:
-                            min_qty, _, qty_step, _ = await get_instrument_constraints(symbol)
-                            symbol_stage2_active[symbol] = True
-                            stage2_active = True
-                            symbol_trail2_order_id[symbol] = s2_order_id
-                            symbol_trail2_qty[symbol] = round_qty_to_step(stage2_qty, qty_step, min_qty)
-                            symbol_trail2_price[symbol] = stage2_trail_price
-                            await context.bot.send_message(
-                                chat_id=chat_id,
-                                text=(
-                                    f"\U0001f4c8 STAGE 2 TRAIL placed for {symbol} (Long)\n"
-                                    f"Trail on 30% at {stage2_trail_price:.6g} ({TRAILING_STOP_ATR_STAGE2}x ATR distance)\n"
-                                    f"Trail moves UP as price rises. Bybit executes INSTANTLY when hit.\n"
-                                    f"Remaining 10% continues until Exit Rules exit."
-                                )
-                            )
-                        else:
-                            await context.bot.send_message(
-                                chat_id=chat_id,
-                                text=f"\u26a0\ufe0f {symbol}: Stage 2 trail failed to place. Will retry next cycle."
-                            )
-
-            # ── Stage 2: Update trail and detect fill (after 60% closed) ──
-            if stage2_active and not stage2_taken:
-                # Update stage 2 peak (only moves UP for longs)
-                stage2_peak = symbol_peak_stage2.get(symbol, current_price)
-                stage2_peak = max(stage2_peak, current_price)
-                symbol_peak_stage2[symbol] = stage2_peak
-
-                # Update stage 2 trail price if peak moved
-                current_s2_trail = symbol_trail2_price.get(symbol)
-                new_s2_trail = stage2_peak - (TRAILING_STOP_ATR_STAGE2 * entry_atr)
-                s2_order_id = symbol_trail2_order_id.get(symbol)
-
-                if current_s2_trail is not None and new_s2_trail > current_s2_trail and s2_order_id:
-                    success = await amend_conditional_order(symbol, s2_order_id, new_s2_trail)
-                    if success:
-                        symbol_trail2_price[symbol] = new_s2_trail
-
-                # Detect stage 2 fill
-                current_qty = await get_position_size(symbol)
-                s2_trail_qty = symbol_trail2_qty.get(symbol)
-
-                if current_qty is None:
-                    # Position fully gone
-                    symbol_stage2_taken[symbol] = True
-                    trail_price_display = symbol_trail2_price.get(symbol, 0)
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=(
-                            f"\U0001f3c1 STAGE 2 TRAIL HIT for {symbol} (Long)\n"
-                            f"Trail price: {trail_price_display:.6g}\n"
-                            f"Full remaining position closed. Going FLAT."
-                        )
-                    )
-                    symbol_trends[symbol] = None
-                    symbol_open_trade_side[symbol] = None
-                    _clear_risk_state(symbol)
-                    return
-
-                if current_qty is not None and s2_trail_qty is not None:
-                    if s2_trail_qty > 0 and current_qty <= s2_trail_qty * 0.15:
-                        # Position too small — stage 2 closed everything remaining
-                        symbol_stage2_taken[symbol] = True
-                        trail_price_display = symbol_trail2_price.get(symbol, 0)
-                        await context.bot.send_message(
-                            chat_id=chat_id,
-                            text=(
-                                f"\U0001f3c1 STAGE 2 TRAIL HIT for {symbol} (Long)\n"
-                                f"Trail price: {trail_price_display:.6g}\n"
-                                f"Remaining position closed (too small to split). Going FLAT."
-                            )
-                        )
-                        symbol_trends[symbol] = None
-                        symbol_open_trade_side[symbol] = None
-                        _clear_risk_state(symbol)
-                        return
-
-                    if s2_order_id and current_qty < s2_trail_qty:
-                        # Stage 2 closed 30%, remaining 10% continues
-                        symbol_stage2_taken[symbol] = True
-                        stage2_taken = True
-                        trail_price_display = symbol_trail2_price.get(symbol, 0)
-                        symbol_trail2_order_id[symbol] = None
-                        symbol_trail2_qty[symbol] = None
-                        await context.bot.send_message(
-                            chat_id=chat_id,
-                            text=(
-                                f"\U0001f3c1 STAGE 2 TRAIL closed 30% for {symbol} (Long)\n"
-                                f"Trail price hit: {trail_price_display:.6g}\n"
-                                f"Remaining 10% continues trading.\n"
-                                f"No trailing stop on final 10% — exits on Exit Rules crossover only."
-                            )
-                        )
-
-            # ── Stage 2 retry: If 60% was closed but stage 2 order wasn't placed yet ──
-            if partial_taken and not stage2_active and not stage2_taken:
-                current_qty = await get_position_size(symbol)
-                if current_qty and current_qty > 0:
-                    stage2_qty = current_qty * TRAILING_STAGE2_PCT
-                    s2_peak = symbol_peak_stage2.get(symbol, current_price)
-                    s2_peak = max(s2_peak, current_price)
-                    symbol_peak_stage2[symbol] = s2_peak
-                    stage2_trail_price = s2_peak - (TRAILING_STOP_ATR_STAGE2 * entry_atr)
-                    # Ensure stage 2 trail is never below entry price (would be a loss, not profit)
-                    if stage2_trail_price < entry_price:
-                        stage2_trail_price = entry_price
-                        print(f"[STAGE2-RETRY] {symbol}: Trail price clamped to entry price {entry_price:.6g} (cannot trail below entry for longs)")
-
-                    s2_order_id = await place_conditional_close_order(symbol, "Buy", stage2_qty, stage2_trail_price)
-                    if s2_order_id:
-                        min_qty, _, qty_step, _ = await get_instrument_constraints(symbol)
-                        symbol_stage2_active[symbol] = True
-                        symbol_trail2_order_id[symbol] = s2_order_id
-                        symbol_trail2_qty[symbol] = round_qty_to_step(stage2_qty, qty_step, min_qty)
-                        symbol_trail2_price[symbol] = stage2_trail_price
-                        print(f"[STAGE2-RETRY] {symbol}: Stage 2 trail placed (retry) at {stage2_trail_price:.6g}")
-
-        elif current_open_trade_side == "Sell":
-            unrealized_profit = entry_price - peak  # peak is min for shorts
-
-            # ── Stage 1: Activate 60% trail stop ──
-            if unrealized_profit >= TRAILING_ACTIVATE_ATR * entry_atr and not trailing_active:
-                symbol_trailing_active[symbol] = True
-                trailing_active = True
-                save_state()
-
-                pos_qty = await get_position_size(symbol)
-                if pos_qty:
-                    trail_qty = pos_qty * TRAILING_CLOSE_PCT
-                    trail_stop_price = peak + (TRAILING_STOP_ATR * entry_atr)
-
-                    # Cancel SL1 tier order (trailing now manages exit)
-                    # Keep server-side SL active to protect remaining 40% (and later 10%)
-                    await cancel_sl1_order(symbol)
-
-                    order_id = await place_trail_stop_order(symbol, "Sell", trail_qty, trail_stop_price)
-
-                    if order_id:
-                        await context.bot.send_message(
-                            chat_id=chat_id,
-                            text=(
-                                f"\U0001f4c8 TRAILING ACTIVATED for {symbol} (Short)\n"
-                                f"Profit reached {TRAILING_ACTIVATE_ATR}x ATR ({unrealized_profit:.6g})\n"
-                                f"Trough: {peak:.6g} | Current: {current_price}\n"
-                                f"Stage 1: Trail on {TRAILING_CLOSE_PCT*100:.0f}% at {trail_stop_price:.6g} ({TRAILING_STOP_ATR}x ATR)\n"
-                                f"Trail moves DOWN as price falls. Bybit executes INSTANTLY when hit.\n"
-                                f"After 60% closed: 30% gets trail ({TRAILING_STOP_ATR_STAGE2}x ATR), 10% rides until Exit Rules."
-                            )
-                        )
-                    else:
-                        await context.bot.send_message(
-                            chat_id=chat_id,
-                            text=f"\u26a0\ufe0f {symbol}: Trail activated but failed to place stop order. Will retry."
-                        )
-
-            # ── Stage 1: Update trail price if trough moved (trail only moves DOWN for shorts) ──
-            if trailing_active and not partial_taken:
-                current_trail = symbol_trail_price.get(symbol)
-                new_trail_price = peak + (TRAILING_STOP_ATR * entry_atr)
-
-                if current_trail is not None and new_trail_price < current_trail:
-                    success = await amend_trail_stop_price(symbol, new_trail_price)
-                    if not success:
-                        pass
-
-                # ── Detect if the 60% trail order has been filled ──
-                current_qty = await get_position_size(symbol)
-                trail_qty = symbol_trail_qty.get(symbol)
-                if current_qty is not None and trail_qty is not None:
-                    if trail_qty > 0 and current_qty <= trail_qty * 0.15:
-                        symbol_partial_taken[symbol] = True
-                        trail_price_display = symbol_trail_price.get(symbol, 0)
-                        await context.bot.send_message(
-                            chat_id=chat_id,
-                            text=(
-                                f"\U0001f3c1 TRAILING STOP HIT for {symbol} (Short)\n"
-                                f"Trail price: {trail_price_display:.6g}\n"
-                                f"Full position closed (too small to split). Going FLAT."
-                            )
-                        )
-                        symbol_trends[symbol] = None
-                        symbol_open_trade_side[symbol] = None
-                        _clear_risk_state(symbol)
-                        return
-                elif current_qty is None and trailing_active:
-                    symbol_partial_taken[symbol] = True
-                    trail_price_display = symbol_trail_price.get(symbol, 0)
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=(
-                            f"\U0001f3c1 TRAILING STOP HIT for {symbol} (Short)\n"
-                            f"Trail price: {trail_price_display:.6g}\n"
-                            f"Full position closed. Going FLAT."
-                        )
-                    )
-                    symbol_trends[symbol] = None
-                    symbol_open_trade_side[symbol] = None
-                    _clear_risk_state(symbol)
-                    return
-
-                # Check if trail order filled but position still exists = 60% was closed
-                if current_qty is not None and trail_qty is not None:
-                    order_id = symbol_trail_order_id.get(symbol)
-                    if order_id and current_qty < trail_qty:
-                        # 60% closed, 40% remains — activate stage 2
-                        symbol_partial_taken[symbol] = True
-                        partial_taken = True
-                        trail_price_display = symbol_trail_price.get(symbol, 0)
-                        symbol_trail_order_id[symbol] = None
-                        symbol_trail_qty[symbol] = None
-                        symbol_server_ts_set[symbol] = False
-                        save_state()
-
-                        await context.bot.send_message(
-                            chat_id=chat_id,
-                            text=(
-                                f"\U0001f3c1 STAGE 1 TRAIL closed {TRAILING_CLOSE_PCT*100:.0f}% for {symbol} (Short)\n"
-                                f"Trail price hit: {trail_price_display:.6g}\n"
-                                f"Now placing Stage 2 trail on 30% (1x ATR distance).\n"
-                                f"Remaining 10% will ride until Exit Rules exit."
-                            )
-                        )
-
-                        # ── Immediately activate Stage 2: trail on 30% (75% of remaining) ──
-                        stage2_qty = current_qty * TRAILING_STAGE2_PCT
-                        symbol_peak_stage2[symbol] = current_price
-                        stage2_trail_price = current_price + (TRAILING_STOP_ATR_STAGE2 * entry_atr)
-                        # Ensure stage 2 trail is never above entry price (would be a loss, not profit)
-                        if stage2_trail_price > entry_price:
-                            stage2_trail_price = entry_price
-                            print(f"[STAGE2] {symbol}: Trail price clamped to entry price {entry_price:.6g} (cannot trail above entry for shorts)")
-
-                        s2_order_id = await place_conditional_close_order(symbol, "Sell", stage2_qty, stage2_trail_price)
-                        if s2_order_id:
-                            min_qty, _, qty_step, _ = await get_instrument_constraints(symbol)
-                            symbol_stage2_active[symbol] = True
-                            stage2_active = True
-                            symbol_trail2_order_id[symbol] = s2_order_id
-                            symbol_trail2_qty[symbol] = round_qty_to_step(stage2_qty, qty_step, min_qty)
-                            symbol_trail2_price[symbol] = stage2_trail_price
-                            await context.bot.send_message(
-                                chat_id=chat_id,
-                                text=(
-                                    f"\U0001f4c8 STAGE 2 TRAIL placed for {symbol} (Short)\n"
-                                    f"Trail on 30% at {stage2_trail_price:.6g} ({TRAILING_STOP_ATR_STAGE2}x ATR distance)\n"
-                                    f"Trail moves DOWN as price falls. Bybit executes INSTANTLY when hit.\n"
-                                    f"Remaining 10% continues until Exit Rules exit."
-                                )
-                            )
-                        else:
-                            await context.bot.send_message(
-                                chat_id=chat_id,
-                                text=f"\u26a0\ufe0f {symbol}: Stage 2 trail failed to place. Will retry next cycle."
-                            )
-
-            # ── Stage 2: Update trail and detect fill (after 60% closed) ──
-            if stage2_active and not stage2_taken:
-                # Update stage 2 peak (only moves DOWN for shorts)
-                stage2_peak = symbol_peak_stage2.get(symbol, current_price)
-                stage2_peak = min(stage2_peak, current_price)
-                symbol_peak_stage2[symbol] = stage2_peak
-
-                # Update stage 2 trail price if trough moved
-                current_s2_trail = symbol_trail2_price.get(symbol)
-                new_s2_trail = stage2_peak + (TRAILING_STOP_ATR_STAGE2 * entry_atr)
-                s2_order_id = symbol_trail2_order_id.get(symbol)
-
-                if current_s2_trail is not None and new_s2_trail < current_s2_trail and s2_order_id:
-                    success = await amend_conditional_order(symbol, s2_order_id, new_s2_trail)
-                    if success:
-                        symbol_trail2_price[symbol] = new_s2_trail
-
-                # Detect stage 2 fill
-                current_qty = await get_position_size(symbol)
-                s2_trail_qty = symbol_trail2_qty.get(symbol)
-
-                if current_qty is None:
-                    symbol_stage2_taken[symbol] = True
-                    trail_price_display = symbol_trail2_price.get(symbol, 0)
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=(
-                            f"\U0001f3c1 STAGE 2 TRAIL HIT for {symbol} (Short)\n"
-                            f"Trail price: {trail_price_display:.6g}\n"
-                            f"Full remaining position closed. Going FLAT."
-                        )
-                    )
-                    symbol_trends[symbol] = None
-                    symbol_open_trade_side[symbol] = None
-                    _clear_risk_state(symbol)
-                    return
-
-                if current_qty is not None and s2_trail_qty is not None:
-                    if s2_trail_qty > 0 and current_qty <= s2_trail_qty * 0.15:
-                        symbol_stage2_taken[symbol] = True
-                        trail_price_display = symbol_trail2_price.get(symbol, 0)
-                        await context.bot.send_message(
-                            chat_id=chat_id,
-                            text=(
-                                f"\U0001f3c1 STAGE 2 TRAIL HIT for {symbol} (Short)\n"
-                                f"Trail price: {trail_price_display:.6g}\n"
-                                f"Remaining position closed (too small to split). Going FLAT."
-                            )
-                        )
-                        symbol_trends[symbol] = None
-                        symbol_open_trade_side[symbol] = None
-                        _clear_risk_state(symbol)
-                        return
-
-                    if s2_order_id and current_qty < s2_trail_qty:
-                        symbol_stage2_taken[symbol] = True
-                        stage2_taken = True
-                        trail_price_display = symbol_trail2_price.get(symbol, 0)
-                        symbol_trail2_order_id[symbol] = None
-                        symbol_trail2_qty[symbol] = None
-                        await context.bot.send_message(
-                            chat_id=chat_id,
-                            text=(
-                                f"\U0001f3c1 STAGE 2 TRAIL closed 30% for {symbol} (Short)\n"
-                                f"Trail price hit: {trail_price_display:.6g}\n"
-                                f"Remaining 10% continues trading.\n"
-                                f"No trailing stop on final 10% — exits on Exit Rules crossover only."
-                            )
-                        )
-
-            # ── Stage 2 retry: If 60% was closed but stage 2 order wasn't placed yet ──
-            if partial_taken and not stage2_active and not stage2_taken:
-                current_qty = await get_position_size(symbol)
-                if current_qty and current_qty > 0:
-                    stage2_qty = current_qty * TRAILING_STAGE2_PCT
-                    s2_peak = symbol_peak_stage2.get(symbol, current_price)
-                    s2_peak = min(s2_peak, current_price)
-                    symbol_peak_stage2[symbol] = s2_peak
-                    stage2_trail_price = s2_peak + (TRAILING_STOP_ATR_STAGE2 * entry_atr)
-                    # Ensure stage 2 trail is never above entry price (would be a loss, not profit)
-                    if stage2_trail_price > entry_price:
-                        stage2_trail_price = entry_price
-                        print(f"[STAGE2-RETRY] {symbol}: Trail price clamped to entry price {entry_price:.6g} (cannot trail above entry for shorts)")
-
-                    s2_order_id = await place_conditional_close_order(symbol, "Sell", stage2_qty, stage2_trail_price)
-                    if s2_order_id:
-                        min_qty, _, qty_step, _ = await get_instrument_constraints(symbol)
-                        symbol_stage2_active[symbol] = True
-                        symbol_trail2_order_id[symbol] = s2_order_id
-                        symbol_trail2_qty[symbol] = round_qty_to_step(stage2_qty, qty_step, min_qty)
-                        symbol_trail2_price[symbol] = stage2_trail_price
-                        print(f"[STAGE2-RETRY] {symbol}: Stage 2 trail placed (retry) at {stage2_trail_price:.6g}")
-
-    # ──────────────────────────────────────────────
-    # 2. MACD-BASED PARTIAL EXIT RULES (10-MIN CLOSED-CANDLE CONFIRMATION)
-    #    Uses 10-minute chart MACD with CLOSED candle crossover confirmation.
-    #    This prevents whipsaw from intra-candle noise — the bot only acts when
-    #    a confirmed crossover is detected on a fully closed 10-min candle.
-    #    - Long: Bearish MACD cross on closed 10m candle → close 60%
-    #            Bullish MACD cross on closed 10m candle → add back 60%
-    #    - Short: Bullish MACD cross on closed 10m candle → close 60%
-    #             Bearish MACD cross on closed 10m candle → add back 60%
-    #    Only applies when trailing stop is NOT active (to avoid conflicts)
-    #    Does NOT trigger if exit conditions are already met (let exit handle it)
-    # ──────────────────────────────────────────────
-    if current_open_trade_side is not None:
-        trailing_is_active = symbol_trailing_active.get(symbol, False)
-        macd_partial_closed = symbol_macd_partial_closed.get(symbol, False)
-
-        # Reuse the 10-minute MACD data already fetched at the top of monitor_symbol
-        macd_10m_data = macd_10m_indicators if not trailing_is_active else None
-
-        if macd_10m_data and current_open_trade_side == "Buy" and not trailing_is_active:
-            # Check if exit conditions are met — if so, skip MACD partial (exit will handle)
-            exit_conditions_met = (last_close < ema_20 and macd_line_45m < signal_line_45m)
-
-            # Only act if this is a NEW closed candle (prevent re-triggering on the same candle)
-            last_acted_candle = symbol_macd_last_action_candle.get(symbol)
-            current_10m_candle = macd_10m_data["last_closed_ts_10m"]
-
-            if not exit_conditions_met:
-                if not macd_partial_closed and macd_10m_data["bearish_cross_10m"] and current_10m_candle != last_acted_candle:
-                    # Confirmed bearish MACD crossover on closed 10-min candle → close 60% of long position
-                    pos_qty = await get_position_size(symbol)
-                    if pos_qty:
-                        close_qty = pos_qty * 0.60
-                        min_qty, _, qty_step, _ = await get_instrument_constraints(symbol)
-                        close_qty = round_qty_to_step(close_qty, qty_step, min_qty)
-
-                        closed = await close_partial_position(symbol, side_to_close="Buy", close_pct=0.60)
-                        if closed:
-                            symbol_macd_partial_closed[symbol] = True
-                            symbol_macd_partial_qty[symbol] = closed
-                            symbol_macd_last_action_candle[symbol] = current_10m_candle
-                            save_state()
-                            await context.bot.send_message(
-                                chat_id=chat_id,
-                                text=(
-                                    f"\U0001f4c9 MACD PARTIAL EXIT for {symbol} (Long)\n"
-                                    f"Confirmed on 10-min closed candle\n"
-                                    f"MACD Line ({macd_10m_data['macd_10m']:.6g}) < Signal Line ({macd_10m_data['signal_10m']:.6g})\n"
-                                    f"Prev MACD ({macd_10m_data['prev_macd_10m']:.6g}) was above Signal ({macd_10m_data['prev_signal_10m']:.6g})\n"
-                                    f"Closed 60% of position ({closed} qty)\n"
-                                    f"Remaining 40% still in Long trade.\n"
-                                    f"If MACD crosses back above Signal on a closed 10-min candle, 60% will be added back."
-                                )
-                            )
-
-                elif macd_partial_closed and macd_10m_data["bullish_cross_10m"] and current_10m_candle != last_acted_candle:
-                    # Confirmed bullish MACD crossover on closed 10-min candle → add back the 60% that was closed
-                    add_back_qty = symbol_macd_partial_qty.get(symbol)
-                    if add_back_qty and add_back_qty > 0:
-                        result = await place_trade(symbol, side="Buy", manual_qty_override=add_back_qty)
-                        if result and "error" not in result:
-                            symbol_macd_partial_closed[symbol] = False
-                            symbol_macd_partial_qty[symbol] = None
-                            symbol_macd_last_action_candle[symbol] = current_10m_candle
-                            save_state()
-                            await context.bot.send_message(
-                                chat_id=chat_id,
-                                text=(
-                                    f"\U0001f4c8 MACD RE-ENTRY for {symbol} (Long)\n"
-                                    f"Confirmed on 10-min closed candle\n"
-                                    f"MACD Line ({macd_10m_data['macd_10m']:.6g}) > Signal Line ({macd_10m_data['signal_10m']:.6g})\n"
-                                    f"Added back 60% ({add_back_qty} qty) to Long position.\n"
-                                    f"Full position restored."
-                                )
-                            )
-                        else:
-                            err = result.get("error", "Unknown") if result else "Unknown"
-                            await context.bot.send_message(
-                                chat_id=chat_id,
-                                text=f"\u26a0\ufe0f {symbol}: Failed to add back 60% on MACD re-cross: {err}"
-                            )
-
-        elif macd_10m_data and current_open_trade_side == "Sell" and not trailing_is_active:
-            # Check if exit conditions are met — if so, skip MACD partial (exit will handle)
-            exit_conditions_met = (last_close > ema_20 and macd_line_45m > signal_line_45m)
-
-            # Only act if this is a NEW closed candle (prevent re-triggering on the same candle)
-            last_acted_candle = symbol_macd_last_action_candle.get(symbol)
-            current_10m_candle = macd_10m_data["last_closed_ts_10m"]
-
-            if not exit_conditions_met:
-                if not macd_partial_closed and macd_10m_data["bullish_cross_10m"] and current_10m_candle != last_acted_candle:
-                    # Confirmed bullish MACD crossover on closed 10-min candle → close 60% of short position
-                    pos_qty = await get_position_size(symbol)
-                    if pos_qty:
-                        close_qty = pos_qty * 0.60
-                        min_qty, _, qty_step, _ = await get_instrument_constraints(symbol)
-                        close_qty = round_qty_to_step(close_qty, qty_step, min_qty)
-
-                        closed = await close_partial_position(symbol, side_to_close="Sell", close_pct=0.60)
-                        if closed:
-                            symbol_macd_partial_closed[symbol] = True
-                            symbol_macd_partial_qty[symbol] = closed
-                            symbol_macd_last_action_candle[symbol] = current_10m_candle
-                            save_state()
-                            await context.bot.send_message(
-                                chat_id=chat_id,
-                                text=(
-                                    f"\U0001f4c9 MACD PARTIAL EXIT for {symbol} (Short)\n"
-                                    f"Confirmed on 10-min closed candle\n"
-                                    f"MACD Line ({macd_10m_data['macd_10m']:.6g}) > Signal Line ({macd_10m_data['signal_10m']:.6g})\n"
-                                    f"Prev MACD ({macd_10m_data['prev_macd_10m']:.6g}) was below Signal ({macd_10m_data['prev_signal_10m']:.6g})\n"
-                                    f"Closed 60% of position ({closed} qty)\n"
-                                    f"Remaining 40% still in Short trade.\n"
-                                    f"If MACD crosses back below Signal on a closed 10-min candle, 60% will be added back."
-                                )
-                            )
-
-                elif macd_partial_closed and macd_10m_data["bearish_cross_10m"] and current_10m_candle != last_acted_candle:
-                    # Confirmed bearish MACD crossover on closed 10-min candle → add back the 60% that was closed
-                    add_back_qty = symbol_macd_partial_qty.get(symbol)
-                    if add_back_qty and add_back_qty > 0:
-                        result = await place_trade(symbol, side="Sell", manual_qty_override=add_back_qty)
-                        if result and "error" not in result:
-                            symbol_macd_partial_closed[symbol] = False
-                            symbol_macd_partial_qty[symbol] = None
-                            symbol_macd_last_action_candle[symbol] = current_10m_candle
-                            save_state()
-                            await context.bot.send_message(
-                                chat_id=chat_id,
-                                text=(
-                                    f"\U0001f4c8 MACD RE-ENTRY for {symbol} (Short)\n"
-                                    f"Confirmed on 10-min closed candle\n"
-                                    f"MACD Line ({macd_10m_data['macd_10m']:.6g}) < Signal Line ({macd_10m_data['signal_10m']:.6g})\n"
-                                    f"Added back 60% ({add_back_qty} qty) to Short position.\n"
-                                    f"Full position restored."
-                                )
-                            )
-                        else:
-                            err = result.get("error", "Unknown") if result else "Unknown"
-                            await context.bot.send_message(
-                                chat_id=chat_id,
-                                text=f"\u26a0\ufe0f {symbol}: Failed to add back 60% on MACD re-cross: {err}"
-                            )
-
-    # ──────────────────────────────────────────────
-    # 3. EXIT + POSSIBLE REVERSAL (Decoupled)
-    #    Exit requires: price crosses EMA (30m) AND MACD Line/Signal (45m).
-    #    Reverse ONLY if MACD (45m) + ADX > 24 confirm. Otherwise go FLAT.
-    # ──────────────────────────────────────────────
-    if current_open_trade_side is not None:
-
-        # ── Long Exit: close price below 20 EMA (30m) AND MACD Line < Signal Line (45m) ──
-        if current_open_trade_side == "Buy" and last_close < ema_20 and macd_line_45m < signal_line_45m:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    f"\u26a0\ufe0f EXIT SIGNAL for {symbol} (Long)\n"
-                    f"Last Close ({last_close}) < 20 EMA ({ema_20:.6g})\n"
-                    f"MACD Line 45m ({macd_line_45m:.6g}) < Signal Line 45m ({signal_line_45m:.6g}) — bearish alignment\n"
-                    f"ADX: {adx:.2f}\n"
-                    f"Closing Long position..."
-                )
-            )
-
-            await cancel_server_stops(symbol)  # Cancel server-side stops before closing
-            closed_qty = await close_position(symbol, side_to_close="Buy")
-            manual_override = None
-            if symbol in symbol_manual_quantities and symbol_manual_quantities[symbol] is not None:
-                manual_override = closed_qty
-
-            # Check if we should REVERSE to Short (requires: Price < 20 EMA (30m) AND MACD < Signal (45m) AND ADX > 24)
-            if last_close < ema_20 and macd_line_45m < signal_line_45m and adx > ADX_REVERSAL_THRESHOLD:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        f"\U0001f504 REVERSE to Short for {symbol}\n"
-                        f"Price ({last_close}) < 20 EMA ({ema_20:.6g})\n"
-                        f"MACD 45m ({macd_line_45m:.6g}) < Signal 45m ({signal_line_45m:.6g}) | ADX: {adx:.2f} > {ADX_REVERSAL_THRESHOLD}\n"
-                        f"Opening Short..."
-                    )
-                )
-                result = await place_trade(symbol, side="Sell", manual_qty_override=manual_override)
-                if result and "error" not in result:
-                    order_id = result.get("orderId", "\u2014")
-                    # Get actual fill price from Bybit (not candle close)
-                    await asyncio.sleep(1)
-                    real_entry = await get_position_entry_price(symbol)
-                    fill_price = real_entry if real_entry else last_close
-                    _set_entry_risk_state(symbol, fill_price, atr)
-                    # Set server-side stop-loss based on actual fill price
-                    sl_price = fill_price + (STOP_LOSS_ATR_MULT * atr)
-                    await set_server_stop_loss(symbol, "Sell", sl_price)
-                    await context.bot.send_message(chat_id=chat_id, text=f"\u2705 Short order(s) placed for {symbol}\nLast Order ID: <code>{order_id}</code>\nFill Price: {fill_price:.6g}\nServer-side SL: {sl_price:.6g}", parse_mode="HTML")
-                    symbol_trends[symbol] = "downward"
-                    symbol_open_trade_side[symbol] = "Sell"
-                elif result and "error" in result:
-                    await context.bot.send_message(chat_id=chat_id, text=f"\u274c Failed to place Short for {symbol}: {result['error']}")
-                    symbol_trends[symbol] = None
-                    symbol_open_trade_side[symbol] = None
-            else:
-                # No reverse signal -> go FLAT
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        f"\U0001f7e1 GOING FLAT for {symbol}\n"
-                        f"No reverse signal (need: Price < 20 EMA + MACD < Signal (45m) + ADX > {ADX_REVERSAL_THRESHOLD})\n"
-                        f"MACD 45m: {macd_line_45m:.6g} / Signal 45m: {signal_line_45m:.6g} | ADX: {adx:.2f}\n"
-                        f"Waiting for next entry signal..."
-                    )
-                )
-                symbol_trends[symbol] = None
-                symbol_open_trade_side[symbol] = None
-                _clear_risk_state(symbol)
-            return
-
-        # ── Short Exit: close price above 20 EMA (30m) AND MACD Line > Signal Line (45m) ──
-        elif current_open_trade_side == "Sell" and last_close > ema_20 and macd_line_45m > signal_line_45m:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    f"\u26a0\ufe0f EXIT SIGNAL for {symbol} (Short)\n"
-                    f"Last Close ({last_close}) > 20 EMA ({ema_20:.6g})\n"
-                    f"MACD Line 45m ({macd_line_45m:.6g}) > Signal Line 45m ({signal_line_45m:.6g}) — bullish alignment\n"
-                    f"ADX: {adx:.2f}\n"
-                    f"Closing Short position..."
-                )
-            )
-
-            await cancel_server_stops(symbol)  # Cancel server-side stops before closing
-            closed_qty = await close_position(symbol, side_to_close="Sell")
-            manual_override = None
-            if symbol in symbol_manual_quantities and symbol_manual_quantities[symbol] is not None:
-                manual_override = closed_qty
-
-            # Check if we should REVERSE to Long (requires: Price > 20 EMA (30m) AND MACD > Signal (45m) AND ADX > 24)
-            if last_close > ema_20 and macd_line_45m > signal_line_45m and adx > ADX_REVERSAL_THRESHOLD:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        f"\U0001f504 REVERSE to Long for {symbol}\n"
-                        f"Price ({last_close}) > 20 EMA ({ema_20:.6g})\n"
-                        f"MACD 45m ({macd_line_45m:.6g}) > Signal 45m ({signal_line_45m:.6g}) | ADX: {adx:.2f} > {ADX_REVERSAL_THRESHOLD}\n"
-                        f"Opening Long..."
-                    )
-                )
-                result = await place_trade(symbol, side="Buy", manual_qty_override=manual_override)
-                if result and "error" not in result:
-                    order_id = result.get("orderId", "\u2014")
-                    # Get actual fill price from Bybit (not candle close)
-                    await asyncio.sleep(1)
-                    real_entry = await get_position_entry_price(symbol)
-                    fill_price = real_entry if real_entry else last_close
-                    _set_entry_risk_state(symbol, fill_price, atr)
-                    # Set server-side stop-loss based on actual fill price
-                    sl_price = fill_price - (STOP_LOSS_ATR_MULT * atr)
-                    await set_server_stop_loss(symbol, "Buy", sl_price)
-                    await context.bot.send_message(chat_id=chat_id, text=f"\u2705 Long order(s) placed for {symbol}\nLast Order ID: <code>{order_id}</code>\nFill Price: {fill_price:.6g}\nServer-side SL: {sl_price:.6g}", parse_mode="HTML")
-                    symbol_trends[symbol] = "upward"
-                    symbol_open_trade_side[symbol] = "Buy"
-                elif result and "error" in result:
-                    await context.bot.send_message(chat_id=chat_id, text=f"\u274c Failed to place Long for {symbol}: {result['error']}")
-                    symbol_trends[symbol] = None
-                    symbol_open_trade_side[symbol] = None
-            else:
-                # No reverse signal -> go FLAT
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        f"\U0001f7e1 GOING FLAT for {symbol}\n"
-                        f"No reverse signal (need: Price > 20 EMA + MACD > Signal (45m) + ADX > {ADX_REVERSAL_THRESHOLD})\n"
-                        f"MACD 45m: {macd_line_45m:.6g} / Signal 45m: {signal_line_45m:.6g} | ADX: {adx:.2f}\n"
-                        f"Waiting for next entry signal..."
-                    )
-                )
-                symbol_trends[symbol] = None
-                symbol_open_trade_side[symbol] = None
-                _clear_risk_state(symbol)
-            return
-
-    # ──────────────────────────────────────────────
-    # 4. INITIAL TRADE ENTRY (no open position)
-    #    4-layer filter (ALL must pass):
-    #      1. ADX > 22
-    #      2. Long: Price > 20 EMA (30m) | Short: Price < 20 EMA (30m)
-    #      3. RSI NOT extreme (not > 70 for longs, not < 30 for shorts)
-    #      4. Long: MACD Line > Signal Line (45m) | Short: MACD Line < Signal Line (45m)
-    # ──────────────────────────────────────────────
-    if current_open_trade_side is None:
-        # Filter 1: ADX must be above threshold
-        if adx < ADX_THRESHOLD:
-            return
-
-        new_trend = None
-        side = None
-        # Long: last_close > 20 EMA (30m)
-        if last_close > ema_20:
-            # Filter 3: RSI not overbought for longs
-            if rsi > RSI_OVERBOUGHT:
-                print(f"[FILTER] {symbol}: Long entry blocked — RSI overbought ({rsi:.2f} > {RSI_OVERBOUGHT})")
-                return
-            # Filter 4: MACD Line must be above Signal Line (45m chart) for longs
-            if macd_line_45m <= signal_line_45m:
-                print(f"[FILTER] {symbol}: Long entry blocked — MACD Line 45m ({macd_line_45m:.6g}) <= Signal Line 45m ({signal_line_45m:.6g})")
-                return
-            new_trend = "upward"
-            side = "Buy"
-        # Short: last_close < 20 EMA (30m)
-        elif last_close < ema_20:
-            # Filter 3: RSI not oversold for shorts
-            if rsi < RSI_OVERSOLD:
-                print(f"[FILTER] {symbol}: Short entry blocked — RSI oversold ({rsi:.2f} < {RSI_OVERSOLD})")
-                return
-            # Filter 4: MACD Line must be below Signal Line (45m chart) for shorts
-            if macd_line_45m >= signal_line_45m:
-                print(f"[FILTER] {symbol}: Short entry blocked — MACD Line 45m ({macd_line_45m:.6g}) >= Signal Line 45m ({signal_line_45m:.6g})")
-                return
-            new_trend = "downward"
-            side = "Sell"
-
-        if new_trend and side and (previous_trend is None or new_trend != previous_trend):
-            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            side_text = "Long (Buy)" if side == "Buy" else "Short (Sell)"
-            msg = (
-                f"{ts} \u2014 {symbol} ENTRY SIGNAL: <b>{new_trend.upper()}</b>\n"
-                f"Last Close: {last_close} | 20 EMA: {ema_20:.6g}\n"
-                f"+DI: {plus_di:.2f} | -DI: {minus_di:.2f} | ADX: {adx:.2f}\n"
-                f"RSI: {rsi:.2f} | MACD 45m: {macd_line_45m:.6g} / Signal 45m: {signal_line_45m:.6g}\n"
-                f"MACD Hist (30m): {macd_histogram:.6g} (prev: {prev_macd_histogram:.6g})\n"
-                f"Direction: {side_text}"
-            )
-            await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
-
-            result = await place_trade(symbol, side=side)
-
-            if result and "error" not in result:
-                order_id = result.get("orderId", "\u2014")
-                # Get actual fill price from Bybit (not candle close)
-                await asyncio.sleep(1)
-                real_entry = await get_position_entry_price(symbol)
-                fill_price = real_entry if real_entry else last_close
-                _set_entry_risk_state(symbol, fill_price, atr)
-                # Set server-side stop-loss based on actual fill price
-                if side == "Buy":
-                    sl_price = fill_price - (STOP_LOSS_ATR_MULT * atr)
+            # ──────────────────────────────────
+            #  2. POSITION OPEN: Risk Management
+            # ──────────────────────────────────
+            if current_side:
+                entry_price = symbol_entry_price.get(symbol)
+                entry_atr = symbol_entry_atr.get(symbol) or atr
+                sl_price = symbol_sl_price.get(symbol)
+                trailing_sl = symbol_trailing_sl.get(symbol)
+
+                if entry_price is None:
+                    entry_price = get_position_entry_price(symbol) or price
+
+                # Increment bars in trade on new candle
+                if new_candle:
+                    symbol_bars_in_trade[symbol] = symbol_bars_in_trade.get(symbol, 0) + 1
+
+                # Update peak/trough tracking
+                if current_side == "Buy":
+                    if symbol_highest_since_entry.get(symbol) is None or price > symbol_highest_since_entry[symbol]:
+                        symbol_highest_since_entry[symbol] = price
+                    if symbol_lowest_since_entry.get(symbol) is None or price < symbol_lowest_since_entry[symbol]:
+                        symbol_lowest_since_entry[symbol] = price
                 else:
-                    sl_price = fill_price + (STOP_LOSS_ATR_MULT * atr)
-                await set_server_stop_loss(symbol, side, sl_price)
-                await context.bot.send_message(chat_id=chat_id, text=f"\u2705 {side_text} order(s) placed for {symbol}\nLast Order ID: <code>{order_id}</code>\nFill Price: {fill_price:.6g}\nServer-side SL: {sl_price:.6g}", parse_mode="HTML")
-            elif result and "error" in result:
-                await context.bot.send_message(chat_id=chat_id, text=f"\u274c Failed to place {side_text} for {symbol}: {result['error']}")
+                    if symbol_lowest_since_entry.get(symbol) is None or price < symbol_lowest_since_entry[symbol]:
+                        symbol_lowest_since_entry[symbol] = price
+                    if symbol_highest_since_entry.get(symbol) is None or price > symbol_highest_since_entry[symbol]:
+                        symbol_highest_since_entry[symbol] = price
 
-            symbol_trends[symbol] = new_trend
-            symbol_open_trade_side[symbol] = await get_open_position_side(symbol)
-            save_state()
+                # ── Check stop-loss hit ──
+                sl_hit = False
+                if sl_price:
+                    if current_side == "Buy" and price <= sl_price:
+                        sl_hit = True
+                    elif current_side == "Sell" and price >= sl_price:
+                        sl_hit = True
 
-    # ──────────────────────────────────────────────
-    # 5. 30-Minute Status Report
-    # ──────────────────────────────────────────────
-    current_time = time.time()
-    last_report_time = context.job.data.get("last_report_time", 0)
+                if sl_hit:
+                    await close_position(symbol, current_side, bot)
+                    cancel_all_symbol_orders(symbol)
+                    pnl_pct = ((price - entry_price) / entry_price * 100) if current_side == "Buy" else ((entry_price - price) / entry_price * 100)
+                    # Update streak tracking
+                    if pnl_pct < 0:
+                        symbol_consecutive_losses[symbol] = symbol_consecutive_losses.get(symbol, 0) + 1
+                        symbol_consecutive_wins[symbol] = 0
+                        cooldown = params["cooldown_loss"]
+                        if symbol_consecutive_losses.get(symbol, 0) >= 3:
+                            cooldown = params["cooldown_streak"]
+                        symbol_cooldown[symbol] = cooldown
+                    else:
+                        symbol_consecutive_wins[symbol] = symbol_consecutive_wins.get(symbol, 0) + 1
+                        symbol_consecutive_losses[symbol] = 0
+                        symbol_cooldown[symbol] = params["cooldown_bars"]
 
-    if current_time - last_report_time >= 1800:
-        trade_status = "No open trade"
-        if current_open_trade_side:
-            trade_status = f"\u2705 {current_open_trade_side} trade open for {symbol}"
-        else:
-            trade_status = f"\u274c No open trade for {symbol} (FLAT)"
+                    await bot.send_message(
+                        chat_id=CHAT_ID,
+                        text=(
+                            f"🛑 <b>{symbol}</b> STOP-LOSS HIT\n"
+                            f"Side: {current_side} | PnL: {pnl_pct:+.2f}%\n"
+                            f"Entry: {entry_price:.6g} → Exit: {price:.6g}\n"
+                            f"Consecutive Losses: {symbol_consecutive_losses.get(symbol, 0)}\n"
+                            f"Cooldown: {symbol_cooldown.get(symbol, 0)} bars"
+                        ),
+                        parse_mode="HTML",
+                    )
+                    _clear_risk_state(symbol)
+                    symbol_open_trade_side[symbol] = None
+                    symbol_trends[symbol] = None
+                    save_state()
+                    await asyncio.sleep(POLL_INTERVAL_SECONDS)
+                    continue
 
-        entry_price = symbol_entry_price.get(symbol)
-        entry_atr = symbol_entry_atr.get(symbol)
-        peak = symbol_peak_price.get(symbol)
-        trailing = symbol_trailing_active.get(symbol, False)
+                # ── Take-Profit checks (TP0-TP3) ──
+                if current_side == "Buy":
+                    unrealized_atr = (price - entry_price) / entry_atr if entry_atr else 0
+                else:
+                    unrealized_atr = (entry_price - price) / entry_atr if entry_atr else 0
 
-        risk_info = ""
-        if entry_price and entry_atr:
-            if current_open_trade_side == "Buy":
-                sl = entry_price - (STOP_LOSS_ATR_MULT * entry_atr)
-            elif current_open_trade_side == "Sell":
-                sl = entry_price + (STOP_LOSS_ATR_MULT * entry_atr)
+                remaining_pct = symbol_position_size_pct.get(symbol, 1.0)
+
+                # TP0
+                if not symbol_tp0_hit.get(symbol, False) and unrealized_atr >= params["tp0_atr"]:
+                    close_frac = params["tp0_pct"] / remaining_pct if remaining_pct > 0 else 0
+                    close_frac = min(close_frac, 0.99)
+                    if close_frac > 0:
+                        success = await close_partial_position(symbol, current_side, close_frac, bot)
+                        if success:
+                            symbol_tp0_hit[symbol] = True
+                            symbol_position_size_pct[symbol] = remaining_pct - params["tp0_pct"]
+                            await bot.send_message(
+                                chat_id=CHAT_ID,
+                                text=f"✅ <b>{symbol}</b> TP0 hit ({params['tp0_atr']:.1f}x ATR) — closed {params['tp0_pct']*100:.0f}%",
+                                parse_mode="HTML",
+                            )
+                            save_state()
+
+                # TP1
+                remaining_pct = symbol_position_size_pct.get(symbol, 1.0)
+                if not symbol_tp1_hit.get(symbol, False) and unrealized_atr >= params["tp1_atr"]:
+                    close_frac = params["tp1_pct"] / remaining_pct if remaining_pct > 0 else 0
+                    close_frac = min(close_frac, 0.99)
+                    if close_frac > 0:
+                        success = await close_partial_position(symbol, current_side, close_frac, bot)
+                        if success:
+                            symbol_tp1_hit[symbol] = True
+                            symbol_position_size_pct[symbol] = remaining_pct - params["tp1_pct"]
+                            await bot.send_message(
+                                chat_id=CHAT_ID,
+                                text=f"✅ <b>{symbol}</b> TP1 hit ({params['tp1_atr']:.1f}x ATR) — closed {params['tp1_pct']*100:.0f}%",
+                                parse_mode="HTML",
+                            )
+                            save_state()
+
+                # TP2
+                remaining_pct = symbol_position_size_pct.get(symbol, 1.0)
+                if not symbol_tp2_hit.get(symbol, False) and unrealized_atr >= params["tp2_atr"]:
+                    close_frac = params["tp2_pct"] / remaining_pct if remaining_pct > 0 else 0
+                    close_frac = min(close_frac, 0.99)
+                    if close_frac > 0:
+                        success = await close_partial_position(symbol, current_side, close_frac, bot)
+                        if success:
+                            symbol_tp2_hit[symbol] = True
+                            symbol_position_size_pct[symbol] = remaining_pct - params["tp2_pct"]
+                            await bot.send_message(
+                                chat_id=CHAT_ID,
+                                text=f"✅ <b>{symbol}</b> TP2 hit ({params['tp2_atr']:.1f}x ATR) — closed {params['tp2_pct']*100:.0f}%",
+                                parse_mode="HTML",
+                            )
+                            save_state()
+
+                # TP3
+                remaining_pct = symbol_position_size_pct.get(symbol, 1.0)
+                if not symbol_tp3_hit.get(symbol, False) and unrealized_atr >= params["tp3_atr"]:
+                    close_frac = params["tp3_pct"] / remaining_pct if remaining_pct > 0 else 0
+                    close_frac = min(close_frac, 0.99)
+                    if close_frac > 0:
+                        success = await close_partial_position(symbol, current_side, close_frac, bot)
+                        if success:
+                            symbol_tp3_hit[symbol] = True
+                            symbol_position_size_pct[symbol] = remaining_pct - params["tp3_pct"]
+                            await bot.send_message(
+                                chat_id=CHAT_ID,
+                                text=f"✅ <b>{symbol}</b> TP3 hit ({params['tp3_atr']:.1f}x ATR) — closed {params['tp3_pct']*100:.0f}%",
+                                parse_mode="HTML",
+                            )
+                            save_state()
+
+                # ── Trailing Stop Update (ADX-adaptive with progressive tightening) ──
+                if trailing_sl is not None and entry_atr:
+                    # Determine trail multiplier based on ADX
+                    adx_strong = params.get("adx_strong", 28)
+                    adx_vstrong = params.get("adx_vstrong", 42)
+                    if adx >= adx_vstrong:
+                        trail_mult = params["trail_vstrong"]
+                    elif adx >= adx_strong:
+                        trail_mult = params["trail_strong"]
+                    else:
+                        trail_mult = params["trail_atr"]
+
+                    # Progressive tightening after TP hits
+                    if symbol_tp2_hit.get(symbol, False):
+                        trail_mult *= params["trail_tighten_tp2"]
+                    elif symbol_tp1_hit.get(symbol, False):
+                        trail_mult *= params["trail_tighten_tp1"]
+
+                    trail_dist = entry_atr * trail_mult
+
+                    if current_side == "Buy":
+                        new_trail = price - trail_dist
+                        if new_trail > trailing_sl:
+                            symbol_trailing_sl[symbol] = new_trail
+                            # Also update SL (never move SL backwards)
+                            if new_trail > (symbol_sl_price.get(symbol) or 0):
+                                symbol_sl_price[symbol] = new_trail
+                    else:
+                        new_trail = price + trail_dist
+                        if new_trail < trailing_sl:
+                            symbol_trailing_sl[symbol] = new_trail
+                            if symbol_sl_price.get(symbol) is None or new_trail < symbol_sl_price[symbol]:
+                                symbol_sl_price[symbol] = new_trail
+
+                # ── Signal-based exit check ──
+                exit_signals = compute_exit_signals(ind, htf, current_side)
+                bars_in_trade = symbol_bars_in_trade.get(symbol, 0)
+
+                should_exit = False
+                exit_reason = ""
+
+                # Exit if enough bearish/bullish signals
+                if exit_signals >= 3:
+                    should_exit = True
+                    exit_reason = f"Signal exit ({exit_signals} opposing signals)"
+
+                # Time-based flat trade exit
+                flat_bars = params.get("flat_bars", 15)
+                flat_threshold = params.get("flat_threshold", 0.3)
+                if bars_in_trade >= flat_bars and abs(unrealized_atr) < flat_threshold:
+                    should_exit = True
+                    exit_reason = f"Flat trade exit ({bars_in_trade} bars, {unrealized_atr:.2f}x ATR)"
+
+                if should_exit:
+                    await close_position(symbol, current_side, bot)
+                    cancel_all_symbol_orders(symbol)
+                    pnl_pct = ((price - entry_price) / entry_price * 100) if current_side == "Buy" else ((entry_price - price) / entry_price * 100)
+
+                    # Update streaks
+                    if pnl_pct < 0:
+                        symbol_consecutive_losses[symbol] = symbol_consecutive_losses.get(symbol, 0) + 1
+                        symbol_consecutive_wins[symbol] = 0
+                        cooldown = params["cooldown_loss"]
+                        if symbol_consecutive_losses.get(symbol, 0) >= 3:
+                            cooldown = params["cooldown_streak"]
+                        symbol_cooldown[symbol] = cooldown
+                    else:
+                        symbol_consecutive_wins[symbol] = symbol_consecutive_wins.get(symbol, 0) + 1
+                        symbol_consecutive_losses[symbol] = 0
+                        symbol_cooldown[symbol] = params["cooldown_bars"]
+
+                    emoji = "📉" if pnl_pct < 0 else "📈"
+                    await bot.send_message(
+                        chat_id=CHAT_ID,
+                        text=(
+                            f"{emoji} <b>{symbol}</b> EXIT — {exit_reason}\n"
+                            f"Side: {current_side} | PnL: {pnl_pct:+.2f}%\n"
+                            f"Entry: {entry_price:.6g} → Exit: {price:.6g}\n"
+                            f"Bars in trade: {bars_in_trade}\n"
+                            f"Losses streak: {symbol_consecutive_losses.get(symbol, 0)} | "
+                            f"Wins streak: {symbol_consecutive_wins.get(symbol, 0)}"
+                        ),
+                        parse_mode="HTML",
+                    )
+
+                    old_side = current_side
+                    _clear_risk_state(symbol)
+                    symbol_open_trade_side[symbol] = None
+                    symbol_trends[symbol] = None
+                    save_state()
+
+                    # Quick reversal check after signal exit
+                    if exit_signals >= 3 and symbol_cooldown.get(symbol, 0) <= 0:
+                        long_sig, short_sig, strat = compute_entry_signals(ind, htf, params)
+                        rev_side = None
+                        if old_side == "Buy" and short_sig >= params["sig_threshold"]:
+                            rev_side = "Sell"
+                        elif old_side == "Sell" and long_sig >= params["sig_threshold"]:
+                            rev_side = "Buy"
+
+                        if rev_side:
+                            manual_qty = symbol_manual_quantities.get(symbol)
+                            success = await place_trade(symbol, rev_side, bot, manual_qty=manual_qty)
+                            if success:
+                                entry_p = get_position_entry_price(symbol) or price
+                                pos_size = get_position_size(symbol) or 0
+                                _set_entry_risk_state(symbol, entry_p, atr, rev_side, pos_size, params)
+                                symbol_open_trade_side[symbol] = rev_side
+                                symbol_trends[symbol] = "LONG" if rev_side == "Buy" else "SHORT"
+                                set_server_stop_loss(symbol, rev_side, symbol_sl_price.get(symbol, 0))
+
+                                await bot.send_message(
+                                    chat_id=CHAT_ID,
+                                    text=(
+                                        f"🔄 <b>{symbol}</b> QUICK REVERSAL → {rev_side}\n"
+                                        f"Strategy: {strat}\n"
+                                        f"Entry: {entry_p:.6g} | SL: {symbol_sl_price.get(symbol, 0):.6g}\n"
+                                        f"ATR: {atr:.6g} | ADX: {adx:.1f}"
+                                    ),
+                                    parse_mode="HTML",
+                                )
+                                save_state()
+
+                    await asyncio.sleep(POLL_INTERVAL_SECONDS)
+                    continue
+
+            # ──────────────────────────────────
+            #  3. NO POSITION: Entry Logic
+            # ──────────────────────────────────
             else:
-                sl = None
-            risk_info = (
-                f"\n\u2022 Entry Price: {entry_price:.6g}"
-                f"\n\u2022 Entry ATR: {entry_atr:.6g}"
-                f"\n\u2022 Stop-Loss: {sl:.6g}" if sl else ""
-            )
-            if peak:
-                risk_info += f"\n\u2022 Peak Price: {peak:.6g}"
-            partial_taken_flag = symbol_partial_taken.get(symbol, False)
-            stage2_active_flag = symbol_stage2_active.get(symbol, False)
-            stage2_taken_flag = symbol_stage2_taken.get(symbol, False)
-            sl1_taken_flag = symbol_sl1_taken.get(symbol, False)
-            server_sl = symbol_server_sl_set.get(symbol, False)
-            server_ts = symbol_server_ts_set.get(symbol, False)
-            trail_price = symbol_trail_price.get(symbol)
-            trail2_price = symbol_trail2_price.get(symbol)
-            if stage2_taken_flag:
-                trailing_status = '60% + 30% CLOSED by trail. 10% riding until Exit Rules exit'
-            elif stage2_active_flag and trail2_price:
-                trailing_status = f'Stage 2 ACTIVE - trail on 30% @ {trail2_price:.6g} (1x ATR)'
-            elif partial_taken_flag:
-                trailing_status = f'60% CLOSED by trail. Placing 30% trail...'
-            elif trailing and trail_price:
-                trailing_status = f'Stage 1 ACTIVE - trail on 60% @ {trail_price:.6g} (1x ATR)'
-            elif trailing:
-                trailing_status = 'Stage 1 ACTIVE (placing trail order...)'
-            else:
-                trailing_status = 'Not yet'
-            risk_info += f"\n\u2022 Trailing Stop: {trailing_status}"
-            # SL status
-            if sl1_taken_flag:
-                sl_status = f'Tier 1 HIT (50% closed at 0.5x ATR). Tier 2 at 1x ATR protects remaining 50%'
-            else:
-                sl_status = f"Tier 1: {'SET' if symbol_sl1_order_id.get(symbol) else 'Not set'} (50% @ 0.5x ATR) | Tier 2: {'SET' if server_sl else 'Not set'} (50% @ 1x ATR)"
-            risk_info += f"\n\u2022 Stop-Loss: {sl_status}"
-            risk_info += f"\n\u2022 Server-Side SL: {'SET' if server_sl else 'Not set'}"
-            risk_info += f"\n\u2022 Server-Side TS: {'SET' if server_ts else 'Not set'}"
-            # MACD partial exit status
-            macd_partial_flag = symbol_macd_partial_closed.get(symbol, False)
-            macd_partial_qty_val = symbol_macd_partial_qty.get(symbol)
-            if macd_partial_flag and macd_partial_qty_val:
-                risk_info += f"\n\u2022 MACD Partial: 60% CLOSED ({macd_partial_qty_val} qty) — waiting for re-cross to add back"
-            else:
-                risk_info += "\n\u2022 MACD Partial: Not triggered"
+                # Decrement cooldown on new candle
+                if new_candle and symbol_cooldown.get(symbol, 0) > 0:
+                    symbol_cooldown[symbol] = symbol_cooldown.get(symbol, 0) - 1
 
-        report_msg = (
-            f"Still monitoring {symbol}\n"
-            f"\u2022 Entry: 4-layer filter (ADX>{ADX_THRESHOLD}, EMA (30m), RSI, MACD 45m Line/Signal)\n"
-            f"\u2022 Exit: Long exits when Price < 20 EMA (30m) AND MACD < Signal (45m) | Short exits when Price > 20 EMA (30m) AND MACD > Signal (45m)\n"
-            f"\u2022 Reverse: Only if ADX > {ADX_REVERSAL_THRESHOLD} + EMA (30m) + MACD alignment (45m), else FLAT\n"
-            f"\u2022 SL: 50% at {SL_STAGE1_ATR_MULT}x ATR + 50% at {STOP_LOSS_ATR_MULT}x ATR (server SL always active)\n"
-            f"\u2022 MACD Partial: Close 60% on adverse MACD cross, add back on re-cross\n"
-            f"\u2022 Trail: 60% at {TRAILING_ACTIVATE_ATR}x ATR, then 30% at 1x ATR, 10% rides\n"
-            f"\u2022 WebSocket prices + polling every {POLL_INTERVAL_SECONDS}s\n"
-            f"\u2022 20 EMA (30m): {ema_20:.6g} | +DI: {plus_di:.2f} | -DI: {minus_di:.2f} | ADX: {adx:.2f}\n"
-            f"\u2022 RSI: {rsi:.2f} | MACD 45m: {macd_line_45m:.6g} / Signal 45m: {signal_line_45m:.6g}\n"
-            f"\u2022 MACD Hist (30m): {macd_histogram:.6g} (prev: {prev_macd_histogram:.6g})\n"
-            f"\u2022 Last Close: {last_close} | Current Price: {current_price}\n"
-            f"\u2022 {symbol} state: {current_market_state}\n"
-            f"\u2022 {trade_status}"
-            f"{risk_info}"
-        )
-        if symbol in symbol_manual_quantities and symbol_manual_quantities[symbol] is not None:
-            report_msg += f"\n\u2022 Manual Quantity: {symbol_manual_quantities[symbol]}"
-        else:
-            report_msg += "\n\u2022 Auto-sizing: 20% Balance"
+                # Skip if in cooldown
+                if symbol_cooldown.get(symbol, 0) > 0:
+                    await asyncio.sleep(POLL_INTERVAL_SECONDS)
+                    continue
 
-        await context.bot.send_message(chat_id=chat_id, text=report_msg)
-        context.job.data["last_report_time"] = current_time
+                # Equity curve management: check drawdown
+                try:
+                    balance_resp = await asyncio.to_thread(
+                        bybit_session.get_wallet_balance,
+                        accountType="UNIFIED",
+                        coin="USDT",
+                    )
+                    coins = balance_resp["result"]["list"][0].get("coin", [])
+                    equity = 0.0
+                    for c in coins:
+                        if c["coin"] == "USDT":
+                            equity = float(c.get("equity", c.get("walletBalance", 0)))
+                            break
+                except Exception:
+                    equity = 0.0
 
+                peak_eq = symbol_peak_equity.get(symbol, equity)
+                if equity > peak_eq:
+                    peak_eq = equity
+                    symbol_peak_equity[symbol] = peak_eq
+
+                dd_pct = ((peak_eq - equity) / peak_eq * 100) if peak_eq > 0 else 0
+
+                # Drawdown-based position sizing
+                if dd_pct >= params["dd_pause"]:
+                    # Too much drawdown, pause trading
+                    await asyncio.sleep(POLL_INTERVAL_SECONDS)
+                    continue
+
+                size_mult = 1.0
+                if dd_pct >= params["dd_small"]:
+                    size_mult = params["size_small"]
+                elif dd_pct >= params["dd_reduce"]:
+                    size_mult = params["size_reduced"]
+
+                # Win streak bonus
+                wins = symbol_consecutive_wins.get(symbol, 0)
+                if wins >= 3:
+                    size_mult += params["win_streak_bonus"]
+                    size_mult = min(size_mult, 1.5)  # cap at 150%
+
+                # Compute entry signals
+                long_sig, short_sig, strategy = compute_entry_signals(ind, htf, params)
+
+                # Determine entry side
+                entry_side = None
+                sig_count = 0
+
+                # ADX-adaptive threshold
+                adx_strong = params.get("adx_strong", 28)
+                adx_vstrong = params.get("adx_vstrong", 42)
+                if adx >= adx_vstrong:
+                    threshold = params["sig_vstrong"]
+                elif adx >= adx_strong:
+                    threshold = params["sig_strong"]
+                else:
+                    threshold = params["sig_threshold"]
+
+                if long_sig >= threshold and long_sig > short_sig:
+                    entry_side = "Buy"
+                    sig_count = long_sig
+                elif short_sig >= threshold and short_sig > long_sig:
+                    entry_side = "Sell"
+                    sig_count = short_sig
+
+                if entry_side:
+                    # Calculate quantity with size multiplier
+                    manual_qty = symbol_manual_quantities.get(symbol)
+                    if manual_qty and size_mult != 1.0:
+                        adjusted_qty = manual_qty * size_mult
+                        # Mean reversion uses smaller size
+                        if strategy == "C:MeanRev":
+                            adjusted_qty *= params.get("mr_size", 0.6)
+                    elif manual_qty:
+                        adjusted_qty = manual_qty
+                        if strategy == "C:MeanRev":
+                            adjusted_qty *= params.get("mr_size", 0.6)
+                    else:
+                        adjusted_qty = None  # Will use wallet-based sizing
+
+                    success = await place_trade(symbol, entry_side, bot, manual_qty=adjusted_qty)
+
+                    if success:
+                        entry_p = get_position_entry_price(symbol) or price
+                        pos_size = get_position_size(symbol) or 0
+
+                        # Store swing levels before setting risk state
+                        symbol_lowest_since_entry[symbol] = ind["swing_low"] or price
+                        symbol_highest_since_entry[symbol] = ind["swing_high"] or price
+
+                        _set_entry_risk_state(symbol, entry_p, atr, entry_side, pos_size, params)
+                        symbol_open_trade_side[symbol] = entry_side
+                        symbol_trends[symbol] = "LONG" if entry_side == "Buy" else "SHORT"
+
+                        # Set server-side stop-loss
+                        set_server_stop_loss(symbol, entry_side, symbol_sl_price.get(symbol, 0))
+
+                        # Compute TP levels for display
+                        tp0_price = entry_p + atr * params["tp0_atr"] if entry_side == "Buy" else entry_p - atr * params["tp0_atr"]
+                        tp1_price = entry_p + atr * params["tp1_atr"] if entry_side == "Buy" else entry_p - atr * params["tp1_atr"]
+                        tp2_price = entry_p + atr * params["tp2_atr"] if entry_side == "Buy" else entry_p - atr * params["tp2_atr"]
+                        tp3_price = entry_p + atr * params["tp3_atr"] if entry_side == "Buy" else entry_p - atr * params["tp3_atr"]
+
+                        direction = "\U0001f7e2 LONG" if entry_side == "Buy" else "\U0001f534 SHORT"
+                        await bot.send_message(
+                            chat_id=CHAT_ID,
+                            text=(
+                                f"{direction} <b>{symbol}</b> \u2014 {strategy}\n"
+                                f"Entry: {entry_p:.6g} | Signals: {sig_count}\n"
+                                f"SL: {symbol_sl_price.get(symbol, 0):.6g}\n"
+                                f"TP0: {tp0_price:.6g} ({params['tp0_pct']*100:.0f}%)\n"
+                                f"TP1: {tp1_price:.6g} ({params['tp1_pct']*100:.0f}%)\n"
+                                f"TP2: {tp2_price:.6g} ({params['tp2_pct']*100:.0f}%)\n"
+                                f"TP3: {tp3_price:.6g} ({params['tp3_pct']*100:.0f}%)\n"
+                                f"ATR: {atr:.6g} ({atr_pct:.2f}%) | ADX: {adx:.1f}\n"
+                                f"Trend: {ind['trend_score']} | HTF 1H: {htf.get('htf_1h_trend', 0)} | 4H: {htf.get('htf_4h_trend', 0)}\n"
+                                f"Size mult: {size_mult:.2f}"
+                            ),
+                            parse_mode="HTML",
+                        )
+                        save_state()
+
+            # ──────────────────────────────────
+            #  4. Periodic Status Report (every 30 min)
+            # ──────────────────────────────────
+            now = time.time()
+            if now - last_status_time >= STATUS_INTERVAL:
+                last_status_time = now
+                current_side = symbol_open_trade_side.get(symbol)
+                if current_side:
+                    entry_p = symbol_entry_price.get(symbol, 0) or 0
+                    pnl = ((price - entry_p) / entry_p * 100) if current_side == "Buy" else ((entry_p - price) / entry_p * 100) if entry_p else 0
+                    entry_atr_val = symbol_entry_atr.get(symbol) or atr
+                    unreal_atr = ((price - entry_p) / entry_atr_val) if current_side == "Buy" else ((entry_p - price) / entry_atr_val) if entry_atr_val else 0
+
+                    tp_status = []
+                    if symbol_tp0_hit.get(symbol): tp_status.append("TP0\u2713")
+                    if symbol_tp1_hit.get(symbol): tp_status.append("TP1\u2713")
+                    if symbol_tp2_hit.get(symbol): tp_status.append("TP2\u2713")
+                    if symbol_tp3_hit.get(symbol): tp_status.append("TP3\u2713")
+                    tp_str = " ".join(tp_status) if tp_status else "None hit"
+
+                    remaining = symbol_position_size_pct.get(symbol, 1.0)
+
+                    await bot.send_message(
+                        chat_id=CHAT_ID,
+                        text=(
+                            f"\U0001f4ca <b>{symbol}</b> STATUS\n"
+                            f"Side: {current_side} | PnL: {pnl:+.2f}% ({unreal_atr:+.2f}x ATR)\n"
+                            f"Entry: {entry_p:.6g} | Now: {price:.6g}\n"
+                            f"SL: {symbol_sl_price.get(symbol, 0):.6g} | Trail: {symbol_trailing_sl.get(symbol, 0):.6g}\n"
+                            f"TP: {tp_str} | Remaining: {remaining*100:.0f}%\n"
+                            f"Bars: {symbol_bars_in_trade.get(symbol, 0)} | ADX: {adx:.1f}\n"
+                            f"Trend: {ind['trend_score']} | RSI: {ind['rsi']:.1f}"
+                        ),
+                        parse_mode="HTML",
+                    )
+                else:
+                    cooldown_left = symbol_cooldown.get(symbol, 0)
+                    cd_str = f" | Cooldown: {cooldown_left} bars" if cooldown_left > 0 else ""
+                    await bot.send_message(
+                        chat_id=CHAT_ID,
+                        text=(
+                            f"\U0001f4ca <b>{symbol}</b> WATCHING (no position)\n"
+                            f"Price: {price:.6g} | ATR: {atr:.6g} ({atr_pct:.2f}%)\n"
+                            f"ADX: {adx:.1f} | RSI: {ind['rsi']:.1f} | Trend: {ind['trend_score']}\n"
+                            f"HTF 1H: {htf.get('htf_1h_trend', 0)} | 4H: {htf.get('htf_4h_trend', 0)}{cd_str}\n"
+                            f"Losses: {symbol_consecutive_losses.get(symbol, 0)} | Wins: {symbol_consecutive_wins.get(symbol, 0)}"
+                        ),
+                        parse_mode="HTML",
+                    )
+
+        except Exception as e:
+            print(f"[{symbol}] Monitor error: {e}")
+            import traceback
+            traceback.print_exc()
+
+        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+
+
+# ────────────────────────────────────────────────
+#  Telegram Commands: add_symbol, remove_symbol, start
+# ────────────────────────────────────────────────
 
 async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Privacy: only the owner can use this bot
+    """Add a symbol to monitor. Usage: /add_symbol BTCUSDT [optional_qty]"""
     if update.effective_chat.id != CHAT_ID:
-        await update.message.reply_text("\u26d4 Unauthorized. This bot is private.")
-        return
-    if not context.args:
-        await update.message.reply_text(
-            "Usage:\n"
-            "/add_symbol <symbol> (Auto-size 20% balance)\n"
-            "/add_symbol <symbol> <quantity> (Manual quantity + INSTANT TRADE)"
-        )
+        await update.message.reply_text("Unauthorized.")
         return
 
-    symbol = context.args[0].upper()
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /add_symbol SYMBOL [qty]\nExample: /add_symbol BTCUSDT 0.5")
+        return
+
+    symbol = args[0].upper()
     manual_qty = None
-
-    if len(context.args) >= 2:
+    if len(args) > 1:
         try:
-            manual_qty = float(context.args[1])
-            if manual_qty <= 0:
-                await update.message.reply_text("Quantity must be greater than 0.")
-                return
+            manual_qty = float(args[1])
         except ValueError:
-            await update.message.reply_text("Quantity must be a valid number.")
+            await update.message.reply_text(f"Invalid quantity: {args[1]}")
             return
 
-    # Store settings
-    symbol_manual_quantities[symbol] = manual_qty
-    symbol_trends[symbol] = None
-    _clear_risk_state(symbol)
-    if symbol not in monitored_symbols:
-        monitored_symbols.append(symbol)
-    save_state()
+    if symbol in monitored_symbols:
+        await update.message.reply_text(f"{symbol} is already being monitored.")
+        return
 
-    # Subscribe to WebSocket ticker for real-time price feeds
+    # Validate symbol exists on Bybit
+    constraints = get_instrument_constraints(symbol)
+    if not constraints:
+        await update.message.reply_text(f"Could not find {symbol} on Bybit. Check the symbol name.")
+        return
+
+    # Initialize state
+    monitored_symbols.append(symbol)
+    symbol_trends[symbol] = None
+    symbol_open_trade_side[symbol] = None
+    symbol_manual_quantities[symbol] = manual_qty
+    _clear_risk_state(symbol)
+    symbol_cooldown[symbol] = 0
+    symbol_consecutive_losses[symbol] = 0
+    symbol_consecutive_wins[symbol] = 0
+    symbol_peak_equity[symbol] = 0.0
+
+    # Subscribe to WebSocket
     subscribe_ws_symbol(symbol)
 
-    chat_id = update.effective_chat.id
+    # Check for existing position
+    existing_side = get_open_position_side(symbol)
+    if existing_side:
+        entry_price = get_position_entry_price(symbol)
+        params = get_symbol_params(symbol)
+        ind = await get_all_indicators(symbol)
+        atr_val = ind["atr"] if ind else 1.0
+        if entry_price:
+            _set_entry_risk_state(symbol, entry_price, atr_val, existing_side, 0, params)
+        symbol_open_trade_side[symbol] = existing_side
+        symbol_trends[symbol] = "LONG" if existing_side == "Buy" else "SHORT"
 
-    # Handle instant trade for manual quantity
-    if manual_qty:
-        await update.message.reply_text(f"\U0001f680 INSTANT TRADE for {symbol} with quantity {manual_qty}...")
+    save_state()
 
-        indicators = await get_all_indicators(symbol)
-        macd_45m_data = await get_macd_45min(symbol)
-        if indicators and indicators["current_price"] and macd_45m_data:
-            last_close = indicators["last_close"]
-            ema_20 = indicators["ema_20"]
-            plus_di = indicators["plus_di"]
-            minus_di = indicators["minus_di"]
-            adx = indicators["adx"]
-            atr = indicators["atr"]
-
-            adx_prev2 = indicators["adx_prev2"]
-            rsi = indicators["rsi"]
-            macd_line = indicators["macd_line"]
-            signal_line = indicators["signal_line"]
-            macd_histogram = indicators["macd_histogram"]
-            prev_macd_histogram = indicators["prev_macd_histogram"]
-            macd_hist_dying_long = indicators["macd_hist_dying_long"]
-            macd_hist_dying_short = indicators["macd_hist_dying_short"]
-
-            # 45-min MACD for entry filter
-            macd_line_45m = macd_45m_data["macd_line_45m"]
-            signal_line_45m = macd_45m_data["signal_line_45m"]
-
-            # 4-layer entry filter for instant trade
-            entry_blocked = False
-            block_reason = ""
-
-            # Filter 1: ADX threshold
-            if adx < ADX_THRESHOLD:
-                entry_blocked = True
-                block_reason = f"ADX ({adx:.2f}) < {ADX_THRESHOLD} — market is sideways"
-
-            if entry_blocked:
-                await update.message.reply_text(
-                    f"\u26a0\ufe0f Instant trade blocked for {symbol}: {block_reason}\n"
-                    f"Monitoring will wait for proper conditions."
-                )
-            else:
-                # Require EMA + RSI + MACD (45m) filters
-                side = None
-                if last_close > ema_20:
-                    if rsi > RSI_OVERBOUGHT:
-                        entry_blocked = True
-                        block_reason = f"RSI overbought ({rsi:.2f} > {RSI_OVERBOUGHT})"
-                    elif macd_line_45m <= signal_line_45m:
-                        entry_blocked = True
-                        block_reason = f"MACD Line 45m ({macd_line_45m:.6g}) <= Signal Line 45m ({signal_line_45m:.6g})"
-                    else:
-                        side = "Buy"
-                elif last_close < ema_20:
-                    if rsi < RSI_OVERSOLD:
-                        entry_blocked = True
-                        block_reason = f"RSI oversold ({rsi:.2f} < {RSI_OVERSOLD})"
-                    elif macd_line_45m >= signal_line_45m:
-                        entry_blocked = True
-                        block_reason = f"MACD Line 45m ({macd_line_45m:.6g}) >= Signal Line 45m ({signal_line_45m:.6g})"
-                    else:
-                        side = "Sell"
-
-                if entry_blocked:
-                    await update.message.reply_text(
-                        f"\u26a0\ufe0f Instant trade blocked for {symbol}: {block_reason}\n"
-                        f"Monitoring will wait for proper conditions."
-                    )
-                elif side is None:
-                    await update.message.reply_text(
-                        f"\u26a0\ufe0f No aligned signal for {symbol}.\n"
-                        f"Last Close: {last_close} | EMA: {ema_20:.6g}\n"
-                        f"MACD 45m: {macd_line_45m:.6g} / Signal 45m: {signal_line_45m:.6g} | ADX: {adx:.2f}\n"
-                        f"Need: Price > EMA + MACD > Signal (45m) for Long, or Price < EMA + MACD < Signal (45m) for Short.\n"
-                        f"Monitoring will wait for proper alignment."
-                    )
-                else:
-                    side_text = "Long (Buy)" if side == "Buy" else "Short (Sell)"
-
-                    await update.message.reply_text(
-                        f"\U0001f4ca {symbol}: Last Close={last_close} | 20 EMA={ema_20:.6g}\n"
-                        f"+DI: {plus_di:.2f} | -DI: {minus_di:.2f} | ADX: {adx:.2f}\n"
-                        f"MACD 45m: {macd_line_45m:.6g} / Signal 45m: {signal_line_45m:.6g} | Hist (30m): {macd_histogram:.6g}\n"
-                        f"Direction: {side_text}"
-                    )
-
-                    result = await place_trade(symbol, side=side, manual_qty_override=manual_qty)
-
-                    if result and "error" not in result:
-                        order_id = result.get("orderId", "\u2014")
-                        # Get actual fill price from Bybit (not candle close)
-                        await asyncio.sleep(1)
-                        real_entry = await get_position_entry_price(symbol)
-                        fill_price = real_entry if real_entry else last_close
-                        _set_entry_risk_state(symbol, fill_price, atr)
-                        # Set server-side stop-loss based on actual fill price
-                        if side == "Buy":
-                            sl_price = fill_price - (STOP_LOSS_ATR_MULT * atr)
-                        else:
-                            sl_price = fill_price + (STOP_LOSS_ATR_MULT * atr)
-                        await set_server_stop_loss(symbol, side, sl_price)
-                        await update.message.reply_text(
-                            f"\u2705 Instant {side_text} order(s) placed for {symbol}\n"
-                            f"Last Order ID: <code>{order_id}</code>\n"
-                            f"Fill Price: {fill_price:.6g}\n"
-                            f"Server-side SL: {sl_price:.6g} ({STOP_LOSS_ATR_MULT}x ATR)\n"
-                            f"Bybit will execute SL instantly at exact price.",
-                            parse_mode="HTML"
-                        )
-                        symbol_trends[symbol] = "upward" if side == "Buy" else "downward"
-                    elif result and "error" in result:
-                        await update.message.reply_text(f"\u274c Failed to place instant {side_text} for {symbol}: {result['error']}")
-        else:
-            await update.message.reply_text(f"\u26a0\ufe0f Could not fetch indicators for {symbol}. Monitoring will take over.\n(Requires both 30m indicators and 45m MACD data)")
-
-    qty_info = f"Manual Quantity: {manual_qty} (Instant Trade Attempted)" if manual_qty else "Auto-sizing: 20% of available USDT balance"
+    params = get_symbol_params(symbol)
+    has_overrides = symbol in COIN_OVERRIDES
+    override_str = " (custom params)" if has_overrides else " (default params)"
 
     await update.message.reply_text(
-        f"Monitoring {symbol}!\n"
-        f"\u2022 {qty_info}\n"
-        f"\u2022 Entry filters: ADX > {ADX_THRESHOLD} + EMA (30m) + RSI + MACD Line/Signal (45m)\n"
-        f"\u2022 Exit: Long exits when Price < 20 EMA (30m) AND MACD < Signal (45m) | Short exits when Price > 20 EMA (30m) AND MACD > Signal (45m)\n"
-        f"\u2022 Reverse only if ADX > {ADX_REVERSAL_THRESHOLD} + EMA (30m) + MACD alignment (45m), else FLAT\n"
-        f"\u2022 SL: 50% at {SL_STAGE1_ATR_MULT}x ATR + 50% at {STOP_LOSS_ATR_MULT}x ATR (server-side SL always active)\n"
-        f"\u2022 MACD Partial: Close 60% on adverse MACD cross, add back on favorable re-cross\n"
-        f"\u2022 Trail: 60% at {TRAILING_ACTIVATE_ATR}x ATR profit ({TRAILING_STOP_ATR}x ATR dist), then 30% ({TRAILING_STOP_ATR_STAGE2}x ATR dist), 10% rides until Exit Rules exit\n"
-        f"\u2022 WebSocket real-time price feeds + polling every {POLL_INTERVAL_SECONDS}s\n"
-        f"\u2022 State persistence: crash recovery via {STATE_FILE}\n"
-        f"\u2022 Status report every 30 minutes"
+        f"\u2705 <b>{symbol}</b> added to monitoring{override_str}\n"
+        f"Qty: {'Auto (95% wallet)' if manual_qty is None else f'{manual_qty}'}\n"
+        f"{'Existing ' + existing_side + ' position detected!' if existing_side else 'No existing position'}\n\n"
+        f"Strategy: v29 (4 strategies)\n"
+        f"\u2022 A: Trend Following (multi-signal scoring)\n"
+        f"\u2022 B: BB Squeeze Breakout\n"
+        f"\u2022 C: Mean Reversion\n"
+        f"\u2022 D: EMA Crossover + Volume Surge\n\n"
+        f"Risk Management:\n"
+        f"\u2022 SL: {params['sl_atr']:.1f}x ATR (max {params['max_loss']:.1f}%)\n"
+        f"\u2022 Trail: {params['trail_atr']:.1f}x ATR (ADX-adaptive)\n"
+        f"\u2022 TP0: {params['tp0_atr']:.1f}x ATR ({params['tp0_pct']*100:.0f}%)\n"
+        f"\u2022 TP1: {params['tp1_atr']:.1f}x ATR ({params['tp1_pct']*100:.0f}%)\n"
+        f"\u2022 TP2: {params['tp2_atr']:.1f}x ATR ({params['tp2_pct']*100:.0f}%)\n"
+        f"\u2022 TP3: {params['tp3_atr']:.1f}x ATR ({params['tp3_pct']*100:.0f}%)\n"
+        f"\u2022 Cooldown: {params['cooldown_bars']} bars (loss: {params['cooldown_loss']})\n"
+        f"\u2022 DD pause: {params['dd_pause']:.0f}%",
+        parse_mode="HTML",
     )
 
-    if context.job_queue:
-        existing_jobs = context.job_queue.get_jobs_by_name(f"{symbol}_monitor")
-        if not existing_jobs:
-            context.job_queue.run_repeating(
-                callback=monitor_symbol,
-                interval=POLL_INTERVAL_SECONDS,
-                first=POLL_INTERVAL_SECONDS,
-                chat_id=chat_id,
-                name=f"{symbol}_monitor",
-                data={"symbol": symbol, "last_report_time": time.time()},
-            )
+    # Start monitoring loop
+    asyncio.create_task(monitor_symbol(symbol, context.bot))
 
 async def remove_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Privacy: only the owner can use this bot
+    """Remove a symbol from monitoring. Usage: /remove_symbol BTCUSDT"""
     if update.effective_chat.id != CHAT_ID:
-        await update.message.reply_text("\u26d4 Unauthorized. This bot is private.")
-        return
-    if not context.args:
-        await update.message.reply_text("Usage: /remove_symbol <symbol>")
+        await update.message.reply_text("Unauthorized.")
         return
 
-    symbol = context.args[0].upper()
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /remove_symbol SYMBOL")
+        return
+
+    symbol = args[0].upper()
     if symbol not in monitored_symbols:
         await update.message.reply_text(f"{symbol} is not being monitored.")
         return
 
-    monitored_symbols.remove(symbol)
-    if symbol in symbol_trends:
-        del symbol_trends[symbol]
-    if symbol in symbol_manual_quantities:
-        del symbol_manual_quantities[symbol]
-    if symbol in symbol_last_di_cross_candle:
-        del symbol_last_di_cross_candle[symbol]
-    # Cancel any server-side stops before removing
-    await cancel_server_stops(symbol)
-    # Clean up risk management state
-    for state_dict in [symbol_entry_price, symbol_entry_atr, symbol_peak_price, symbol_trailing_active,
-                        symbol_partial_taken, symbol_server_sl_set, symbol_server_ts_set,
-                        symbol_trail_order_id, symbol_trail_qty, symbol_trail_price,
-                        symbol_stage2_active, symbol_stage2_taken, symbol_trail2_order_id,
-                        symbol_trail2_qty, symbol_trail2_price, symbol_peak_stage2,
-                        symbol_sl1_order_id, symbol_sl1_qty, symbol_sl1_taken, symbol_original_qty,
-                        symbol_macd_partial_closed, symbol_macd_partial_qty,
-                        symbol_macd_last_action_candle]:
-        if symbol in state_dict:
-            del state_dict[symbol]
+    # Check for open position
+    current_side = symbol_open_trade_side.get(symbol)
+    if current_side:
+        await close_position(symbol, current_side)
+        cancel_all_symbol_orders(symbol)
 
-    if context.job_queue:
-        jobs = context.job_queue.get_jobs_by_name(f"{symbol}_monitor")
-        for job in jobs:
-            job.schedule_removal()
+    monitored_symbols.remove(symbol)
+    _clear_risk_state(symbol)
+    symbol_open_trade_side.pop(symbol, None)
+    symbol_trends.pop(symbol, None)
+    symbol_manual_quantities.pop(symbol, None)
+    symbol_cooldown.pop(symbol, None)
+    symbol_consecutive_losses.pop(symbol, None)
+    symbol_consecutive_wins.pop(symbol, None)
+    symbol_peak_equity.pop(symbol, None)
+    symbol_bars_in_trade.pop(symbol, None)
+    symbol_last_candle_ts.pop(symbol, None)
 
     save_state()
-    await update.message.reply_text(f"Stopped monitoring {symbol}.")
+
+    closed_msg = f" Position closed ({current_side})." if current_side else ""
+    await update.message.reply_text(f"\u274c <b>{symbol}</b> removed from monitoring.{closed_msg}", parse_mode="HTML")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Privacy: only the owner can use this bot
     if update.effective_chat.id != CHAT_ID:
-        await update.message.reply_text("\u26d4 Unauthorized. This bot is private.")
+        await update.message.reply_text("Unauthorized.")
         return
+
+    active = ", ".join(monitored_symbols) if monitored_symbols else "None"
     await update.message.reply_text(
-        "Bot ready! (v14 - 4-Layer Filter + 45m MACD Entry/Exit/Reversal + 10-min MACD Partial Exit + WebSocket)\n\n"
+        f"\U0001f916 <b>Trading Bot v14 (v29 Strategy)</b>\n\n"
+        f"Active symbols: {active}\n\n"
         "Commands:\n"
-        "1. /start - Display this message\n"
-        "2. /add_symbol <symbol> - Start monitoring with auto-sizing (20% balance)\n"
-        "3. /add_symbol <symbol> <quantity> - INSTANT TRADE + Manual quantity monitoring\n"
-        "4. /remove_symbol <symbol> - Stop monitoring a symbol\n\n"
-        "Entry Filters (ALL must pass):\n"
-        f"\u2022 1. ADX > {ADX_THRESHOLD}\n"
-        "\u2022 2. Long: Price > 20 EMA (30m) | Short: Price < 20 EMA (30m)\n"
-        f"\u2022 3. RSI NOT extreme (not > {RSI_OVERBOUGHT} for longs, not < {RSI_OVERSOLD} for shorts)\n"
-        "\u2022 4. Long: MACD Line > Signal Line (45m) | Short: MACD Line < Signal Line (45m)\n\n"
-        "Partial Exit Rules (MACD-based, 10-min closed-candle confirmation):\n"
-        "\u2022 Long: If MACD crosses below Signal on a CLOSED 10-min candle \u2192 close 60%\n"
-        "\u2022 If MACD crosses back above Signal on a CLOSED 10-min candle \u2192 add back 60%\n"
-        "\u2022 Short: If MACD crosses above Signal on a CLOSED 10-min candle \u2192 close 60%\n"
-        "\u2022 If MACD crosses back below Signal on a CLOSED 10-min candle \u2192 add back 60%\n"
-        "\u2022 Prevents whipsaw: only acts on confirmed crossovers, not intra-candle noise\n\n"
-        "Stop-Loss (Tiered):\n"
-        f"\u2022 Tier 1: 50% closed INSTANTLY at {SL_STAGE1_ATR_MULT}x ATR loss\n"
-        f"\u2022 Tier 2: Remaining 50% closed at {STOP_LOSS_ATR_MULT}x ATR loss (server-side, always active)\n\n"
-        "Trailing Stop (Multi-Stage):\n"
-        f"\u2022 At {TRAILING_ACTIVATE_ATR}x ATR profit: Stage 1 trail activates on {TRAILING_CLOSE_PCT*100:.0f}%\n"
-        f"\u2022 Stage 1 trail: {TRAILING_STOP_ATR}x ATR distance. Bybit closes {TRAILING_CLOSE_PCT*100:.0f}% INSTANTLY when hit\n"
-        f"\u2022 Stage 2 trail: After 60% closed, 30% gets trail ({TRAILING_STOP_ATR_STAGE2}x ATR distance)\n"
-        f"\u2022 Stage 2 trail will never be placed below entry price (long) or above entry price (short)\n"
-        f"\u2022 Remaining 10% protected by server-side SL + Exit Rules\n\n"
-        "Exit Rules:\n"
-        "\u2022 Long exits: Price < 20 EMA (30m) AND MACD Line < Signal Line (45m)\n"
-        "\u2022 Short exits: Price > 20 EMA (30m) AND MACD Line > Signal Line (45m)\n\n"
-        "Reversal Rules:\n"
-        f"\u2022 ADX > {ADX_REVERSAL_THRESHOLD}\n"
-        "\u2022 Long reversal: Price > 20 EMA (30m) + MACD > Signal (45m)\n"
-        "\u2022 Short reversal: Price < 20 EMA (30m) + MACD < Signal (45m)\n"
-        "\u2022 If conditions not met, bot goes FLAT\n\n"
+        "\u2022 /add_symbol SYMBOL [qty] \u2014 Start monitoring\n"
+        "\u2022 /remove_symbol SYMBOL \u2014 Stop monitoring\n\n"
+        "Strategy: BybitStrategyBacktester v29\n"
+        "\u2022 4 entry strategies (Trend, BB Squeeze, Mean Rev, EMA Cross)\n"
+        "\u2022 Multi-signal scoring with ADX-adaptive thresholds\n"
+        "\u2022 Signal-based exits (bearish/bullish count >= 3)\n"
+        "\u2022 ATR-adaptive trailing stops\n"
+        "\u2022 4-level take-profit (TP0-TP3)\n"
+        "\u2022 Equity curve management (drawdown-based sizing)\n"
+        "\u2022 Cooldown system after losses\n"
+        "\u2022 Higher timeframe confirmation (1H + 4H)\n\n"
         "Infrastructure:\n"
         "\u2022 WebSocket real-time price feeds (REST fallback)\n"
         f"\u2022 State persistence: {STATE_FILE} (crash recovery)\n"
@@ -2700,7 +1901,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "\u2022 Bot is PRIVATE \u2014 only accessible by owner\n\n"
         "Examples:\n"
         "\u2022 /add_symbol BTCUSDT\n"
-        "\u2022 /add_symbol ETHUSDT 0.5"
+        "\u2022 /add_symbol ETHUSDT 0.5",
+        parse_mode="HTML",
     )
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2754,6 +1956,11 @@ async def main():
 
     await application.initialize()
     await application.start()
+
+    # Resume monitoring for all loaded symbols
+    for sym in monitored_symbols:
+        asyncio.create_task(monitor_symbol(sym, application.bot))
+    print(f"[STARTUP] Started monitoring {len(monitored_symbols)} symbols")
 
     async def health(request):
         return web.Response(text="OK")
