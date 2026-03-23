@@ -157,7 +157,7 @@ DEFAULT_PARAMS = {
     "tp2_pct": 0.20,
     "tp3_pct": 0.20,
     # Entry thresholds
-    "sig_threshold": 4,
+    "sig_threshold": 5,
     "sig_strong": 4,
     "sig_vstrong": 3,
     # ADX thresholds
@@ -190,7 +190,7 @@ DEFAULT_PARAMS = {
     # Win streak
     "win_streak_bonus": 0.15,
     # Volatility floor
-    "min_atr_pct": 0.08,
+    "min_atr_pct": 0.3,
     # Mean reversion position size
     "mr_size": 0.6,
 }
@@ -600,9 +600,10 @@ async def get_all_indicators(
 async def compute_higher_tf(symbol: str) -> dict:
     """
     Compute higher-timeframe trend signals (1H and 4H).
-    Returns trend direction for each TF based on EMA20/50 + MACD.
+    Matches backtester v29 get_htf_trend: 3 sub-signals (close vs ema20, ema20 vs ema50, macd vs signal).
+    Also computes 4H ADX for regime detection.
     """
-    result = {"htf_1h_trend": 0, "htf_4h_trend": 0}
+    result = {"htf_1h_trend": 0, "htf_4h_trend": 0, "htf_4h_adx": 20.0}
     for interval, key in [("60", "htf_1h_trend"), ("240", "htf_4h_trend")]:
         try:
             resp = await asyncio.to_thread(
@@ -628,18 +629,57 @@ async def compute_higher_tf(symbol: str) -> dict:
             macd_line = df["close"].ewm(span=12, adjust=False).mean() - df["close"].ewm(span=26, adjust=False).mean()
             macd_signal = macd_line.ewm(span=9, adjust=False).mean()
 
-            last = df.iloc[-2]  # Last closed candle
             last_idx = len(df) - 2
+            c = float(df["close"].iloc[last_idx])
+            e20 = float(ema20.iloc[last_idx])
+            e50 = float(ema50.iloc[last_idx])
+            m = float(macd_line.iloc[last_idx])
+            ms = float(macd_signal.iloc[last_idx])
+
+            # 3 sub-signals matching backtester get_htf_trend (range -3 to +3)
             trend = 0
-            if ema20.iloc[last_idx] > ema50.iloc[last_idx]:
+            if c > e20 * 1.001:
                 trend += 1
-            else:
+            elif c < e20 * 0.999:
                 trend -= 1
-            if macd_line.iloc[last_idx] > macd_signal.iloc[last_idx]:
+            if e20 > e50:
                 trend += 1
-            else:
+            elif e20 < e50:
+                trend -= 1
+            if m > ms:
+                trend += 1
+            elif m < ms:
                 trend -= 1
             result[key] = trend
+
+            # Compute 4H ADX for regime detection
+            if interval == "240":
+                try:
+                    tr1 = df["high"] - df["low"]
+                    tr2 = abs(df["high"] - df["close"].shift(1))
+                    tr3 = abs(df["low"] - df["close"].shift(1))
+                    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+                    atr_htf = tr.ewm(alpha=1/14, min_periods=14).mean()
+
+                    plus_dm = df["high"].diff()
+                    minus_dm = -df["low"].diff()
+                    plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0.0)
+                    minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0.0)
+
+                    plus_dm_s = plus_dm.ewm(alpha=1/14, min_periods=14).mean()
+                    minus_dm_s = minus_dm.ewm(alpha=1/14, min_periods=14).mean()
+                    plus_di = (plus_dm_s / atr_htf) * 100
+                    minus_di = (minus_dm_s / atr_htf) * 100
+                    di_sum = (plus_di + minus_di).replace(0, float("nan"))
+                    dx = (abs(plus_di - minus_di) / di_sum) * 100
+                    adx_htf = dx.ewm(alpha=1/14, min_periods=14).mean()
+
+                    adx_val = float(adx_htf.iloc[last_idx])
+                    if not pd.isna(adx_val):
+                        result["htf_4h_adx"] = adx_val
+                except Exception:
+                    pass  # Keep default 20.0
+
         except Exception as e:
             print(f"[HTF] Error computing {interval}m for {symbol}: {e}")
     return result
@@ -999,10 +1039,11 @@ async def place_trade(symbol: str, side: str, bot=None, manual_qty: Optional[flo
         return False
 
 
-def compute_entry_signals(ind: dict, htf: dict, params: dict) -> Tuple[int, int, str]:
+def compute_entry_signals(ind: dict, htf: dict, params: dict) -> dict:
     """
-    Compute entry signal counts for long and short based on v29 strategy.
-    Returns (long_signals, short_signals, best_strategy_label).
+    Compute entry signals matching backtester v29 exactly.
+    Returns dict with per-strategy signal info for cascading evaluation in monitor_symbol.
+    Strategies are evaluated A→B→C→D (first match wins, matching backtester's 'continue' logic).
     """
     trend_score = ind["trend_score"]
     adx = ind["adx"]
@@ -1027,6 +1068,7 @@ def compute_entry_signals(ind: dict, htf: dict, params: dict) -> Tuple[int, int,
 
     htf_1h = htf.get("htf_1h_trend", 0)
     htf_4h = htf.get("htf_4h_trend", 0)
+    adx_4h = htf.get("htf_4h_adx", 20.0)
 
     adx_entry = params["adx_entry"]
     rsi_ob = params["rsi_ob"]
@@ -1034,138 +1076,127 @@ def compute_entry_signals(ind: dict, htf: dict, params: dict) -> Tuple[int, int,
     bb_squeeze = params["bb_squeeze"]
     rsi_mr_high = params["rsi_mr_high"]
     rsi_mr_low = params["rsi_mr_low"]
+    adx_4h_regime = params.get("adx_4h_regime", 16)
 
-    long_signals = 0
-    short_signals = 0
-    strategy_a_long = 0
-    strategy_a_short = 0
-    best_strategy = ""
+    regime_trending = adx_4h >= adx_4h_regime
+    vol_ok = vol_ratio >= 0.7
+
+    result = {
+        "side": None,           # "Buy" or "Sell" or None
+        "strategy": "",         # "A:Trend", "B:BBSqueeze", "C:MeanRev", "D:EMACross"
+        "sig_count": 0,         # signal count (for Strategy A)
+        "regime_trending": regime_trending,
+        "vol_ok": vol_ok,
+    }
 
     # ────────────────────────────
-    # Strategy A: Trend Following (multi-signal scoring)
+    # Strategy A: Trend Following (10 signals, matching backtester exactly)
     # ────────────────────────────
-    if adx is not None and adx >= adx_entry:
-        # Signal 1: Trend score
-        if trend_score >= 3: strategy_a_long += 1
-        if trend_score <= -3: strategy_a_short += 1
-
-        # Signal 2: HTF 1H trend
-        if htf_1h >= 1: strategy_a_long += 1
-        if htf_1h <= -1: strategy_a_short += 1
-
-        # Signal 3: HTF 4H trend
-        if htf_4h >= 1: strategy_a_long += 1
-        if htf_4h <= -1: strategy_a_short += 1
-
-        # Signal 4: MACD histogram rising
-        if macd_hist > 0 and macd_hist > macd_hist_prev: strategy_a_long += 1
-        if macd_hist < 0 and macd_hist < macd_hist_prev: strategy_a_short += 1
-
-        # Signal 5: RSI confirming
-        if 40 < rsi < rsi_ob: strategy_a_long += 1
-        if rsi_os < rsi < 60: strategy_a_short += 1
-
-        # Signal 6: VWAP
-        if vwap and price > vwap: strategy_a_long += 1
-        if vwap and price < vwap: strategy_a_short += 1
-
-        # Signal 7: ROC
-        if roc > 0: strategy_a_long += 1
-        if roc < 0: strategy_a_short += 1
-
-        # Signal 8: EMA slope
-        if ema_fast_slope > 0.05: strategy_a_long += 1
-        if ema_fast_slope < -0.05: strategy_a_short += 1
-
-        # Signal 9: Stoch RSI
-        if stoch_k > stoch_d and stoch_k < 80: strategy_a_long += 1
-        if stoch_k < stoch_d and stoch_k > 20: strategy_a_short += 1
-
-        # Signal 10: Volume confirmation
-        if vol_ratio > 1.2: 
-            strategy_a_long += 1
-            strategy_a_short += 1
-
-        # ADX-adaptive thresholds
+    if regime_trending and adx is not None and adx >= adx_entry:
+        # ADX-adaptive threshold
         adx_strong = params.get("adx_strong", 28)
         adx_vstrong = params.get("adx_vstrong", 42)
-        sig_threshold = params["sig_threshold"]
-        sig_strong = params["sig_strong"]
-        sig_vstrong = params["sig_vstrong"]
-
-        if adx >= adx_vstrong:
-            threshold = sig_vstrong
-        elif adx >= adx_strong:
-            threshold = sig_strong
+        if adx > adx_vstrong:
+            threshold = params["sig_vstrong"]
+        elif adx > adx_strong:
+            threshold = params["sig_strong"]
         else:
-            threshold = sig_threshold
+            threshold = params["sig_threshold"]
 
-        if strategy_a_long >= threshold:
-            long_signals = max(long_signals, strategy_a_long)
-            best_strategy = "A:Trend"
-        if strategy_a_short >= threshold:
-            short_signals = max(short_signals, strategy_a_short)
-            best_strategy = "A:Trend"
+        # 10 long signals (matching backtester line 874-885)
+        long_signals = sum([
+            trend_score >= 2,                           # Signal 1: trend alignment
+            htf_4h >= 1,                                # Signal 2: 4H trend
+            htf_1h >= 1,                                # Signal 3: 1H trend
+            macd_hist > 0,                              # Signal 4: MACD positive
+            macd_hist > macd_hist_prev,                  # Signal 5: MACD increasing
+            rsi > 40 and rsi < rsi_ob,                  # Signal 6: RSI healthy
+            (vwap is not None and price > vwap) if vwap else False,  # Signal 7: above VWAP
+            roc > 0,                                    # Signal 8: ROC positive
+            ema_fast_slope > 0,                         # Signal 9: EMA slope up
+            stoch_k > stoch_d and stoch_k < 80,         # Signal 10: Stoch confirming
+        ])
+
+        # Hard filters: vol_ok AND trend_4h >= 1 (matching backtester line 886)
+        if long_signals >= threshold and vol_ok and htf_4h >= 1:
+            result["side"] = "Buy"
+            result["strategy"] = "A:Trend"
+            result["sig_count"] = long_signals
+            return result
+
+        # 10 short signals (matching backtester line 902-913)
+        short_signals = sum([
+            trend_score <= -2,
+            htf_4h <= -1,
+            htf_1h <= -1,
+            macd_hist < 0,
+            macd_hist < macd_hist_prev,
+            rsi < 60 and rsi > rsi_os,
+            (vwap is not None and price < vwap) if vwap else False,
+            roc < 0,
+            ema_fast_slope < 0,
+            stoch_k < stoch_d and stoch_k > 20,
+        ])
+
+        # Hard filters: vol_ok AND trend_4h <= -1 (matching backtester line 914)
+        if short_signals >= threshold and vol_ok and htf_4h <= -1:
+            result["side"] = "Sell"
+            result["strategy"] = "A:Trend"
+            result["sig_count"] = short_signals
+            return result
 
     # ────────────────────────────
-    # Strategy B: BB Squeeze Breakout
+    # Strategy B: BB Squeeze Breakout (matching backtester line 930-951)
+    # Requires: regime_trending, bb_width_min < squeeze, bb_width > squeeze (breakout from squeeze)
     # ────────────────────────────
-    if bb_width is not None and bb_width_min is not None and bb_width_min < bb_squeeze:
-        b_long = 0
-        b_short = 0
-        if bb_upper and price > bb_upper and rsi > 50 and trend_score >= 1:
-            b_long = 5
-        if bb_lower and price < bb_lower and rsi < 50 and trend_score <= -1:
-            b_short = 5
-        if b_long > long_signals:
-            long_signals = b_long
-            best_strategy = "B:BBSqueeze"
-        if b_short > short_signals:
-            short_signals = b_short
-            best_strategy = "B:BBSqueeze"
+    if (regime_trending and bb_width is not None and bb_width_min is not None
+            and bb_width_min < bb_squeeze and bb_width > bb_squeeze):
+        if bb_upper and price > bb_upper and roc > 0 and trend_score >= 1 and htf_4h >= 0:
+            result["side"] = "Buy"
+            result["strategy"] = "B:BBSqueeze"
+            return result
+        elif bb_lower and price < bb_lower and roc < 0 and trend_score <= -1 and htf_4h <= 0:
+            result["side"] = "Sell"
+            result["strategy"] = "B:BBSqueeze"
+            return result
 
     # ────────────────────────────
-    # Strategy C: Mean Reversion
+    # Strategy C: Mean Reversion (matching backtester line 953-970)
+    # Requires: adx < adx_entry, stoch_k < 15 (long) / > 85 (short), trend_4h filter
     # ────────────────────────────
     if adx is not None and adx < adx_entry:
-        c_long = 0
-        c_short = 0
-        if bb_lower and price < bb_lower and rsi < rsi_mr_low and stoch_k < 20:
-            c_long = 5
-        if bb_upper and price > bb_upper and rsi > rsi_mr_high and stoch_k > 80:
-            c_short = 5
-        if c_long > long_signals:
-            long_signals = c_long
-            best_strategy = "C:MeanRev"
-        if c_short > short_signals:
-            short_signals = c_short
-            best_strategy = "C:MeanRev"
+        if bb_lower and price <= bb_lower and rsi < rsi_mr_low and stoch_k < 15 and htf_4h >= 0:
+            result["side"] = "Buy"
+            result["strategy"] = "C:MeanRev"
+            return result
+        elif bb_upper and price >= bb_upper and rsi > rsi_mr_high and stoch_k > 85 and htf_4h <= 0:
+            result["side"] = "Sell"
+            result["strategy"] = "C:MeanRev"
+            return result
 
     # ────────────────────────────
-    # Strategy D: EMA Crossover + Volume Surge
+    # Strategy D: EMA Crossover + Volume Surge (matching backtester line 972-995)
+    # Requires: regime_trending, vol_ratio >= 1.5, EMA crossover, trend_4h filter
     # ────────────────────────────
-    if prev_ema_fast is not None and prev_ema_mid is not None and ema_fast is not None and ema_mid is not None:
-        d_long = 0
-        d_short = 0
-        cross_up = prev_ema_fast <= prev_ema_mid and ema_fast > ema_mid
-        cross_down = prev_ema_fast >= prev_ema_mid and ema_fast < ema_mid
-        if cross_up and vol_ratio > 1.5 and rsi > 45 and trend_score >= 0:
-            d_long = 5
-        if cross_down and vol_ratio > 1.5 and rsi < 55 and trend_score <= 0:
-            d_short = 5
-        if d_long > long_signals:
-            long_signals = d_long
-            best_strategy = "D:EMACross"
-        if d_short > short_signals:
-            short_signals = d_short
-            best_strategy = "D:EMACross"
+    if (regime_trending and vol_ratio >= 1.5
+            and prev_ema_fast is not None and prev_ema_mid is not None
+            and ema_fast is not None and ema_mid is not None):
+        if prev_ema_fast <= prev_ema_mid and ema_fast > ema_mid and rsi > 45 and htf_4h >= 0:
+            result["side"] = "Buy"
+            result["strategy"] = "D:EMACross"
+            return result
+        elif prev_ema_fast >= prev_ema_mid and ema_fast < ema_mid and rsi < 55 and htf_4h <= 0:
+            result["side"] = "Sell"
+            result["strategy"] = "D:EMACross"
+            return result
 
-    return long_signals, short_signals, best_strategy
+    return result
 
 
-def compute_exit_signals(ind: dict, htf: dict, side: str) -> int:
+def compute_exit_signals(ind: dict, htf: dict, side: str, params: dict) -> int:
     """
     Count bearish (for longs) or bullish (for shorts) exit signals.
+    Matches backtester v29 exactly (5 signals, lines 769-794).
     Returns signal count (exit when >= 3).
     """
     trend_score = ind["trend_score"]
@@ -1173,31 +1204,28 @@ def compute_exit_signals(ind: dict, htf: dict, side: str) -> int:
     macd_hist = ind["macd_hist"]
     macd_hist_prev = ind["macd_hist_prev"]
     stoch_k = ind["stoch_rsi_k"]
-    ema_fast = ind["ema_fast"]
-    ema_mid = ind["ema_mid"]
+    ema_slow = ind["ema_slow"]
     price = ind["current_price"]
 
-    htf_1h = htf.get("htf_1h_trend", 0)
+    htf_4h = htf.get("htf_4h_trend", 0)
+    rsi_ob = params["rsi_ob"]
+    rsi_os = params["rsi_os"]
 
     count = 0
     if side == "Buy":
-        # Bearish signals for long exit
+        # 5 bearish signals for long exit (matching backtester line 770-776)
         if trend_score <= -2: count += 1
-        if rsi > 75: count += 1
         if macd_hist < 0 and macd_hist < macd_hist_prev: count += 1
-        if stoch_k > 80 and stoch_k < (ind["stoch_rsi_d"] or 50): count += 1
-        if ema_fast and ema_mid and ema_fast < ema_mid: count += 1
-        if htf_1h <= -1: count += 1
-        if ema_fast and price < ema_fast: count += 1
+        if ema_slow is not None and price < ema_slow: count += 1
+        if htf_4h <= -2: count += 1
+        if rsi > rsi_ob and stoch_k > 80: count += 1
     else:
-        # Bullish signals for short exit
+        # 5 bullish signals for short exit (matching backtester line 783-789)
         if trend_score >= 2: count += 1
-        if rsi < 25: count += 1
         if macd_hist > 0 and macd_hist > macd_hist_prev: count += 1
-        if stoch_k < 20 and stoch_k > (ind["stoch_rsi_d"] or 50): count += 1
-        if ema_fast and ema_mid and ema_fast > ema_mid: count += 1
-        if htf_1h >= 1: count += 1
-        if ema_fast and price > ema_fast: count += 1
+        if ema_slow is not None and price > ema_slow: count += 1
+        if htf_4h >= 2: count += 1
+        if rsi < rsi_os and stoch_k < 20: count += 1
 
     return count
 
@@ -1208,13 +1236,13 @@ def compute_exit_signals(ind: dict, htf: dict, side: str) -> int:
 
 async def monitor_symbol(symbol: str, bot):
     """
-    Main trading loop for a symbol. Implements the v29 backtester strategy:
-    - 4 entry strategies (Trend Following, BB Squeeze, Mean Reversion, EMA Crossover)
-    - Signal-based exits (bearish/bullish count >= 3)
-    - ATR-adaptive trailing stops with progressive tightening
-    - 4-level take-profit system (TP0-TP3)
-    - Equity curve management (drawdown-based sizing)
-    - Cooldown system (after losses)
+    Main trading loop for a symbol. Matches backtester v29 exactly:
+    - 4 entry strategies (A→B→C→D cascade, first match wins)
+    - Signal-based exits (5 signals, exit when >= 3, with trailing SL protection)
+    - ATR-adaptive trailing stops (only when unrealized > 1 ATR or TP0 hit, uses high/low anchor)
+    - Sequential take-profit system (TP0→TP1→TP2→TP3, with breakeven SL moves)
+    - Equity curve management (drawdown + consecutive-losses sizing)
+    - Quick reversal using trend_4h + trend_score (not full signal recomputation)
     """
     last_status_time = 0
     STATUS_INTERVAL = 1800  # 30 minutes
@@ -1242,18 +1270,18 @@ async def monitor_symbol(symbol: str, bot):
                 await asyncio.sleep(POLL_INTERVAL_SECONDS)
                 continue
 
-            # Volatility floor check
-            min_atr_pct = params.get("min_atr_pct", 0.08)
-            if atr_pct is not None and atr_pct < min_atr_pct:
-                print(f"[{symbol}] Volatility too low: ATR%={atr_pct:.4f}% < floor {min_atr_pct}% — skipping cycle")
-                await asyncio.sleep(POLL_INTERVAL_SECONDS)
-                continue
+            # NOTE: Volatility floor is checked ONLY before new entries (matching backtester line 857-859).
+            # It does NOT block position management when already in a trade.
 
-            # Track bar changes (for bars_in_trade counting)
+            # Track bar changes (for bars_in_trade counting and cooldown decrement)
             candle_ts = ind["last_candle_ts"]
             prev_candle_ts = symbol_last_candle_ts.get(symbol)
             new_candle = (candle_ts != prev_candle_ts) and (prev_candle_ts is not None)
             symbol_last_candle_ts[symbol] = candle_ts
+
+            # Decrement cooldown on new candle (matching backtester line 562-563: always decremented)
+            if new_candle and symbol_cooldown.get(symbol, 0) > 0:
+                symbol_cooldown[symbol] = symbol_cooldown.get(symbol, 0) - 1
 
             # Check current position state
             current_side = symbol_open_trade_side.get(symbol)
@@ -1280,7 +1308,7 @@ async def monitor_symbol(symbol: str, bot):
                     save_state()
 
             # ──────────────────────────────────
-            #  2. POSITION OPEN: Risk Management
+            #  2. POSITION OPEN: Risk Management (matching backtester lines 598-848)
             # ──────────────────────────────────
             if current_side:
                 entry_price = symbol_entry_price.get(symbol)
@@ -1295,19 +1323,15 @@ async def monitor_symbol(symbol: str, bot):
                 if new_candle:
                     symbol_bars_in_trade[symbol] = symbol_bars_in_trade.get(symbol, 0) + 1
 
-                # Update peak/trough tracking
+                # Update peak/trough tracking (matching backtester lines 602-607)
                 if current_side == "Buy":
                     if symbol_highest_since_entry.get(symbol) is None or price > symbol_highest_since_entry[symbol]:
                         symbol_highest_since_entry[symbol] = price
-                    if symbol_lowest_since_entry.get(symbol) is None or price < symbol_lowest_since_entry[symbol]:
-                        symbol_lowest_since_entry[symbol] = price
                 else:
                     if symbol_lowest_since_entry.get(symbol) is None or price < symbol_lowest_since_entry[symbol]:
                         symbol_lowest_since_entry[symbol] = price
-                    if symbol_highest_since_entry.get(symbol) is None or price > symbol_highest_since_entry[symbol]:
-                        symbol_highest_since_entry[symbol] = price
 
-                # ── Check stop-loss hit ──
+                # ── Check stop-loss hit (matching backtester lines 619-654) ──
                 sl_hit = False
                 if sl_price:
                     if current_side == "Buy" and price <= sl_price:
@@ -1319,25 +1343,18 @@ async def monitor_symbol(symbol: str, bot):
                     await close_position(symbol, current_side, bot)
                     cancel_all_symbol_orders(symbol)
                     pnl_pct = ((price - entry_price) / entry_price * 100) if current_side == "Buy" else ((entry_price - price) / entry_price * 100)
-                    # Update streak tracking
-                    if pnl_pct < 0:
-                        symbol_consecutive_losses[symbol] = symbol_consecutive_losses.get(symbol, 0) + 1
-                        symbol_consecutive_wins[symbol] = 0
-                        cooldown = params["cooldown_loss"]
-                        if symbol_consecutive_losses.get(symbol, 0) >= 3:
-                            cooldown = params["cooldown_streak"]
-                        symbol_cooldown[symbol] = cooldown
-                    else:
-                        symbol_consecutive_wins[symbol] = symbol_consecutive_wins.get(symbol, 0) + 1
-                        symbol_consecutive_losses[symbol] = 0
-                        symbol_cooldown[symbol] = params["cooldown_bars"]
+                    # Update streak tracking (matching backtester lines 632-634)
+                    symbol_consecutive_losses[symbol] = symbol_consecutive_losses.get(symbol, 0) + 1
+                    symbol_consecutive_wins[symbol] = 0
+                    cooldown = params["cooldown_streak"] if symbol_consecutive_losses.get(symbol, 0) >= 3 else params["cooldown_loss"]
+                    symbol_cooldown[symbol] = cooldown
 
                     await bot.send_message(
                         chat_id=CHAT_ID,
                         text=(
-                            f"🛑 <b>{symbol}</b> STOP-LOSS HIT\n"
+                            f"\U0001f6d1 <b>{symbol}</b> STOP-LOSS HIT\n"
                             f"Side: {current_side} | PnL: {pnl_pct:+.2f}%\n"
-                            f"Entry: {entry_price:.6g} → Exit: {price:.6g}\n"
+                            f"Entry: {entry_price:.6g} \u2192 Exit: {price:.6g}\n"
                             f"Consecutive Losses: {symbol_consecutive_losses.get(symbol, 0)}\n"
                             f"Cooldown: {symbol_cooldown.get(symbol, 0)} bars"
                         ),
@@ -1350,16 +1367,69 @@ async def monitor_symbol(symbol: str, bot):
                     await asyncio.sleep(POLL_INTERVAL_SECONDS)
                     continue
 
-                # ── Take-Profit checks (TP0-TP3) ──
+                # ── Trailing Stop Update (matching backtester lines 656-689) ──
+                # Key differences from old live bot:
+                # 1. Only activates when unrealized_atr > 1.0 OR tp0_hit
+                # 2. Uses highest_since_entry/lowest_since_entry as anchor (not current price)
+                # 3. adx > adx_entry (but not strong): trail_atr * 1.1
                 if current_side == "Buy":
-                    unrealized_atr = (price - entry_price) / entry_atr if entry_atr else 0
+                    unrealized_atr = (price - entry_price) / atr if atr > 0 else 0
                 else:
-                    unrealized_atr = (entry_price - price) / entry_atr if entry_atr else 0
+                    unrealized_atr = (entry_price - price) / atr if atr > 0 else 0
+
+                adx_strong = params.get("adx_strong", 28)
+                adx_vstrong = params.get("adx_vstrong", 42)
+
+                if adx > adx_vstrong:
+                    trail_mult = params["trail_vstrong"]
+                elif adx > adx_strong:
+                    trail_mult = params["trail_strong"]
+                elif adx > params["adx_entry"]:
+                    trail_mult = params["trail_atr"] * 1.1
+                else:
+                    trail_mult = params["trail_atr"]
+
+                # Progressive tightening after TP hits
+                if symbol_tp2_hit.get(symbol, False):
+                    trail_mult *= params["trail_tighten_tp2"]
+                elif symbol_tp1_hit.get(symbol, False):
+                    trail_mult *= params["trail_tighten_tp1"]
+
+                tp0_hit = symbol_tp0_hit.get(symbol, False)
+
+                if current_side == "Buy":
+                    if unrealized_atr > 1.0 or tp0_hit:
+                        anchor = symbol_highest_since_entry.get(symbol) or price
+                        new_trail = anchor - (trail_mult * atr)
+                        if trailing_sl is None or new_trail > trailing_sl:
+                            symbol_trailing_sl[symbol] = new_trail
+                            trailing_sl = new_trail
+                        if trailing_sl is not None and trailing_sl > (symbol_sl_price.get(symbol) or 0):
+                            symbol_sl_price[symbol] = trailing_sl
+                elif current_side == "Sell":
+                    if unrealized_atr > 1.0 or tp0_hit:
+                        anchor = symbol_lowest_since_entry.get(symbol) or price
+                        new_trail = anchor + (trail_mult * atr)
+                        if trailing_sl is None or new_trail < trailing_sl:
+                            symbol_trailing_sl[symbol] = new_trail
+                            trailing_sl = new_trail
+                        if trailing_sl is not None and (symbol_sl_price.get(symbol) is None or trailing_sl < symbol_sl_price[symbol]):
+                            symbol_sl_price[symbol] = trailing_sl
+
+                # ── Take-Profit checks (TP0-TP3, matching backtester lines 691-765) ──
+                # Key differences from old live bot:
+                # 1. TP0/TP1: Move SL to breakeven+ after hit
+                # 2. TP2: Requires TP1 to be hit first
+                # 3. TP3: Requires TP2 to be hit first
+                if current_side == "Buy":
+                    unrealized_atr_tp = (price - entry_price) / entry_atr if entry_atr else 0
+                else:
+                    unrealized_atr_tp = (entry_price - price) / entry_atr if entry_atr else 0
 
                 remaining_pct = symbol_position_size_pct.get(symbol, 1.0)
 
-                # TP0
-                if not symbol_tp0_hit.get(symbol, False) and unrealized_atr >= params["tp0_atr"]:
+                # TP0 (matching backtester lines 691-711)
+                if not symbol_tp0_hit.get(symbol, False) and unrealized_atr_tp >= params["tp0_atr"]:
                     close_frac = params["tp0_pct"] / remaining_pct if remaining_pct > 0 else 0
                     close_frac = min(close_frac, 0.99)
                     if close_frac > 0:
@@ -1367,16 +1437,27 @@ async def monitor_symbol(symbol: str, bot):
                         if success:
                             symbol_tp0_hit[symbol] = True
                             symbol_position_size_pct[symbol] = remaining_pct - params["tp0_pct"]
+                            # Move SL to breakeven+ (matching backtester line 699-701)
+                            if current_side == "Buy":
+                                be_price = entry_price * 1.001
+                                symbol_sl_price[symbol] = max(symbol_sl_price.get(symbol) or 0, be_price)
+                                if symbol_trailing_sl.get(symbol) is not None:
+                                    symbol_trailing_sl[symbol] = max(symbol_trailing_sl[symbol], be_price)
+                            else:
+                                be_price = entry_price * 0.999
+                                symbol_sl_price[symbol] = min(symbol_sl_price.get(symbol) or float('inf'), be_price)
+                                if symbol_trailing_sl.get(symbol) is not None:
+                                    symbol_trailing_sl[symbol] = min(symbol_trailing_sl[symbol], be_price)
                             await bot.send_message(
                                 chat_id=CHAT_ID,
-                                text=f"✅ <b>{symbol}</b> TP0 hit ({params['tp0_atr']:.1f}x ATR) — closed {params['tp0_pct']*100:.0f}%",
+                                text=f"\u2705 <b>{symbol}</b> TP0 hit ({params['tp0_atr']:.1f}x ATR) \u2014 closed {params['tp0_pct']*100:.0f}% | SL moved to breakeven+",
                                 parse_mode="HTML",
                             )
                             save_state()
 
-                # TP1
+                # TP1 (matching backtester lines 713-733)
                 remaining_pct = symbol_position_size_pct.get(symbol, 1.0)
-                if not symbol_tp1_hit.get(symbol, False) and unrealized_atr >= params["tp1_atr"]:
+                if not symbol_tp1_hit.get(symbol, False) and unrealized_atr_tp >= params["tp1_atr"]:
                     close_frac = params["tp1_pct"] / remaining_pct if remaining_pct > 0 else 0
                     close_frac = min(close_frac, 0.99)
                     if close_frac > 0:
@@ -1384,16 +1465,27 @@ async def monitor_symbol(symbol: str, bot):
                         if success:
                             symbol_tp1_hit[symbol] = True
                             symbol_position_size_pct[symbol] = remaining_pct - params["tp1_pct"]
+                            # Move SL higher (matching backtester line 721-723)
+                            if current_side == "Buy":
+                                be2_price = entry_price * 1.002
+                                symbol_sl_price[symbol] = max(symbol_sl_price.get(symbol) or 0, be2_price)
+                                if symbol_trailing_sl.get(symbol) is not None:
+                                    symbol_trailing_sl[symbol] = max(symbol_trailing_sl[symbol], be2_price)
+                            else:
+                                be2_price = entry_price * 0.998
+                                symbol_sl_price[symbol] = min(symbol_sl_price.get(symbol) or float('inf'), be2_price)
+                                if symbol_trailing_sl.get(symbol) is not None:
+                                    symbol_trailing_sl[symbol] = min(symbol_trailing_sl[symbol], be2_price)
                             await bot.send_message(
                                 chat_id=CHAT_ID,
-                                text=f"✅ <b>{symbol}</b> TP1 hit ({params['tp1_atr']:.1f}x ATR) — closed {params['tp1_pct']*100:.0f}%",
+                                text=f"\u2705 <b>{symbol}</b> TP1 hit ({params['tp1_atr']:.1f}x ATR) \u2014 closed {params['tp1_pct']*100:.0f}%",
                                 parse_mode="HTML",
                             )
                             save_state()
 
-                # TP2
+                # TP2 — requires TP1 hit first (matching backtester line 736)
                 remaining_pct = symbol_position_size_pct.get(symbol, 1.0)
-                if not symbol_tp2_hit.get(symbol, False) and unrealized_atr >= params["tp2_atr"]:
+                if symbol_tp1_hit.get(symbol, False) and not symbol_tp2_hit.get(symbol, False) and unrealized_atr_tp >= params["tp2_atr"]:
                     close_frac = params["tp2_pct"] / remaining_pct if remaining_pct > 0 else 0
                     close_frac = min(close_frac, 0.99)
                     if close_frac > 0:
@@ -1403,14 +1495,14 @@ async def monitor_symbol(symbol: str, bot):
                             symbol_position_size_pct[symbol] = remaining_pct - params["tp2_pct"]
                             await bot.send_message(
                                 chat_id=CHAT_ID,
-                                text=f"✅ <b>{symbol}</b> TP2 hit ({params['tp2_atr']:.1f}x ATR) — closed {params['tp2_pct']*100:.0f}%",
+                                text=f"\u2705 <b>{symbol}</b> TP2 hit ({params['tp2_atr']:.1f}x ATR) \u2014 closed {params['tp2_pct']*100:.0f}%",
                                 parse_mode="HTML",
                             )
                             save_state()
 
-                # TP3
+                # TP3 — requires TP2 hit first (matching backtester line 752)
                 remaining_pct = symbol_position_size_pct.get(symbol, 1.0)
-                if not symbol_tp3_hit.get(symbol, False) and unrealized_atr >= params["tp3_atr"]:
+                if symbol_tp2_hit.get(symbol, False) and not symbol_tp3_hit.get(symbol, False) and unrealized_atr_tp >= params["tp3_atr"]:
                     close_frac = params["tp3_pct"] / remaining_pct if remaining_pct > 0 else 0
                     close_frac = min(close_frac, 0.99)
                     if close_frac > 0:
@@ -1420,89 +1512,65 @@ async def monitor_symbol(symbol: str, bot):
                             symbol_position_size_pct[symbol] = remaining_pct - params["tp3_pct"]
                             await bot.send_message(
                                 chat_id=CHAT_ID,
-                                text=f"✅ <b>{symbol}</b> TP3 hit ({params['tp3_atr']:.1f}x ATR) — closed {params['tp3_pct']*100:.0f}%",
+                                text=f"\u2705 <b>{symbol}</b> TP3 hit ({params['tp3_atr']:.1f}x ATR) \u2014 closed {params['tp3_pct']*100:.0f}%",
                                 parse_mode="HTML",
                             )
                             save_state()
 
-                # ── Trailing Stop Update (ADX-adaptive with progressive tightening) ──
-                if trailing_sl is not None and entry_atr:
-                    # Determine trail multiplier based on ADX
-                    adx_strong = params.get("adx_strong", 28)
-                    adx_vstrong = params.get("adx_vstrong", 42)
-                    if adx >= adx_vstrong:
-                        trail_mult = params["trail_vstrong"]
-                    elif adx >= adx_strong:
-                        trail_mult = params["trail_strong"]
-                    else:
-                        trail_mult = params["trail_atr"]
-
-                    # Progressive tightening after TP hits
-                    if symbol_tp2_hit.get(symbol, False):
-                        trail_mult *= params["trail_tighten_tp2"]
-                    elif symbol_tp1_hit.get(symbol, False):
-                        trail_mult *= params["trail_tighten_tp1"]
-
-                    trail_dist = entry_atr * trail_mult
-
-                    if current_side == "Buy":
-                        new_trail = price - trail_dist
-                        if new_trail > trailing_sl:
-                            symbol_trailing_sl[symbol] = new_trail
-                            # Also update SL (never move SL backwards)
-                            if new_trail > (symbol_sl_price.get(symbol) or 0):
-                                symbol_sl_price[symbol] = new_trail
-                    else:
-                        new_trail = price + trail_dist
-                        if new_trail < trailing_sl:
-                            symbol_trailing_sl[symbol] = new_trail
-                            if symbol_sl_price.get(symbol) is None or new_trail < symbol_sl_price[symbol]:
-                                symbol_sl_price[symbol] = new_trail
-
-                # ── Signal-based exit check ──
-                exit_signals = compute_exit_signals(ind, htf, current_side)
+                # ── Signal-based exit check (matching backtester lines 767-794) ──
+                exit_signals = compute_exit_signals(ind, htf, current_side, params)
                 bars_in_trade = symbol_bars_in_trade.get(symbol, 0)
 
                 should_exit = False
                 exit_reason = ""
 
-                # Exit if enough bearish/bullish signals
+                # Exit if enough opposing signals (matching backtester lines 777-794)
+                # Key difference: if trailing SL is protecting profit, DON'T exit on signals
                 if exit_signals >= 3:
-                    should_exit = True
-                    exit_reason = f"Signal exit ({exit_signals} opposing signals)"
+                    trailing_sl_now = symbol_trailing_sl.get(symbol)
+                    if current_side == "Buy" and trailing_sl_now is not None and trailing_sl_now > entry_price * 1.001:
+                        # Trailing stop is protecting profit — let it ride (matching backtester line 778-779)
+                        pass
+                    elif current_side == "Sell" and trailing_sl_now is not None and trailing_sl_now < entry_price * 0.999:
+                        # Trailing stop is protecting profit — let it ride (matching backtester line 791-792)
+                        pass
+                    else:
+                        should_exit = True
+                        exit_reason = f"Signal exit ({exit_signals} opposing signals)"
 
-                # Time-based flat trade exit
+                # Time-based flat trade exit (matching backtester lines 796-803)
+                # Key difference: requires NOT tp1_hit
                 flat_bars = params.get("flat_bars", 15)
                 flat_threshold = params.get("flat_threshold", 0.3)
-                if bars_in_trade >= flat_bars and abs(unrealized_atr) < flat_threshold:
-                    should_exit = True
-                    exit_reason = f"Flat trade exit ({bars_in_trade} bars, {unrealized_atr:.2f}x ATR)"
+                if bars_in_trade >= flat_bars and not symbol_tp1_hit.get(symbol, False):
+                    if current_side == "Buy":
+                        unrealized_pct = ((price - entry_price) / entry_price) * 100
+                    else:
+                        unrealized_pct = ((entry_price - price) / entry_price) * 100
+                    if abs(unrealized_pct) < flat_threshold:
+                        should_exit = True
+                        exit_reason = f"Flat trade exit ({bars_in_trade} bars, {unrealized_pct:.2f}%)"
 
                 if should_exit:
                     await close_position(symbol, current_side, bot)
                     cancel_all_symbol_orders(symbol)
                     pnl_pct = ((price - entry_price) / entry_price * 100) if current_side == "Buy" else ((entry_price - price) / entry_price * 100)
 
-                    # Update streaks
-                    if pnl_pct < 0:
+                    # Update streaks (matching backtester lines 817-822)
+                    if pnl_pct > 0:
+                        symbol_consecutive_losses[symbol] = 0
+                        symbol_consecutive_wins[symbol] = symbol_consecutive_wins.get(symbol, 0) + 1
+                    else:
                         symbol_consecutive_losses[symbol] = symbol_consecutive_losses.get(symbol, 0) + 1
                         symbol_consecutive_wins[symbol] = 0
-                        cooldown = params["cooldown_loss"]
-                        if symbol_consecutive_losses.get(symbol, 0) >= 3:
-                            cooldown = params["cooldown_streak"]
-                        symbol_cooldown[symbol] = cooldown
-                    else:
-                        symbol_consecutive_wins[symbol] = symbol_consecutive_wins.get(symbol, 0) + 1
-                        symbol_consecutive_losses[symbol] = 0
-                        symbol_cooldown[symbol] = params["cooldown_bars"]
 
-                    emoji = "📉" if pnl_pct < 0 else "📈"
+                    emoji = "\U0001f4c9" if pnl_pct < 0 else "\U0001f4c8"
                     await bot.send_message(
                         chat_id=CHAT_ID,
                         text=(
-                            f"{emoji} <b>{symbol}</b> EXIT — {exit_reason}\n"
+                            f"{emoji} <b>{symbol}</b> EXIT \u2014 {exit_reason}\n"
                             f"Side: {current_side} | PnL: {pnl_pct:+.2f}%\n"
-                            f"Entry: {entry_price:.6g} → Exit: {price:.6g}\n"
+                            f"Entry: {entry_price:.6g} \u2192 Exit: {price:.6g}\n"
                             f"Bars in trade: {bars_in_trade}\n"
                             f"Losses streak: {symbol_consecutive_losses.get(symbol, 0)} | "
                             f"Wins streak: {symbol_consecutive_wins.get(symbol, 0)}"
@@ -1516,13 +1584,21 @@ async def monitor_symbol(symbol: str, bot):
                     symbol_trends[symbol] = None
                     save_state()
 
-                    # Quick reversal check after signal exit
-                    if exit_signals >= 3 and symbol_cooldown.get(symbol, 0) <= 0:
-                        long_sig, short_sig, strat = compute_entry_signals(ind, htf, params)
+                    # Quick reversal check (matching backtester lines 831-847)
+                    # Key differences from old live bot:
+                    # 1. Uses trend_4h + trend_score conditions, NOT full signal recomputation
+                    # 2. Requires consecutive_losses == 0
+                    # 3. Requires adx > adx_entry
+                    # 4. Simple SL: entry_price +/- sl_atr * atr
+                    htf_4h = htf.get("htf_4h_trend", 0)
+                    trend_score = ind["trend_score"]
+                    cons_losses = symbol_consecutive_losses.get(symbol, 0)
+
+                    if cons_losses == 0 and adx > params["adx_entry"] and symbol_cooldown.get(symbol, 0) <= 0:
                         rev_side = None
-                        if old_side == "Buy" and short_sig >= params["sig_threshold"]:
+                        if old_side == "Buy" and htf_4h <= -1 and trend_score <= -2:
                             rev_side = "Sell"
-                        elif old_side == "Sell" and long_sig >= params["sig_threshold"]:
+                        elif old_side == "Sell" and htf_4h >= 1 and trend_score >= 2:
                             rev_side = "Buy"
 
                         if rev_side:
@@ -1531,41 +1607,64 @@ async def monitor_symbol(symbol: str, bot):
                             if success:
                                 entry_p = get_position_entry_price(symbol) or price
                                 pos_size = get_position_size(symbol) or 0
-                                _set_entry_risk_state(symbol, entry_p, atr, rev_side, pos_size, params)
+                                # Simple SL (matching backtester lines 835/841)
+                                if rev_side == "Sell":
+                                    rev_sl = entry_p + (params["sl_atr"] * atr)
+                                else:
+                                    rev_sl = entry_p - (params["sl_atr"] * atr)
+
+                                symbol_entry_price[symbol] = entry_p
+                                symbol_entry_atr[symbol] = atr
+                                symbol_sl_price[symbol] = rev_sl
+                                symbol_trailing_sl[symbol] = None
+                                symbol_tp0_hit[symbol] = False
+                                symbol_tp1_hit[symbol] = False
+                                symbol_tp2_hit[symbol] = False
+                                symbol_tp3_hit[symbol] = False
+                                symbol_position_size_pct[symbol] = 1.0
+                                symbol_bars_in_trade[symbol] = 0
+                                symbol_original_qty[symbol] = pos_size
+                                if rev_side == "Buy":
+                                    symbol_highest_since_entry[symbol] = price
+                                    symbol_lowest_since_entry[symbol] = None
+                                else:
+                                    symbol_highest_since_entry[symbol] = None
+                                    symbol_lowest_since_entry[symbol] = price
+
                                 symbol_open_trade_side[symbol] = rev_side
                                 symbol_trends[symbol] = "LONG" if rev_side == "Buy" else "SHORT"
-                                set_server_stop_loss(symbol, rev_side, symbol_sl_price.get(symbol, 0))
+                                set_server_stop_loss(symbol, rev_side, rev_sl)
 
                                 await bot.send_message(
                                     chat_id=CHAT_ID,
                                     text=(
-                                        f"🔄 <b>{symbol}</b> QUICK REVERSAL → {rev_side}\n"
-                                        f"Strategy: {strat}\n"
-                                        f"Entry: {entry_p:.6g} | SL: {symbol_sl_price.get(symbol, 0):.6g}\n"
-                                        f"ATR: {atr:.6g} | ADX: {adx:.1f}"
+                                        f"\U0001f504 <b>{symbol}</b> QUICK REVERSAL \u2192 {rev_side}\n"
+                                        f"Entry: {entry_p:.6g} | SL: {rev_sl:.6g}\n"
+                                        f"ATR: {atr:.6g} | ADX: {adx:.1f}\n"
+                                        f"Trend 4H: {htf_4h} | Trend Score: {trend_score}"
                                     ),
                                     parse_mode="HTML",
                                 )
                                 save_state()
 
+                    # If no reversal, set cooldown (matching backtester line 846-847)
+                    if symbol_open_trade_side.get(symbol) is None:
+                        symbol_cooldown[symbol] = params["cooldown_bars"]
+
                     await asyncio.sleep(POLL_INTERVAL_SECONDS)
                     continue
 
             # ──────────────────────────────────
-            #  3. NO POSITION: Entry Logic
+            #  3. NO POSITION: Entry Logic (matching backtester lines 850-995)
             # ──────────────────────────────────
             else:
-                # Decrement cooldown on new candle
-                if new_candle and symbol_cooldown.get(symbol, 0) > 0:
-                    symbol_cooldown[symbol] = symbol_cooldown.get(symbol, 0) - 1
-
-                # Skip if in cooldown
+                # Skip if in cooldown (matching backtester line 851)
                 if symbol_cooldown.get(symbol, 0) > 0:
                     print(f"[{symbol}] In cooldown: {symbol_cooldown[symbol]} bars remaining")
                     await asyncio.sleep(POLL_INTERVAL_SECONDS)
                     continue
 
-                # Equity curve management: check drawdown
+                # Equity curve management (matching backtester lines 565-596)
                 try:
                     balance_resp = await asyncio.to_thread(
                         bybit_session.get_wallet_balance,
@@ -1588,82 +1687,71 @@ async def monitor_symbol(symbol: str, bot):
 
                 dd_pct = ((peak_eq - equity) / peak_eq * 100) if peak_eq > 0 else 0
 
-                # Drawdown-based position sizing
+                # Drawdown + consecutive-loss based sizing (matching backtester lines 572-583)
+                cons_losses = symbol_consecutive_losses.get(symbol, 0)
                 if dd_pct >= params["dd_pause"]:
-                    print(f"[{symbol}] Drawdown pause: DD={dd_pct:.1f}% >= {params['dd_pause']}% — pausing")
+                    effective_size = 0.0
+                elif dd_pct >= params["dd_small"]:
+                    effective_size = params["size_small"]
+                elif dd_pct >= params["dd_reduce"]:
+                    effective_size = params["size_reduced"]
+                elif cons_losses >= 4:
+                    effective_size = 0.5
+                elif cons_losses >= 2:
+                    effective_size = 0.75
+                else:
+                    effective_size = 1.0
+
+                # Win streak bonus (matching backtester lines 586-588)
+                cons_wins = symbol_consecutive_wins.get(symbol, 0)
+                if cons_wins >= 2 and dd_pct < params["dd_reduce"]:
+                    streak_bonus = min(cons_wins - 1, 3) * params["win_streak_bonus"]
+                    effective_size *= min(1.5, 1.0 + streak_bonus)
+
+                # DD pause recovery (matching backtester lines 590-596)
+                if effective_size == 0.0:
+                    if dd_pct < params["dd_pause"] - 5:
+                        effective_size = params["size_small"]
+                    else:
+                        symbol_cooldown[symbol] = max(symbol_cooldown.get(symbol, 0), 2)
+                        print(f"[{symbol}] Drawdown pause: DD={dd_pct:.1f}% >= {params['dd_pause']}% \u2014 pausing")
+                        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+                        continue
+
+                if effective_size <= 0:
                     await asyncio.sleep(POLL_INTERVAL_SECONDS)
                     continue
 
-                size_mult = 1.0
-                if dd_pct >= params["dd_small"]:
-                    size_mult = params["size_small"]
-                elif dd_pct >= params["dd_reduce"]:
-                    size_mult = params["size_reduced"]
+                # Volatility floor (matching backtester line 857-859, ONLY checked before entry)
+                min_atr_pct = params.get("min_atr_pct", 0.3)
+                if atr_pct is not None and atr_pct < min_atr_pct:
+                    print(f"[{symbol}] Volatility too low: ATR%={atr_pct:.4f}% < floor {min_atr_pct}% \u2014 skipping entry")
+                    await asyncio.sleep(POLL_INTERVAL_SECONDS)
+                    continue
 
-                # Win streak bonus
-                wins = symbol_consecutive_wins.get(symbol, 0)
-                if wins >= 3:
-                    size_mult += params["win_streak_bonus"]
-                    size_mult = min(size_mult, 1.5)  # cap at 150%
+                # Compute entry signals (new API returns dict with side, strategy, sig_count)
+                entry_result = compute_entry_signals(ind, htf, params)
+                entry_side = entry_result["side"]
+                strategy = entry_result["strategy"]
+                sig_count = entry_result["sig_count"]
 
-                # Compute entry signals
-                long_sig, short_sig, strategy = compute_entry_signals(ind, htf, params)
-
-                # Determine entry side
-                entry_side = None
-                sig_count = 0
-
-                # ADX-adaptive threshold
-                adx_strong = params.get("adx_strong", 28)
-                adx_vstrong = params.get("adx_vstrong", 42)
-                if adx >= adx_vstrong:
-                    threshold = params["sig_vstrong"]
-                elif adx >= adx_strong:
-                    threshold = params["sig_strong"]
-                else:
-                    threshold = params["sig_threshold"]
-
-                # Diagnostic logging for signal evaluation
+                # Diagnostic logging
                 print(
-                    f"[{symbol}] SIGNALS: Long={long_sig} Short={short_sig} "
-                    f"Threshold={threshold} ADX={adx:.1f} ATR%={atr_pct:.3f}% "
-                    f"Strategy={strategy or 'None'} "
+                    f"[{symbol}] ENTRY EVAL: Side={entry_side or 'None'} Strategy={strategy or 'None'} "
+                    f"Signals={sig_count} ADX={adx:.1f} ATR%={atr_pct:.3f}% "
+                    f"Regime={'Trending' if entry_result['regime_trending'] else 'Ranging'} "
+                    f"VolOK={entry_result['vol_ok']} "
                     f"Trend={ind['trend_score']} RSI={ind['rsi']:.1f} "
-                    f"HTF1H={htf.get('htf_1h_trend',0)} HTF4H={htf.get('htf_4h_trend',0)}"
+                    f"HTF1H={htf.get('htf_1h_trend',0)} HTF4H={htf.get('htf_4h_trend',0)} "
+                    f"EffSize={effective_size:.2f}"
                 )
 
-                if long_sig >= threshold and long_sig > short_sig:
-                    entry_side = "Buy"
-                    sig_count = long_sig
-                elif short_sig >= threshold and short_sig > long_sig:
-                    entry_side = "Sell"
-                    sig_count = short_sig
-                elif long_sig >= threshold and long_sig == short_sig:
-                    # Tiebreaker: use trend_score to decide direction
-                    if ind["trend_score"] > 0:
-                        entry_side = "Buy"
-                        sig_count = long_sig
-                    elif ind["trend_score"] < 0:
-                        entry_side = "Sell"
-                        sig_count = short_sig
-                    else:
-                        print(f"[{symbol}] Signals tied at {long_sig} with neutral trend — no entry")
-
-                if not entry_side:
-                    best_sig = max(long_sig, short_sig)
-                    if best_sig > 0:
-                        print(f"[{symbol}] No entry: best signal {best_sig} < threshold {threshold}")
-
                 if entry_side:
-                    # Calculate quantity with size multiplier
+                    # Calculate quantity with effective_size multiplier
                     manual_qty = symbol_manual_quantities.get(symbol)
-                    if manual_qty and size_mult != 1.0:
-                        adjusted_qty = manual_qty * size_mult
-                        # Mean reversion uses smaller size
-                        if strategy == "C:MeanRev":
-                            adjusted_qty *= params.get("mr_size", 0.6)
-                    elif manual_qty:
-                        adjusted_qty = manual_qty
+                    if manual_qty:
+                        adjusted_qty = manual_qty * effective_size
+                        # Mean reversion uses smaller size (matching backtester line 958)
                         if strategy == "C:MeanRev":
                             adjusted_qty *= params.get("mr_size", 0.6)
                     else:
@@ -1675,16 +1763,80 @@ async def monitor_symbol(symbol: str, bot):
                         entry_p = get_position_entry_price(symbol) or price
                         pos_size = get_position_size(symbol) or 0
 
-                        # Store swing levels before setting risk state
-                        symbol_lowest_since_entry[symbol] = ind["swing_low"] or price
-                        symbol_highest_since_entry[symbol] = ind["swing_high"] or price
+                        # Store swing levels for structural SL
+                        swing_low = ind["swing_low"] or price
+                        swing_high = ind["swing_high"] or price
 
-                        _set_entry_risk_state(symbol, entry_p, atr, entry_side, pos_size, params)
+                        # Per-strategy SL calculation (matching backtester exactly)
+                        if strategy == "A:Trend":
+                            # Strategy A: tighter SL in strong ADX (matching backtester lines 888-893)
+                            sl_mult = params["sl_atr"] * (0.85 if adx > params.get("adx_strong", 28) else 1.0)
+                            if entry_side == "Buy":
+                                atr_sl = entry_p - (sl_mult * atr)
+                                struct_sl = swing_low - (0.3 * atr)
+                                sl_price = max(atr_sl, struct_sl)
+                                max_sl = entry_p * (1 - params["max_loss"] / 100)
+                                sl_price = max(sl_price, max_sl)
+                            else:
+                                atr_sl = entry_p + (sl_mult * atr)
+                                struct_sl = swing_high + (0.3 * atr)
+                                sl_price = min(atr_sl, struct_sl)
+                                max_sl = entry_p * (1 + params["max_loss"] / 100)
+                                sl_price = min(sl_price, max_sl)
+
+                            # Decrement consecutive_losses on Strategy A entry (matching backtester lines 898-899)
+                            if symbol_consecutive_losses.get(symbol, 0) > 0:
+                                symbol_consecutive_losses[symbol] -= 1
+
+                        elif strategy == "C:MeanRev":
+                            # Strategy C: reduced SL (matching backtester line 957/965)
+                            if entry_side == "Buy":
+                                sl_price = entry_p - (params["sl_atr"] * 0.7 * atr)
+                            else:
+                                sl_price = entry_p + (params["sl_atr"] * 0.7 * atr)
+
+                        elif strategy in ("B:BBSqueeze", "D:EMACross"):
+                            # Strategy B/D: ATR + structural SL (matching backtester lines 934-936/978-980)
+                            if entry_side == "Buy":
+                                atr_sl = entry_p - (params["sl_atr"] * atr)
+                                struct_sl = swing_low - (0.3 * atr)
+                                sl_price = max(atr_sl, struct_sl)
+                            else:
+                                atr_sl = entry_p + (params["sl_atr"] * atr)
+                                struct_sl = swing_high + (0.3 * atr)
+                                sl_price = min(atr_sl, struct_sl)
+                        else:
+                            # Fallback
+                            if entry_side == "Buy":
+                                sl_price = entry_p - (params["sl_atr"] * atr)
+                            else:
+                                sl_price = entry_p + (params["sl_atr"] * atr)
+
+                        # Set risk state directly (not using _set_entry_risk_state to match per-strategy SL)
+                        symbol_entry_price[symbol] = entry_p
+                        symbol_entry_atr[symbol] = atr
+                        symbol_sl_price[symbol] = sl_price
+                        symbol_trailing_sl[symbol] = None  # No trailing until unrealized > 1 ATR
+                        symbol_peak_price[symbol] = entry_p
+                        symbol_original_qty[symbol] = pos_size
+                        symbol_position_size_pct[symbol] = 1.0
+                        symbol_bars_in_trade[symbol] = 0
+                        symbol_tp0_hit[symbol] = False
+                        symbol_tp1_hit[symbol] = False
+                        symbol_tp2_hit[symbol] = False
+                        symbol_tp3_hit[symbol] = False
+                        if entry_side == "Buy":
+                            symbol_highest_since_entry[symbol] = price
+                            symbol_lowest_since_entry[symbol] = None
+                        else:
+                            symbol_highest_since_entry[symbol] = None
+                            symbol_lowest_since_entry[symbol] = price
+
                         symbol_open_trade_side[symbol] = entry_side
                         symbol_trends[symbol] = "LONG" if entry_side == "Buy" else "SHORT"
 
                         # Set server-side stop-loss
-                        set_server_stop_loss(symbol, entry_side, symbol_sl_price.get(symbol, 0))
+                        set_server_stop_loss(symbol, entry_side, sl_price)
 
                         # Compute TP levels for display
                         tp0_price = entry_p + atr * params["tp0_atr"] if entry_side == "Buy" else entry_p - atr * params["tp0_atr"]
@@ -1698,14 +1850,14 @@ async def monitor_symbol(symbol: str, bot):
                             text=(
                                 f"{direction} <b>{symbol}</b> \u2014 {strategy}\n"
                                 f"Entry: {entry_p:.6g} | Signals: {sig_count}\n"
-                                f"SL: {symbol_sl_price.get(symbol, 0):.6g}\n"
+                                f"SL: {sl_price:.6g}\n"
                                 f"TP0: {tp0_price:.6g} ({params['tp0_pct']*100:.0f}%)\n"
                                 f"TP1: {tp1_price:.6g} ({params['tp1_pct']*100:.0f}%)\n"
                                 f"TP2: {tp2_price:.6g} ({params['tp2_pct']*100:.0f}%)\n"
                                 f"TP3: {tp3_price:.6g} ({params['tp3_pct']*100:.0f}%)\n"
                                 f"ATR: {atr:.6g} ({atr_pct:.2f}%) | ADX: {adx:.1f}\n"
                                 f"Trend: {ind['trend_score']} | HTF 1H: {htf.get('htf_1h_trend', 0)} | 4H: {htf.get('htf_4h_trend', 0)}\n"
-                                f"Size mult: {size_mult:.2f}"
+                                f"Effective size: {effective_size:.2f}"
                             ),
                             parse_mode="HTML",
                         )
