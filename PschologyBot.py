@@ -157,7 +157,7 @@ DEFAULT_PARAMS = {
     "tp2_pct": 0.20,
     "tp3_pct": 0.20,
     # Entry thresholds
-    "sig_threshold": 5,
+    "sig_threshold": 4,
     "sig_strong": 4,
     "sig_vstrong": 3,
     # ADX thresholds
@@ -190,7 +190,7 @@ DEFAULT_PARAMS = {
     # Win streak
     "win_streak_bonus": 0.15,
     # Volatility floor
-    "min_atr_pct": 0.3,
+    "min_atr_pct": 0.08,
     # Mean reversion position size
     "mr_size": 0.6,
 }
@@ -1243,9 +1243,9 @@ async def monitor_symbol(symbol: str, bot):
                 continue
 
             # Volatility floor check
-            min_atr_pct = params.get("min_atr_pct", 0.3)
+            min_atr_pct = params.get("min_atr_pct", 0.08)
             if atr_pct is not None and atr_pct < min_atr_pct:
-                # Too low volatility, skip this cycle
+                print(f"[{symbol}] Volatility too low: ATR%={atr_pct:.4f}% < floor {min_atr_pct}% — skipping cycle")
                 await asyncio.sleep(POLL_INTERVAL_SECONDS)
                 continue
 
@@ -1561,6 +1561,7 @@ async def monitor_symbol(symbol: str, bot):
 
                 # Skip if in cooldown
                 if symbol_cooldown.get(symbol, 0) > 0:
+                    print(f"[{symbol}] In cooldown: {symbol_cooldown[symbol]} bars remaining")
                     await asyncio.sleep(POLL_INTERVAL_SECONDS)
                     continue
 
@@ -1589,7 +1590,7 @@ async def monitor_symbol(symbol: str, bot):
 
                 # Drawdown-based position sizing
                 if dd_pct >= params["dd_pause"]:
-                    # Too much drawdown, pause trading
+                    print(f"[{symbol}] Drawdown pause: DD={dd_pct:.1f}% >= {params['dd_pause']}% — pausing")
                     await asyncio.sleep(POLL_INTERVAL_SECONDS)
                     continue
 
@@ -1622,12 +1623,36 @@ async def monitor_symbol(symbol: str, bot):
                 else:
                     threshold = params["sig_threshold"]
 
+                # Diagnostic logging for signal evaluation
+                print(
+                    f"[{symbol}] SIGNALS: Long={long_sig} Short={short_sig} "
+                    f"Threshold={threshold} ADX={adx:.1f} ATR%={atr_pct:.3f}% "
+                    f"Strategy={strategy or 'None'} "
+                    f"Trend={ind['trend_score']} RSI={ind['rsi']:.1f} "
+                    f"HTF1H={htf.get('htf_1h_trend',0)} HTF4H={htf.get('htf_4h_trend',0)}"
+                )
+
                 if long_sig >= threshold and long_sig > short_sig:
                     entry_side = "Buy"
                     sig_count = long_sig
                 elif short_sig >= threshold and short_sig > long_sig:
                     entry_side = "Sell"
                     sig_count = short_sig
+                elif long_sig >= threshold and long_sig == short_sig:
+                    # Tiebreaker: use trend_score to decide direction
+                    if ind["trend_score"] > 0:
+                        entry_side = "Buy"
+                        sig_count = long_sig
+                    elif ind["trend_score"] < 0:
+                        entry_side = "Sell"
+                        sig_count = short_sig
+                    else:
+                        print(f"[{symbol}] Signals tied at {long_sig} with neutral trend — no entry")
+
+                if not entry_side:
+                    best_sig = max(long_sig, short_sig)
+                    if best_sig > 0:
+                        print(f"[{symbol}] No entry: best signal {best_sig} < threshold {threshold}")
 
                 if entry_side:
                     # Calculate quantity with size multiplier
