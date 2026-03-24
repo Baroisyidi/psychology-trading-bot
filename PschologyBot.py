@@ -152,6 +152,9 @@ def save_state():
             "symbol_sl1_qty": symbol_sl1_qty,
             "symbol_sl1_taken": symbol_sl1_taken,
             "symbol_original_qty": symbol_original_qty,
+            "symbol_tp1_taken": symbol_tp1_taken,
+            "symbol_tp2_taken": symbol_tp2_taken,
+            "symbol_post_exit_flat": symbol_post_exit_flat,
         }
         with open(STATE_FILE, "w") as f:
             json.dump(state, f, indent=2, default=str)
@@ -197,6 +200,9 @@ def load_state():
         symbol_sl1_qty.update({k: v for k, v in state.get("symbol_sl1_qty", {}).items()})
         symbol_sl1_taken.update({k: v for k, v in state.get("symbol_sl1_taken", {}).items()})
         symbol_original_qty.update({k: v for k, v in state.get("symbol_original_qty", {}).items()})
+        symbol_tp1_taken.update({k: v for k, v in state.get("symbol_tp1_taken", {}).items()})
+        symbol_tp2_taken.update({k: v for k, v in state.get("symbol_tp2_taken", {}).items()})
+        symbol_post_exit_flat.update({k: v for k, v in state.get("symbol_post_exit_flat", {}).items()})
 
         print(f"[STATE] Loaded state from {STATE_FILE} — {len(monitored_symbols)} symbols restored")
         return True
@@ -218,14 +224,14 @@ symbol_entry_price: dict[str, Optional[float]] = {}
 symbol_entry_atr: dict[str, Optional[float]] = {}
 symbol_peak_price: dict[str, Optional[float]] = {}
 symbol_trailing_active: dict[str, bool] = {}
-symbol_partial_taken: dict[str, bool] = {}  # Track if 60% trailing profit has been taken
+symbol_partial_taken: dict[str, bool] = {}  # Track if 30% Stage 1 trail has been closed
 symbol_server_sl_set: dict[str, bool] = {}  # Track if server-side stop-loss is active
 symbol_server_ts_set: dict[str, bool] = {}  # Track if server-side trailing stop is active
-symbol_trail_order_id: dict[str, Optional[str]] = {}  # Conditional order ID for 60% trailing SL
-symbol_trail_qty: dict[str, Optional[float]] = {}     # 60% qty under trailing stop order
+symbol_trail_order_id: dict[str, Optional[str]] = {}  # Conditional order ID for 30% trailing SL
+symbol_trail_qty: dict[str, Optional[float]] = {}     # 30% qty under trailing stop order
 symbol_trail_price: dict[str, Optional[float]] = {}   # Current trailing stop trigger price
 
-# Stage 2 trailing stop (30% of original position, after 60% closed)
+# Stage 2 trailing stop (20% of original position, after 30% closed)
 symbol_stage2_active: dict[str, bool] = {}             # Is stage 2 trailing active?
 symbol_stage2_taken: dict[str, bool] = {}              # Has stage 2 trail been filled?
 symbol_trail2_order_id: dict[str, Optional[str]] = {}  # Conditional order ID for stage 2 trail
@@ -234,27 +240,40 @@ symbol_trail2_price: dict[str, Optional[float]] = {}   # Stage 2 trail trigger p
 symbol_peak_stage2: dict[str, Optional[float]] = {}    # Peak price tracking for stage 2
 
 # Tiered stop-loss tracking
-symbol_sl1_order_id: dict[str, Optional[str]] = {}     # Conditional order for 50% at 1.5x ATR
+symbol_sl1_order_id: dict[str, Optional[str]] = {}     # Conditional order for 50% at 0.5x ATR
 symbol_sl1_qty: dict[str, Optional[float]] = {}        # Qty for the 50% SL order
-symbol_sl1_taken: dict[str, bool] = {}                 # Has 50% SL at 1.5x ATR been taken?
+symbol_sl1_taken: dict[str, bool] = {}                 # Has 50% SL at 0.5x ATR been taken?
 symbol_original_qty: dict[str, Optional[float]] = {}   # Original position qty at entry
+
+# Take-Profit tracking
+symbol_tp1_taken: dict[str, bool] = {}                 # Has TP1 (20% at 1.5x ATR) been taken?
+symbol_tp2_taken: dict[str, bool] = {}                 # Has TP2 (25% at 3.5x ATR) been taken?
+
+# Post-exit FLAT state (use reversal conditions ADX>27 instead of entry ADX>20)
+symbol_post_exit_flat: dict[str, bool] = {}            # True when FLAT after exit, awaiting reversal conditions
 
 
 # ────────────────────────────────────────────────
 #  Constants
 # ────────────────────────────────────────────────
-ATR_MULTIPLIER = 1.5        # Legacy (kept for reference)
 ADX_THRESHOLD = 20           # Only trade when ADX > 20 (trending)
 ADX_EXIT_THRESHOLD = 25      # Exit requires ADX > 25
 ADX_REVERSAL_THRESHOLD = 27  # Reversal requires ADX > 27
-STOP_LOSS_ATR_MULT = 3.0    # Ultimate stop-loss at 3x ATR from entry (closes remaining 50%)
-SL_STAGE1_ATR_MULT = 1.5    # First tier SL at 1.5x ATR (closes 50%)
+STOP_LOSS_ATR_MULT = 1.0     # Tier 2: remaining 50% closed at 1.0x ATR loss (server-side)
+SL_STAGE1_ATR_MULT = 0.5    # Tier 1: 50% closed INSTANTLY at 0.5x ATR loss
 SL_STAGE1_CLOSE_PCT = 0.50  # Close 50% of position at first SL level
-TRAILING_ACTIVATE_ATR = 1.5  # Activate trailing stop after 1.5x ATR profit
+TP1_ATR_MULT = 1.5           # TP1: close 20% at 1.5x ATR profit
+TP1_CLOSE_PCT = 0.20         # Close 20% of original position at TP1
+TP1_SL_MOVE_ATR = 0.5        # After TP1: move SL to lock in 0.5x ATR profit
+TP2_ATR_MULT = 3.5           # TP2: close 25% at 3.5x ATR profit
+TP2_CLOSE_PCT = 0.25         # Close 25% of original position at TP2
+TP2_SL_MOVE_ATR = 1.0        # After TP2: move SL to lock in 1.0x ATR profit
+TRAILING_ACTIVATE_ATR = 2.0  # Activate Stage 1 trailing stop after 2.0x ATR profit
 TRAILING_STOP_ATR = 1.0      # Stage 1 trailing stop distance: 1x ATR from peak
 TRAILING_STOP_ATR_STAGE2 = 1.0  # Stage 2 trailing stop distance: 1x ATR from peak
-TRAILING_CLOSE_PCT = 0.60    # Close 60% of position on stage 1 trail
-TRAILING_STAGE2_PCT = 0.75   # Close 75% of remaining 40% (= 30% of original) on stage 2
+TRAILING_CLOSE_PCT = 0.30    # Close 30% of original position on Stage 1 trail
+TRAILING_STAGE2_QTY_PCT = 0.20  # Close 20% of original position on Stage 2 trail
+# Remaining 5% protected by server-side SL + Exit Rules
 POLL_INTERVAL_SECONDS = 10   # Poll every 10 seconds (faster for risk management)
 RSI_OVERBOUGHT = 70          # Block long entries when RSI > 70
 RSI_OVERSOLD = 30            # Block short entries when RSI < 30
@@ -740,6 +759,9 @@ def _clear_risk_state(symbol: str) -> None:
     symbol_sl1_qty[symbol] = None
     symbol_sl1_taken[symbol] = False
     symbol_original_qty[symbol] = None
+    # Take-Profit
+    symbol_tp1_taken[symbol] = False
+    symbol_tp2_taken[symbol] = False
     save_state()
 
 
@@ -767,6 +789,9 @@ def _set_entry_risk_state(symbol: str, entry_price: float, atr: float) -> None:
     symbol_sl1_qty[symbol] = None
     symbol_sl1_taken[symbol] = False
     symbol_original_qty[symbol] = None
+    # Take-Profit
+    symbol_tp1_taken[symbol] = False
+    symbol_tp2_taken[symbol] = False
     save_state()
 
 
@@ -1074,6 +1099,42 @@ async def cancel_server_stops(symbol: str) -> bool:
         return False
 
 
+async def close_position_by_qty(symbol: str, side_to_close: str, qty: float) -> Optional[float]:
+    """Close a specific quantity of a position. Returns the closed quantity."""
+    try:
+        close_side = "Sell" if side_to_close == "Buy" else "Buy"
+        min_qty, max_qty, qty_step, _ = await get_instrument_constraints(symbol)
+        rounded_qty = round_qty_to_step(qty, qty_step, min_qty)
+
+        remaining_to_close = rounded_qty
+        while remaining_to_close > 0:
+            current_batch_qty = min(remaining_to_close, max_qty)
+            current_batch_qty = round_qty_to_step(current_batch_qty, qty_step, min_qty)
+            qty_str = format_qty_str(current_batch_qty, qty_step)
+
+            order = await asyncio.to_thread(
+                bybit_session.place_order,
+                category="linear",
+                symbol=symbol,
+                side=close_side,
+                orderType="Market",
+                qty=qty_str,
+                reduceOnly=True,
+            )
+            if order.get("retCode") != 0:
+                print(f"Close qty batch failed for {symbol}: {order.get('retMsg')}")
+                return None
+            remaining_to_close -= current_batch_qty
+            if remaining_to_close > 0:
+                await asyncio.sleep(0.5)
+
+        print(f"[INFO] {symbol}: Closed {rounded_qty} of {side_to_close} position")
+        return rounded_qty
+    except Exception as exc:
+        print(f"Position close by qty failed for {symbol}: {exc}")
+        return None
+
+
 async def place_trade(symbol: str, side: str = "Buy", manual_qty_override: Optional[float] = None) -> Optional[dict]:
     """
     Places a trade, optionally using a specific manual quantity override for reversals.
@@ -1170,15 +1231,17 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
         current_market_state = "AT 50 EMA (Neutral)"
 
     # ──────────────────────────────────────────────
-    # 1. RISK MANAGEMENT: Multi-stage trailing + tiered stop-loss
+    # 1. RISK MANAGEMENT: Tiered SL + TP Levels + Multi-stage Trailing
     #    STOP-LOSS (price goes against us):
-    #      - Server-side SL at 3x ATR (safety net, closes remaining 50%)
-    #      - Conditional order at 1.5x ATR closes 50% INSTANTLY
-    #      - If price continues to 3x ATR, server SL closes remaining 50%
-    #    TRAILING STOP (price goes in our favor):
-    #      - Stage 1: At 1.5x ATR profit, trail on 60%. Bybit closes INSTANTLY when hit.
-    #      - Stage 2: After 60% closed, trail on 30% (1x ATR distance). Bybit closes INSTANTLY.
-    #      - Stage 3: Remaining 10% has NO trail — exits only on Exit Rules (EMA+MACD).
+    #      - Tier 1: 50% closed INSTANTLY at 0.5x ATR loss
+    #      - Tier 2: Remaining 50% at 1.0x ATR loss (server-side, always active)
+    #    TAKE-PROFIT (price goes in our favor):
+    #      - TP1: At 1.5x ATR profit → close 20%, move SL to 0.5x ATR profit
+    #      - TP2: At 3.5x ATR profit → close 25%, move SL to 1.0x ATR profit
+    #    TRAILING STOP:
+    #      - Stage 1: At 2.0x ATR profit, trail on 30% (1.0x ATR distance)
+    #      - Stage 2: After 30% closed, trail on 20% (1.0x ATR distance, never below/above entry)
+    #      - Remaining 5% protected by server-side SL + Exit Rules
     #    Uses current_price (real-time) for all risk checks
     # ──────────────────────────────────────────────
     if current_open_trade_side is not None:
@@ -1191,23 +1254,26 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
             entry_atr = atr
             _set_entry_risk_state(symbol, entry_price, entry_atr)
             print(f"[INFO] {symbol}: Initialized risk state from current values (entry={entry_price}, atr={entry_atr})")
-            # Set server-side stop-loss for recovered position
             if current_open_trade_side == "Buy":
                 sl_price = entry_price - (STOP_LOSS_ATR_MULT * entry_atr)
             else:
                 sl_price = entry_price + (STOP_LOSS_ATR_MULT * entry_atr)
             await set_server_stop_loss(symbol, current_open_trade_side, sl_price)
 
-        # Ensure server-side stop-loss is set (retry if not) — skip if trailing is active
-        if not symbol_server_sl_set.get(symbol, False) and not symbol_partial_taken.get(symbol, False) and not symbol_trailing_active.get(symbol, False):
+        # Ensure server-side stop-loss is set (retry if not)
+        # Skip if TP1 already taken (SL has been moved to profit level)
+        tp1_taken = symbol_tp1_taken.get(symbol, False)
+        tp2_taken = symbol_tp2_taken.get(symbol, False)
+        if not symbol_server_sl_set.get(symbol, False) and not tp1_taken:
             if current_open_trade_side == "Buy":
                 sl_price = entry_price - (STOP_LOSS_ATR_MULT * entry_atr)
             else:
                 sl_price = entry_price + (STOP_LOSS_ATR_MULT * entry_atr)
             await set_server_stop_loss(symbol, current_open_trade_side, sl_price)
 
-        # Ensure SL1 conditional order (50% at 0.5x ATR) is placed — skip if trailing active or SL1 already taken/set
-        if not symbol_sl1_order_id.get(symbol) and not symbol_sl1_taken.get(symbol, False) and not symbol_trailing_active.get(symbol, False) and not symbol_partial_taken.get(symbol, False):
+        # Ensure SL1 conditional order (50% at 0.5x ATR) is placed
+        # Skip if trailing active, SL1 already taken/set, or TP1 already taken
+        if not symbol_sl1_order_id.get(symbol) and not symbol_sl1_taken.get(symbol, False) and not symbol_trailing_active.get(symbol, False) and not symbol_partial_taken.get(symbol, False) and not tp1_taken:
             pos_qty = await get_position_size(symbol)
             if pos_qty:
                 sl1_qty = pos_qty * SL_STAGE1_CLOSE_PCT
@@ -1227,20 +1293,18 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
         peak = symbol_peak_price.get(symbol, entry_price)
         if current_open_trade_side == "Buy":
             peak = max(peak, current_price)
-        else:  # Sell
+        else:
             peak = min(peak, current_price)
         symbol_peak_price[symbol] = peak
 
         # ── TIERED STOP-LOSS: Detect SL1 (50% at 0.5x ATR) fill ──
-        # Only check if SL1 order was placed and not yet confirmed as taken, and trailing not active
         sl1_taken = symbol_sl1_taken.get(symbol, False)
-        if not sl1_taken and symbol_sl1_order_id.get(symbol) and not symbol_trailing_active.get(symbol, False):
+        if not sl1_taken and symbol_sl1_order_id.get(symbol) and not symbol_trailing_active.get(symbol, False) and not tp1_taken:
             current_qty = await get_position_size(symbol)
             original_qty = symbol_original_qty.get(symbol)
             sl1_qty_val = symbol_sl1_qty.get(symbol)
 
             if current_qty is not None and original_qty and sl1_qty_val:
-                # If position reduced by roughly the SL1 amount, SL1 has fired
                 if current_qty <= original_qty - (sl1_qty_val * 0.8):
                     symbol_sl1_taken[symbol] = True
                     sl1_taken = True
@@ -1255,11 +1319,10 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                             f"50% closed at {SL_STAGE1_ATR_MULT}x ATR loss\n"
                             f"Entry: {entry_price:.6g} | Current: {current_price:.6g}\n"
                             f"Remaining 50% protected by server SL at {STOP_LOSS_ATR_MULT}x ATR\n"
-                            f"If price recovers, trailing can still activate."
+                            f"If price recovers, TP/trailing can still activate."
                         )
                     )
             elif current_qty is None:
-                # Position fully gone — both SL tiers may have fired
                 symbol_sl1_taken[symbol] = True
                 await context.bot.send_message(
                     chat_id=chat_id,
@@ -1274,11 +1337,8 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                 return
 
         # ── CLIENT-SIDE BACKUP: ATR Stop-Loss Checks ──
-        # Server-side orders should fire first, but this is a safety net.
-        # Skip if trailing is active (SL was cancelled, trail order handles risk).
-        if not symbol_trailing_active.get(symbol, False) and not symbol_partial_taken.get(symbol, False):
+        if not symbol_trailing_active.get(symbol, False) and not symbol_partial_taken.get(symbol, False) and not tp1_taken:
             if current_open_trade_side == "Buy":
-                # Check 3x ATR (full remaining close)
                 stop_loss_price_full = entry_price - (STOP_LOSS_ATR_MULT * entry_atr)
                 if current_price <= stop_loss_price_full:
                     await context.bot.send_message(
@@ -1287,8 +1347,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                             f"\U0001f6d1 STOP-LOSS HIT for {symbol} (Long) [Backup check]\n"
                             f"Entry: {entry_price} | Stop: {stop_loss_price_full:.6g}\n"
                             f"Current Price: {current_price} | ATR: {entry_atr:.6g}\n"
-                            f"Loss at {STOP_LOSS_ATR_MULT}x ATR. Closing remaining position.\n"
-                            f"(Server-side SL should have fired first)"
+                            f"Loss at {STOP_LOSS_ATR_MULT}x ATR. Closing remaining position."
                         )
                     )
                     await cancel_server_stops(symbol)
@@ -1297,15 +1356,14 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                     symbol_open_trade_side[symbol] = None
                     return
 
-                # Check 1.5x ATR (50% close) — backup if conditional order missed
                 if not sl1_taken:
-                    stop_loss_price_30 = entry_price - (SL_STAGE1_ATR_MULT * entry_atr)
-                    if current_price <= stop_loss_price_30:
+                    stop_loss_price_sl1 = entry_price - (SL_STAGE1_ATR_MULT * entry_atr)
+                    if current_price <= stop_loss_price_sl1:
                         await context.bot.send_message(
                             chat_id=chat_id,
                             text=(
-                                    f"\U0001f6d1 SL TIER 1 (Backup) for {symbol} (Long)\n"
-                                    f"Closing 50% at {SL_STAGE1_ATR_MULT}x ATR loss\n"
+                                f"\U0001f6d1 SL TIER 1 (Backup) for {symbol} (Long)\n"
+                                f"Closing 50% at {SL_STAGE1_ATR_MULT}x ATR loss\n"
                                 f"Entry: {entry_price} | Current: {current_price}"
                             )
                         )
@@ -1315,7 +1373,6 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                         sl1_taken = True
 
             elif current_open_trade_side == "Sell":
-                # Check 3x ATR (full remaining close)
                 stop_loss_price_full = entry_price + (STOP_LOSS_ATR_MULT * entry_atr)
                 if current_price >= stop_loss_price_full:
                     await context.bot.send_message(
@@ -1324,8 +1381,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                             f"\U0001f6d1 STOP-LOSS HIT for {symbol} (Short) [Backup check]\n"
                             f"Entry: {entry_price} | Stop: {stop_loss_price_full:.6g}\n"
                             f"Current Price: {current_price} | ATR: {entry_atr:.6g}\n"
-                            f"Loss at {STOP_LOSS_ATR_MULT}x ATR. Closing remaining position.\n"
-                            f"(Server-side SL should have fired first)"
+                            f"Loss at {STOP_LOSS_ATR_MULT}x ATR. Closing remaining position."
                         )
                     )
                     await cancel_server_stops(symbol)
@@ -1334,10 +1390,9 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                     symbol_open_trade_side[symbol] = None
                     return
 
-                # Check 1.5x ATR (50% close) — backup if conditional order missed
                 if not sl1_taken:
-                    stop_loss_price_30 = entry_price + (SL_STAGE1_ATR_MULT * entry_atr)
-                    if current_price >= stop_loss_price_30:
+                    stop_loss_price_sl1 = entry_price + (SL_STAGE1_ATR_MULT * entry_atr)
+                    if current_price >= stop_loss_price_sl1:
                         await context.bot.send_message(
                             chat_id=chat_id,
                             text=(
@@ -1351,53 +1406,89 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                         symbol_sl1_taken[symbol] = True
                         sl1_taken = True
 
-        # ── TRAILING STOP: Multi-stage trailing ──
-        # Stage 1: At 1.5x ATR profit, trail on 60%. Bybit closes INSTANTLY when hit.
-        # Stage 2: After 60% closed, trail on 30% (1x ATR distance).
-        # Stage 3: Remaining 10% — no trail, exits on Exit Rules only.
+        # ── TAKE-PROFIT + TRAILING STOP: Multi-stage ──
         trailing_active = symbol_trailing_active.get(symbol, False)
         partial_taken = symbol_partial_taken.get(symbol, False)
         stage2_active = symbol_stage2_active.get(symbol, False)
         stage2_taken = symbol_stage2_taken.get(symbol, False)
+        original_qty = symbol_original_qty.get(symbol)
 
         if current_open_trade_side == "Buy":
-            unrealized_profit = peak - entry_price
+            unrealized_profit_atr = (current_price - entry_price) / entry_atr if entry_atr else 0
 
-            # ── Stage 1: Activate 60% trail stop ──
-            if unrealized_profit >= TRAILING_ACTIVATE_ATR * entry_atr and not trailing_active:
+            # ── TP1: At 1.5x ATR profit → close 20%, move SL to 0.5x ATR profit ──
+            if not tp1_taken and unrealized_profit_atr >= TP1_ATR_MULT and original_qty:
+                tp1_qty = original_qty * TP1_CLOSE_PCT
+                closed = await close_position_by_qty(symbol, "Buy", tp1_qty)
+                if closed:
+                    symbol_tp1_taken[symbol] = True
+                    tp1_taken = True
+                    # Cancel SL1 order (no longer needed, SL moving to profit)
+                    await cancel_sl1_order(symbol)
+                    symbol_sl1_taken[symbol] = True
+                    sl1_taken = True
+                    # Move server SL to lock in 0.5x ATR profit
+                    new_sl = entry_price + (TP1_SL_MOVE_ATR * entry_atr)
+                    await set_server_stop_loss(symbol, "Buy", new_sl)
+                    save_state()
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"\U0001f3af TP1 HIT for {symbol} (Long)\n"
+                            f"Closed 20% at {TP1_ATR_MULT}x ATR profit\n"
+                            f"Entry: {entry_price:.6g} | Current: {current_price:.6g}\n"
+                            f"SL moved to {new_sl:.6g} (locking in {TP1_SL_MOVE_ATR}x ATR profit)\n"
+                            f"Remaining: 80% of original position"
+                        )
+                    )
+
+            # ── Stage 1 Trail: At 2.0x ATR profit, trail on 30% ──
+            if tp1_taken and not trailing_active and unrealized_profit_atr >= TRAILING_ACTIVATE_ATR and original_qty:
                 symbol_trailing_active[symbol] = True
                 trailing_active = True
                 save_state()
 
-                pos_qty = await get_position_size(symbol)
-                if pos_qty:
-                    trail_qty = pos_qty * TRAILING_CLOSE_PCT
-                    trail_stop_price = peak - (TRAILING_STOP_ATR * entry_atr)
+                trail_qty = original_qty * TRAILING_CLOSE_PCT
+                trail_stop_price = peak - (TRAILING_STOP_ATR * entry_atr)
 
-                    # Cancel SL1 tier order (trailing now manages exit)
-                    # Keep server-side SL active to protect remaining 40% (and later 10%)
-                    await cancel_sl1_order(symbol)
-
-                    # Place conditional stop order for 60% at trail price
-                    order_id = await place_trail_stop_order(symbol, "Buy", trail_qty, trail_stop_price)
-
-                    if order_id:
-                        await context.bot.send_message(
-                            chat_id=chat_id,
-                            text=(
-                                f"\U0001f4c8 TRAILING ACTIVATED for {symbol} (Long)\n"
-                                f"Profit reached {TRAILING_ACTIVATE_ATR}x ATR ({unrealized_profit:.6g})\n"
-                                f"Peak: {peak:.6g} | Current: {current_price}\n"
-                                f"Stage 1: Trail on {TRAILING_CLOSE_PCT*100:.0f}% at {trail_stop_price:.6g} ({TRAILING_STOP_ATR}x ATR)\n"
-                                f"Trail moves UP as price rises. Bybit executes INSTANTLY when hit.\n"
-                                f"After 60% closed: 30% gets trail ({TRAILING_STOP_ATR_STAGE2}x ATR), 10% rides until Exit Rules."
-                            )
+                order_id = await place_trail_stop_order(symbol, "Buy", trail_qty, trail_stop_price)
+                if order_id:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"\U0001f4c8 STAGE 1 TRAIL ACTIVATED for {symbol} (Long)\n"
+                            f"Profit reached {TRAILING_ACTIVATE_ATR}x ATR\n"
+                            f"Peak: {peak:.6g} | Trail on 30% at {trail_stop_price:.6g} ({TRAILING_STOP_ATR}x ATR dist)\n"
+                            f"Bybit executes INSTANTLY when hit."
                         )
-                    else:
-                        await context.bot.send_message(
-                            chat_id=chat_id,
-                            text=f"\u26a0\ufe0f {symbol}: Trail activated but failed to place stop order. Will retry."
+                    )
+                else:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"\u26a0\ufe0f {symbol}: Stage 1 trail failed to place. Will retry."
+                    )
+
+            # ── TP2: At 3.5x ATR profit → close 25%, move SL to 1.0x ATR profit ──
+            if tp1_taken and not tp2_taken and unrealized_profit_atr >= TP2_ATR_MULT and original_qty:
+                tp2_qty = original_qty * TP2_CLOSE_PCT
+                closed = await close_position_by_qty(symbol, "Buy", tp2_qty)
+                if closed:
+                    symbol_tp2_taken[symbol] = True
+                    tp2_taken = True
+                    # Move server SL to lock in 1.0x ATR profit
+                    new_sl = entry_price + (TP2_SL_MOVE_ATR * entry_atr)
+                    await set_server_stop_loss(symbol, "Buy", new_sl)
+                    save_state()
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"\U0001f3af TP2 HIT for {symbol} (Long)\n"
+                            f"Closed 25% at {TP2_ATR_MULT}x ATR profit\n"
+                            f"Entry: {entry_price:.6g} | Current: {current_price:.6g}\n"
+                            f"SL moved to {new_sl:.6g} (locking in {TP2_SL_MOVE_ATR}x ATR profit)\n"
+                            f"Remaining: 55% (30% trail + 20% stage2 + 5% exit rules)"
                         )
+                    )
 
             # ── Stage 1: Update trail price if peak moved (trail only moves UP for longs) ──
             if trailing_active and not partial_taken:
@@ -1405,37 +1496,19 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                 new_trail_price = peak - (TRAILING_STOP_ATR * entry_atr)
 
                 if current_trail is not None and new_trail_price > current_trail:
-                    success = await amend_trail_stop_price(symbol, new_trail_price)
-                    if not success:
-                        pass
+                    await amend_trail_stop_price(symbol, new_trail_price)
 
-                # ── Detect if the 60% trail order has been filled ──
+                # Detect if Stage 1 trail order has been filled
                 current_qty = await get_position_size(symbol)
                 trail_qty = symbol_trail_qty.get(symbol)
-                if current_qty is not None and trail_qty is not None:
-                    if trail_qty > 0 and current_qty <= trail_qty * 0.15:
-                        # Position is now ~0 — trail closed everything (too small to split)
-                        symbol_partial_taken[symbol] = True
-                        trail_price_display = symbol_trail_price.get(symbol, 0)
-                        await context.bot.send_message(
-                            chat_id=chat_id,
-                            text=(
-                                f"\U0001f3c1 TRAILING STOP HIT for {symbol} (Long)\n"
-                                f"Trail price: {trail_price_display:.6g}\n"
-                                f"Full position closed (too small to split). Going FLAT."
-                            )
-                        )
-                        symbol_trends[symbol] = None
-                        symbol_open_trade_side[symbol] = None
-                        _clear_risk_state(symbol)
-                        return
-                elif current_qty is None and trailing_active:
+
+                if current_qty is None:
                     symbol_partial_taken[symbol] = True
                     trail_price_display = symbol_trail_price.get(symbol, 0)
                     await context.bot.send_message(
                         chat_id=chat_id,
                         text=(
-                            f"\U0001f3c1 TRAILING STOP HIT for {symbol} (Long)\n"
+                            f"\U0001f3c1 STAGE 1 TRAIL HIT for {symbol} (Long)\n"
                             f"Trail price: {trail_price_display:.6g}\n"
                             f"Full position closed. Going FLAT."
                         )
@@ -1445,11 +1518,26 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                     _clear_risk_state(symbol)
                     return
 
-                # Check if trail order filled but position still exists = 60% was closed
                 if current_qty is not None and trail_qty is not None:
+                    if trail_qty > 0 and current_qty <= trail_qty * 0.15:
+                        symbol_partial_taken[symbol] = True
+                        trail_price_display = symbol_trail_price.get(symbol, 0)
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=(
+                                f"\U0001f3c1 STAGE 1 TRAIL HIT for {symbol} (Long)\n"
+                                f"Trail price: {trail_price_display:.6g}\n"
+                                f"Remaining position closed (too small to split). Going FLAT."
+                            )
+                        )
+                        symbol_trends[symbol] = None
+                        symbol_open_trade_side[symbol] = None
+                        _clear_risk_state(symbol)
+                        return
+
                     order_id = symbol_trail_order_id.get(symbol)
                     if order_id and current_qty < trail_qty:
-                        # 60% closed, 40% remains — activate stage 2
+                        # 30% closed by trail — activate Stage 2 on 20% of original
                         symbol_partial_taken[symbol] = True
                         partial_taken = True
                         trail_price_display = symbol_trail_price.get(symbol, 0)
@@ -1461,22 +1549,21 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                         await context.bot.send_message(
                             chat_id=chat_id,
                             text=(
-                                f"\U0001f3c1 STAGE 1 TRAIL closed {TRAILING_CLOSE_PCT*100:.0f}% for {symbol} (Long)\n"
+                                f"\U0001f3c1 STAGE 1 TRAIL closed 30% for {symbol} (Long)\n"
                                 f"Trail price hit: {trail_price_display:.6g}\n"
-                                f"Now placing Stage 2 trail on 30% (1x ATR distance).\n"
-                                f"Remaining 10% will ride until Exit Rules exit."
+                                f"Now placing Stage 2 trail on 20% ({TRAILING_STOP_ATR_STAGE2}x ATR distance).\n"
+                                f"Remaining 5% will ride until Exit Rules exit."
                             )
                         )
 
-                        # ── Immediately activate Stage 2: trail on 30% (75% of remaining 40%) ──
-                        stage2_qty = current_qty * TRAILING_STAGE2_PCT
-                        # Stage 2 peak starts at current price (price just dropped to hit stage 1 trail)
+                        # Activate Stage 2: trail on 20% of original
+                        stage2_qty = original_qty * TRAILING_STAGE2_QTY_PCT if original_qty else current_qty * 0.5
                         symbol_peak_stage2[symbol] = current_price
                         stage2_trail_price = current_price - (TRAILING_STOP_ATR_STAGE2 * entry_atr)
-                        # Ensure stage 2 trail is never below entry price (would be a loss, not profit)
+                        # Never below entry price for longs
                         if stage2_trail_price < entry_price:
                             stage2_trail_price = entry_price
-                            print(f"[STAGE2] {symbol}: Trail price clamped to entry price {entry_price:.6g} (cannot trail below entry for longs)")
+                            print(f"[STAGE2] {symbol}: Trail price clamped to entry price {entry_price:.6g}")
 
                         s2_order_id = await place_conditional_close_order(symbol, "Buy", stage2_qty, stage2_trail_price)
                         if s2_order_id:
@@ -1490,27 +1577,23 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                                 chat_id=chat_id,
                                 text=(
                                     f"\U0001f4c8 STAGE 2 TRAIL placed for {symbol} (Long)\n"
-                                    f"Trail on 30% at {stage2_trail_price:.6g} ({TRAILING_STOP_ATR_STAGE2}x ATR distance)\n"
-                                    f"Trail moves UP as price rises. Bybit executes INSTANTLY when hit.\n"
-                                    f"Remaining 10% continues until Exit Rules exit."
+                                    f"Trail on 20% at {stage2_trail_price:.6g} ({TRAILING_STOP_ATR_STAGE2}x ATR dist)\n"
+                                    f"Never below entry. Bybit executes INSTANTLY when hit.\n"
+                                    f"Remaining 5% continues until Exit Rules."
                                 )
                             )
-                        else:
-                            await context.bot.send_message(
-                                chat_id=chat_id,
-                                text=f"\u26a0\ufe0f {symbol}: Stage 2 trail failed to place. Will retry next cycle."
-                            )
 
-            # ── Stage 2: Update trail and detect fill (after 60% closed) ──
+            # ── Stage 2: Update trail and detect fill ──
             if stage2_active and not stage2_taken:
-                # Update stage 2 peak (only moves UP for longs)
                 stage2_peak = symbol_peak_stage2.get(symbol, current_price)
                 stage2_peak = max(stage2_peak, current_price)
                 symbol_peak_stage2[symbol] = stage2_peak
 
-                # Update stage 2 trail price if peak moved
                 current_s2_trail = symbol_trail2_price.get(symbol)
                 new_s2_trail = stage2_peak - (TRAILING_STOP_ATR_STAGE2 * entry_atr)
+                # Never below entry for longs
+                if new_s2_trail < entry_price:
+                    new_s2_trail = entry_price
                 s2_order_id = symbol_trail2_order_id.get(symbol)
 
                 if current_s2_trail is not None and new_s2_trail > current_s2_trail and s2_order_id:
@@ -1518,12 +1601,10 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                     if success:
                         symbol_trail2_price[symbol] = new_s2_trail
 
-                # Detect stage 2 fill
                 current_qty = await get_position_size(symbol)
                 s2_trail_qty = symbol_trail2_qty.get(symbol)
 
                 if current_qty is None:
-                    # Position fully gone
                     symbol_stage2_taken[symbol] = True
                     trail_price_display = symbol_trail2_price.get(symbol, 0)
                     await context.bot.send_message(
@@ -1541,7 +1622,6 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
 
                 if current_qty is not None and s2_trail_qty is not None:
                     if s2_trail_qty > 0 and current_qty <= s2_trail_qty * 0.15:
-                        # Position too small — stage 2 closed everything remaining
                         symbol_stage2_taken[symbol] = True
                         trail_price_display = symbol_trail2_price.get(symbol, 0)
                         await context.bot.send_message(
@@ -1549,7 +1629,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                             text=(
                                 f"\U0001f3c1 STAGE 2 TRAIL HIT for {symbol} (Long)\n"
                                 f"Trail price: {trail_price_display:.6g}\n"
-                                f"Remaining position closed (too small to split). Going FLAT."
+                                f"Remaining position closed (too small). Going FLAT."
                             )
                         )
                         symbol_trends[symbol] = None
@@ -1558,7 +1638,6 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                         return
 
                     if s2_order_id and current_qty < s2_trail_qty:
-                        # Stage 2 closed 30%, remaining 10% continues
                         symbol_stage2_taken[symbol] = True
                         stage2_taken = True
                         trail_price_display = symbol_trail2_price.get(symbol, 0)
@@ -1567,27 +1646,24 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                         await context.bot.send_message(
                             chat_id=chat_id,
                             text=(
-                                f"\U0001f3c1 STAGE 2 TRAIL closed 30% for {symbol} (Long)\n"
+                                f"\U0001f3c1 STAGE 2 TRAIL closed 20% for {symbol} (Long)\n"
                                 f"Trail price hit: {trail_price_display:.6g}\n"
-                                f"Remaining 10% continues trading.\n"
-                                f"No trailing stop on final 10% — exits on Exit Rules crossover only."
+                                f"Remaining 5% continues trading.\n"
+                                f"No trailing stop on final 5% — exits on Exit Rules only."
                             )
                         )
 
-            # ── Stage 2 retry: If 60% was closed but stage 2 order wasn't placed yet ──
+            # ── Stage 2 retry ──
             if partial_taken and not stage2_active and not stage2_taken:
                 current_qty = await get_position_size(symbol)
-                if current_qty and current_qty > 0:
-                    stage2_qty = current_qty * TRAILING_STAGE2_PCT
+                if current_qty and current_qty > 0 and original_qty:
+                    stage2_qty = original_qty * TRAILING_STAGE2_QTY_PCT
                     s2_peak = symbol_peak_stage2.get(symbol, current_price)
                     s2_peak = max(s2_peak, current_price)
                     symbol_peak_stage2[symbol] = s2_peak
                     stage2_trail_price = s2_peak - (TRAILING_STOP_ATR_STAGE2 * entry_atr)
-                    # Ensure stage 2 trail is never below entry price (would be a loss, not profit)
                     if stage2_trail_price < entry_price:
                         stage2_trail_price = entry_price
-                        print(f"[STAGE2-RETRY] {symbol}: Trail price clamped to entry price {entry_price:.6g} (cannot trail below entry for longs)")
-
                     s2_order_id = await place_conditional_close_order(symbol, "Buy", stage2_qty, stage2_trail_price)
                     if s2_order_id:
                         min_qty, _, qty_step, _ = await get_instrument_constraints(symbol)
@@ -1598,42 +1674,79 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                         print(f"[STAGE2-RETRY] {symbol}: Stage 2 trail placed (retry) at {stage2_trail_price:.6g}")
 
         elif current_open_trade_side == "Sell":
-            unrealized_profit = entry_price - peak  # peak is min for shorts
+            unrealized_profit_atr = (entry_price - current_price) / entry_atr if entry_atr else 0
 
-            # ── Stage 1: Activate 60% trail stop ──
-            if unrealized_profit >= TRAILING_ACTIVATE_ATR * entry_atr and not trailing_active:
+            # ── TP1: At 1.5x ATR profit → close 20%, move SL to 0.5x ATR profit ──
+            if not tp1_taken and unrealized_profit_atr >= TP1_ATR_MULT and original_qty:
+                tp1_qty = original_qty * TP1_CLOSE_PCT
+                closed = await close_position_by_qty(symbol, "Sell", tp1_qty)
+                if closed:
+                    symbol_tp1_taken[symbol] = True
+                    tp1_taken = True
+                    await cancel_sl1_order(symbol)
+                    symbol_sl1_taken[symbol] = True
+                    sl1_taken = True
+                    # Move server SL to lock in 0.5x ATR profit (for shorts, SL goes DOWN)
+                    new_sl = entry_price - (TP1_SL_MOVE_ATR * entry_atr)
+                    await set_server_stop_loss(symbol, "Sell", new_sl)
+                    save_state()
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"\U0001f3af TP1 HIT for {symbol} (Short)\n"
+                            f"Closed 20% at {TP1_ATR_MULT}x ATR profit\n"
+                            f"Entry: {entry_price:.6g} | Current: {current_price:.6g}\n"
+                            f"SL moved to {new_sl:.6g} (locking in {TP1_SL_MOVE_ATR}x ATR profit)\n"
+                            f"Remaining: 80% of original position"
+                        )
+                    )
+
+            # ── Stage 1 Trail: At 2.0x ATR profit, trail on 30% ──
+            if tp1_taken and not trailing_active and unrealized_profit_atr >= TRAILING_ACTIVATE_ATR and original_qty:
                 symbol_trailing_active[symbol] = True
                 trailing_active = True
                 save_state()
 
-                pos_qty = await get_position_size(symbol)
-                if pos_qty:
-                    trail_qty = pos_qty * TRAILING_CLOSE_PCT
-                    trail_stop_price = peak + (TRAILING_STOP_ATR * entry_atr)
+                trail_qty = original_qty * TRAILING_CLOSE_PCT
+                trail_stop_price = peak + (TRAILING_STOP_ATR * entry_atr)
 
-                    # Cancel SL1 tier order (trailing now manages exit)
-                    # Keep server-side SL active to protect remaining 40% (and later 10%)
-                    await cancel_sl1_order(symbol)
-
-                    order_id = await place_trail_stop_order(symbol, "Sell", trail_qty, trail_stop_price)
-
-                    if order_id:
-                        await context.bot.send_message(
-                            chat_id=chat_id,
-                            text=(
-                                f"\U0001f4c8 TRAILING ACTIVATED for {symbol} (Short)\n"
-                                f"Profit reached {TRAILING_ACTIVATE_ATR}x ATR ({unrealized_profit:.6g})\n"
-                                f"Trough: {peak:.6g} | Current: {current_price}\n"
-                                f"Stage 1: Trail on {TRAILING_CLOSE_PCT*100:.0f}% at {trail_stop_price:.6g} ({TRAILING_STOP_ATR}x ATR)\n"
-                                f"Trail moves DOWN as price falls. Bybit executes INSTANTLY when hit.\n"
-                                f"After 60% closed: 30% gets trail ({TRAILING_STOP_ATR_STAGE2}x ATR), 10% rides until Exit Rules."
-                            )
+                order_id = await place_trail_stop_order(symbol, "Sell", trail_qty, trail_stop_price)
+                if order_id:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"\U0001f4c8 STAGE 1 TRAIL ACTIVATED for {symbol} (Short)\n"
+                            f"Profit reached {TRAILING_ACTIVATE_ATR}x ATR\n"
+                            f"Trough: {peak:.6g} | Trail on 30% at {trail_stop_price:.6g} ({TRAILING_STOP_ATR}x ATR dist)\n"
+                            f"Bybit executes INSTANTLY when hit."
                         )
-                    else:
-                        await context.bot.send_message(
-                            chat_id=chat_id,
-                            text=f"\u26a0\ufe0f {symbol}: Trail activated but failed to place stop order. Will retry."
+                    )
+                else:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"\u26a0\ufe0f {symbol}: Stage 1 trail failed to place. Will retry."
+                    )
+
+            # ── TP2: At 3.5x ATR profit → close 25%, move SL to 1.0x ATR profit ──
+            if tp1_taken and not tp2_taken and unrealized_profit_atr >= TP2_ATR_MULT and original_qty:
+                tp2_qty = original_qty * TP2_CLOSE_PCT
+                closed = await close_position_by_qty(symbol, "Sell", tp2_qty)
+                if closed:
+                    symbol_tp2_taken[symbol] = True
+                    tp2_taken = True
+                    new_sl = entry_price - (TP2_SL_MOVE_ATR * entry_atr)
+                    await set_server_stop_loss(symbol, "Sell", new_sl)
+                    save_state()
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"\U0001f3af TP2 HIT for {symbol} (Short)\n"
+                            f"Closed 25% at {TP2_ATR_MULT}x ATR profit\n"
+                            f"Entry: {entry_price:.6g} | Current: {current_price:.6g}\n"
+                            f"SL moved to {new_sl:.6g} (locking in {TP2_SL_MOVE_ATR}x ATR profit)\n"
+                            f"Remaining: 55% (30% trail + 20% stage2 + 5% exit rules)"
                         )
+                    )
 
             # ── Stage 1: Update trail price if trough moved (trail only moves DOWN for shorts) ──
             if trailing_active and not partial_taken:
@@ -1641,36 +1754,19 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                 new_trail_price = peak + (TRAILING_STOP_ATR * entry_atr)
 
                 if current_trail is not None and new_trail_price < current_trail:
-                    success = await amend_trail_stop_price(symbol, new_trail_price)
-                    if not success:
-                        pass
+                    await amend_trail_stop_price(symbol, new_trail_price)
 
-                # ── Detect if the 60% trail order has been filled ──
+                # Detect if Stage 1 trail order has been filled
                 current_qty = await get_position_size(symbol)
                 trail_qty = symbol_trail_qty.get(symbol)
-                if current_qty is not None and trail_qty is not None:
-                    if trail_qty > 0 and current_qty <= trail_qty * 0.15:
-                        symbol_partial_taken[symbol] = True
-                        trail_price_display = symbol_trail_price.get(symbol, 0)
-                        await context.bot.send_message(
-                            chat_id=chat_id,
-                            text=(
-                                f"\U0001f3c1 TRAILING STOP HIT for {symbol} (Short)\n"
-                                f"Trail price: {trail_price_display:.6g}\n"
-                                f"Full position closed (too small to split). Going FLAT."
-                            )
-                        )
-                        symbol_trends[symbol] = None
-                        symbol_open_trade_side[symbol] = None
-                        _clear_risk_state(symbol)
-                        return
-                elif current_qty is None and trailing_active:
+
+                if current_qty is None:
                     symbol_partial_taken[symbol] = True
                     trail_price_display = symbol_trail_price.get(symbol, 0)
                     await context.bot.send_message(
                         chat_id=chat_id,
                         text=(
-                            f"\U0001f3c1 TRAILING STOP HIT for {symbol} (Short)\n"
+                            f"\U0001f3c1 STAGE 1 TRAIL HIT for {symbol} (Short)\n"
                             f"Trail price: {trail_price_display:.6g}\n"
                             f"Full position closed. Going FLAT."
                         )
@@ -1680,11 +1776,25 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                     _clear_risk_state(symbol)
                     return
 
-                # Check if trail order filled but position still exists = 60% was closed
                 if current_qty is not None and trail_qty is not None:
+                    if trail_qty > 0 and current_qty <= trail_qty * 0.15:
+                        symbol_partial_taken[symbol] = True
+                        trail_price_display = symbol_trail_price.get(symbol, 0)
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=(
+                                f"\U0001f3c1 STAGE 1 TRAIL HIT for {symbol} (Short)\n"
+                                f"Trail price: {trail_price_display:.6g}\n"
+                                f"Remaining position closed (too small to split). Going FLAT."
+                            )
+                        )
+                        symbol_trends[symbol] = None
+                        symbol_open_trade_side[symbol] = None
+                        _clear_risk_state(symbol)
+                        return
+
                     order_id = symbol_trail_order_id.get(symbol)
                     if order_id and current_qty < trail_qty:
-                        # 60% closed, 40% remains — activate stage 2
                         symbol_partial_taken[symbol] = True
                         partial_taken = True
                         trail_price_display = symbol_trail_price.get(symbol, 0)
@@ -1696,21 +1806,20 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                         await context.bot.send_message(
                             chat_id=chat_id,
                             text=(
-                                f"\U0001f3c1 STAGE 1 TRAIL closed {TRAILING_CLOSE_PCT*100:.0f}% for {symbol} (Short)\n"
+                                f"\U0001f3c1 STAGE 1 TRAIL closed 30% for {symbol} (Short)\n"
                                 f"Trail price hit: {trail_price_display:.6g}\n"
-                                f"Now placing Stage 2 trail on 30% (1x ATR distance).\n"
-                                f"Remaining 10% will ride until Exit Rules exit."
+                                f"Now placing Stage 2 trail on 20% ({TRAILING_STOP_ATR_STAGE2}x ATR distance).\n"
+                                f"Remaining 5% will ride until Exit Rules exit."
                             )
                         )
 
-                        # ── Immediately activate Stage 2: trail on 30% (75% of remaining) ──
-                        stage2_qty = current_qty * TRAILING_STAGE2_PCT
+                        stage2_qty = original_qty * TRAILING_STAGE2_QTY_PCT if original_qty else current_qty * 0.5
                         symbol_peak_stage2[symbol] = current_price
                         stage2_trail_price = current_price + (TRAILING_STOP_ATR_STAGE2 * entry_atr)
-                        # Ensure stage 2 trail is never above entry price (would be a loss, not profit)
+                        # Never above entry price for shorts
                         if stage2_trail_price > entry_price:
                             stage2_trail_price = entry_price
-                            print(f"[STAGE2] {symbol}: Trail price clamped to entry price {entry_price:.6g} (cannot trail above entry for shorts)")
+                            print(f"[STAGE2] {symbol}: Trail price clamped to entry price {entry_price:.6g}")
 
                         s2_order_id = await place_conditional_close_order(symbol, "Sell", stage2_qty, stage2_trail_price)
                         if s2_order_id:
@@ -1724,27 +1833,23 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                                 chat_id=chat_id,
                                 text=(
                                     f"\U0001f4c8 STAGE 2 TRAIL placed for {symbol} (Short)\n"
-                                    f"Trail on 30% at {stage2_trail_price:.6g} ({TRAILING_STOP_ATR_STAGE2}x ATR distance)\n"
-                                    f"Trail moves DOWN as price falls. Bybit executes INSTANTLY when hit.\n"
-                                    f"Remaining 10% continues until Exit Rules exit."
+                                    f"Trail on 20% at {stage2_trail_price:.6g} ({TRAILING_STOP_ATR_STAGE2}x ATR dist)\n"
+                                    f"Never above entry. Bybit executes INSTANTLY when hit.\n"
+                                    f"Remaining 5% continues until Exit Rules."
                                 )
                             )
-                        else:
-                            await context.bot.send_message(
-                                chat_id=chat_id,
-                                text=f"\u26a0\ufe0f {symbol}: Stage 2 trail failed to place. Will retry next cycle."
-                            )
 
-            # ── Stage 2: Update trail and detect fill (after 60% closed) ──
+            # ── Stage 2: Update trail and detect fill ──
             if stage2_active and not stage2_taken:
-                # Update stage 2 peak (only moves DOWN for shorts)
                 stage2_peak = symbol_peak_stage2.get(symbol, current_price)
                 stage2_peak = min(stage2_peak, current_price)
                 symbol_peak_stage2[symbol] = stage2_peak
 
-                # Update stage 2 trail price if trough moved
                 current_s2_trail = symbol_trail2_price.get(symbol)
                 new_s2_trail = stage2_peak + (TRAILING_STOP_ATR_STAGE2 * entry_atr)
+                # Never above entry for shorts
+                if new_s2_trail > entry_price:
+                    new_s2_trail = entry_price
                 s2_order_id = symbol_trail2_order_id.get(symbol)
 
                 if current_s2_trail is not None and new_s2_trail < current_s2_trail and s2_order_id:
@@ -1752,7 +1857,6 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                     if success:
                         symbol_trail2_price[symbol] = new_s2_trail
 
-                # Detect stage 2 fill
                 current_qty = await get_position_size(symbol)
                 s2_trail_qty = symbol_trail2_qty.get(symbol)
 
@@ -1781,7 +1885,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                             text=(
                                 f"\U0001f3c1 STAGE 2 TRAIL HIT for {symbol} (Short)\n"
                                 f"Trail price: {trail_price_display:.6g}\n"
-                                f"Remaining position closed (too small to split). Going FLAT."
+                                f"Remaining position closed (too small). Going FLAT."
                             )
                         )
                         symbol_trends[symbol] = None
@@ -1798,27 +1902,24 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                         await context.bot.send_message(
                             chat_id=chat_id,
                             text=(
-                                f"\U0001f3c1 STAGE 2 TRAIL closed 30% for {symbol} (Short)\n"
+                                f"\U0001f3c1 STAGE 2 TRAIL closed 20% for {symbol} (Short)\n"
                                 f"Trail price hit: {trail_price_display:.6g}\n"
-                                f"Remaining 10% continues trading.\n"
-                                f"No trailing stop on final 10% — exits on Exit Rules crossover only."
+                                f"Remaining 5% continues trading.\n"
+                                f"No trailing stop on final 5% — exits on Exit Rules only."
                             )
                         )
 
-            # ── Stage 2 retry: If 60% was closed but stage 2 order wasn't placed yet ──
+            # ── Stage 2 retry ──
             if partial_taken and not stage2_active and not stage2_taken:
                 current_qty = await get_position_size(symbol)
-                if current_qty and current_qty > 0:
-                    stage2_qty = current_qty * TRAILING_STAGE2_PCT
+                if current_qty and current_qty > 0 and original_qty:
+                    stage2_qty = original_qty * TRAILING_STAGE2_QTY_PCT
                     s2_peak = symbol_peak_stage2.get(symbol, current_price)
                     s2_peak = min(s2_peak, current_price)
                     symbol_peak_stage2[symbol] = s2_peak
                     stage2_trail_price = s2_peak + (TRAILING_STOP_ATR_STAGE2 * entry_atr)
-                    # Ensure stage 2 trail is never above entry price (would be a loss, not profit)
                     if stage2_trail_price > entry_price:
                         stage2_trail_price = entry_price
-                        print(f"[STAGE2-RETRY] {symbol}: Trail price clamped to entry price {entry_price:.6g} (cannot trail above entry for shorts)")
-
                     s2_order_id = await place_conditional_close_order(symbol, "Sell", stage2_qty, stage2_trail_price)
                     if s2_order_id:
                         min_qty, _, qty_step, _ = await get_instrument_constraints(symbol)
@@ -1829,39 +1930,42 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                         print(f"[STAGE2-RETRY] {symbol}: Stage 2 trail placed (retry) at {stage2_trail_price:.6g}")
 
     # ──────────────────────────────────────────────
-    # 2. EXIT + POSSIBLE REVERSAL (Decoupled)
-    #    Exit requires: price crosses 50 EMA (1h) AND MACD Line/Signal (1h) AND ADX > 25.
-    #    Reverse ONLY if MACD (1h) + ADX > 27 + RSI not extreme. Otherwise go FLAT.
+    # 2. EXIT + REVERSAL
+    #    Exit requires: Price crosses 50 EMA (1h) AND MACD crosses (1h) AND ADX > 25
+    #    Reversal requires: ADX > 27, EMA/MACD alignment, RSI not extreme
+    #    If reversal conditions not met → go FLAT (wait for reversal conditions)
     # ──────────────────────────────────────────────
     if current_open_trade_side is not None:
 
-        # ── Long Exit: close price below 50 EMA (1h) AND MACD Line < Signal Line (1h) AND ADX > 25 ──
+        # ── Long Exit ──
         if current_open_trade_side == "Buy" and last_close < ema_50 and macd_line_1h < signal_line_1h and adx > ADX_EXIT_THRESHOLD:
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=(
                     f"\u26a0\ufe0f EXIT SIGNAL for {symbol} (Long)\n"
                     f"Last Close ({last_close}) < 50 EMA 1h ({ema_50:.6g})\n"
-                    f"MACD Line 1h ({macd_line_1h:.6g}) < Signal Line 1h ({signal_line_1h:.6g}) — bearish alignment\n"
+                    f"MACD Line 1h ({macd_line_1h:.6g}) < Signal Line 1h ({signal_line_1h:.6g})\n"
                     f"ADX: {adx:.2f} > {ADX_EXIT_THRESHOLD}\n"
                     f"Closing Long position..."
                 )
             )
 
-            await cancel_server_stops(symbol)  # Cancel server-side stops before closing
+            await cancel_server_stops(symbol)
             closed_qty = await close_position(symbol, side_to_close="Buy")
+            _clear_risk_state(symbol)
             manual_override = None
             if symbol in symbol_manual_quantities and symbol_manual_quantities[symbol] is not None:
                 manual_override = closed_qty
 
-            # Check if we should REVERSE to Short (requires: Price < 50 EMA (1h) AND MACD < Signal (1h) AND ADX > 27 AND RSI not extreme)
-            if last_close < ema_50 and macd_line_1h < signal_line_1h and adx > ADX_REVERSAL_THRESHOLD and rsi > RSI_OVERSOLD:
+            # Check REVERSAL conditions: ADX > 27, Price < EMA, MACD < Signal, RSI not oversold
+            if adx > ADX_REVERSAL_THRESHOLD and last_close < ema_50 and macd_line_1h < signal_line_1h and rsi > RSI_OVERSOLD:
                 await context.bot.send_message(
                     chat_id=chat_id,
                     text=(
                         f"\U0001f504 REVERSE to Short for {symbol}\n"
+                        f"ADX: {adx:.2f} > {ADX_REVERSAL_THRESHOLD} (reversal threshold)\n"
                         f"Price ({last_close}) < 50 EMA 1h ({ema_50:.6g})\n"
-                        f"MACD 1h ({macd_line_1h:.6g}) < Signal 1h ({signal_line_1h:.6g}) | ADX: {adx:.2f} > {ADX_REVERSAL_THRESHOLD}\n"
+                        f"MACD 1h ({macd_line_1h:.6g}) < Signal 1h ({signal_line_1h:.6g})\n"
                         f"RSI: {rsi:.2f} (not oversold)\n"
                         f"Opening Short..."
                     )
@@ -1869,64 +1973,72 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                 result = await place_trade(symbol, side="Sell", manual_qty_override=manual_override)
                 if result and "error" not in result:
                     order_id = result.get("orderId", "\u2014")
-                    # Get actual fill price from Bybit (not candle close)
                     await asyncio.sleep(1)
                     real_entry = await get_position_entry_price(symbol)
                     fill_price = real_entry if real_entry else last_close
                     _set_entry_risk_state(symbol, fill_price, atr)
-                    # Set server-side stop-loss based on actual fill price
                     sl_price = fill_price + (STOP_LOSS_ATR_MULT * atr)
                     await set_server_stop_loss(symbol, "Sell", sl_price)
                     await context.bot.send_message(chat_id=chat_id, text=f"\u2705 Short order(s) placed for {symbol}\nLast Order ID: <code>{order_id}</code>\nFill Price: {fill_price:.6g}\nServer-side SL: {sl_price:.6g}", parse_mode="HTML")
                     symbol_trends[symbol] = "downward"
                     symbol_open_trade_side[symbol] = "Sell"
+                    symbol_post_exit_flat[symbol] = False
+                    save_state()
                 elif result and "error" in result:
                     await context.bot.send_message(chat_id=chat_id, text=f"\u274c Failed to place Short for {symbol}: {result['error']}")
-                    symbol_trends[symbol] = None
                     symbol_open_trade_side[symbol] = None
+                    symbol_post_exit_flat[symbol] = True
+                    save_state()
             else:
-                # No reverse signal -> go FLAT
+                # Reversal conditions not met → go FLAT
+                reason = []
+                if adx <= ADX_REVERSAL_THRESHOLD:
+                    reason.append(f"ADX ({adx:.2f}) <= {ADX_REVERSAL_THRESHOLD}")
+                if rsi <= RSI_OVERSOLD:
+                    reason.append(f"RSI oversold ({rsi:.2f})")
                 await context.bot.send_message(
                     chat_id=chat_id,
                     text=(
                         f"\U0001f7e1 GOING FLAT for {symbol}\n"
-                        f"No reverse signal (need: Price < 50 EMA 1h + MACD < Signal 1h + ADX > {ADX_REVERSAL_THRESHOLD} + RSI > {RSI_OVERSOLD})\n"
-                        f"MACD 1h: {macd_line_1h:.6g} / Signal 1h: {signal_line_1h:.6g} | ADX: {adx:.2f} | RSI: {rsi:.2f}\n"
-                        f"Waiting for next entry signal..."
+                        f"Reversal conditions not met: {', '.join(reason) if reason else 'conditions not aligned'}\n"
+                        f"ADX: {adx:.2f} (need > {ADX_REVERSAL_THRESHOLD}) | RSI: {rsi:.2f}\n"
+                        f"Waiting for reversal conditions (ADX > {ADX_REVERSAL_THRESHOLD})..."
                     )
                 )
-                symbol_trends[symbol] = None
                 symbol_open_trade_side[symbol] = None
-                _clear_risk_state(symbol)
+                symbol_post_exit_flat[symbol] = True
+                save_state()
             return
 
-        # ── Short Exit: close price above 50 EMA (1h) AND MACD Line > Signal Line (1h) AND ADX > 25 ──
+        # ── Short Exit ──
         elif current_open_trade_side == "Sell" and last_close > ema_50 and macd_line_1h > signal_line_1h and adx > ADX_EXIT_THRESHOLD:
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=(
                     f"\u26a0\ufe0f EXIT SIGNAL for {symbol} (Short)\n"
                     f"Last Close ({last_close}) > 50 EMA 1h ({ema_50:.6g})\n"
-                    f"MACD Line 1h ({macd_line_1h:.6g}) > Signal Line 1h ({signal_line_1h:.6g}) — bullish alignment\n"
+                    f"MACD Line 1h ({macd_line_1h:.6g}) > Signal Line 1h ({signal_line_1h:.6g})\n"
                     f"ADX: {adx:.2f} > {ADX_EXIT_THRESHOLD}\n"
                     f"Closing Short position..."
                 )
             )
 
-            await cancel_server_stops(symbol)  # Cancel server-side stops before closing
+            await cancel_server_stops(symbol)
             closed_qty = await close_position(symbol, side_to_close="Sell")
+            _clear_risk_state(symbol)
             manual_override = None
             if symbol in symbol_manual_quantities and symbol_manual_quantities[symbol] is not None:
                 manual_override = closed_qty
 
-            # Check if we should REVERSE to Long (requires: Price > 50 EMA (1h) AND MACD > Signal (1h) AND ADX > 27 AND RSI not extreme)
-            if last_close > ema_50 and macd_line_1h > signal_line_1h and adx > ADX_REVERSAL_THRESHOLD and rsi < RSI_OVERBOUGHT:
+            # Check REVERSAL conditions: ADX > 27, Price > EMA, MACD > Signal, RSI not overbought
+            if adx > ADX_REVERSAL_THRESHOLD and last_close > ema_50 and macd_line_1h > signal_line_1h and rsi < RSI_OVERBOUGHT:
                 await context.bot.send_message(
                     chat_id=chat_id,
                     text=(
                         f"\U0001f504 REVERSE to Long for {symbol}\n"
+                        f"ADX: {adx:.2f} > {ADX_REVERSAL_THRESHOLD} (reversal threshold)\n"
                         f"Price ({last_close}) > 50 EMA 1h ({ema_50:.6g})\n"
-                        f"MACD 1h ({macd_line_1h:.6g}) > Signal 1h ({signal_line_1h:.6g}) | ADX: {adx:.2f} > {ADX_REVERSAL_THRESHOLD}\n"
+                        f"MACD 1h ({macd_line_1h:.6g}) > Signal 1h ({signal_line_1h:.6g})\n"
                         f"RSI: {rsi:.2f} (not overbought)\n"
                         f"Opening Long..."
                     )
@@ -1934,59 +2046,63 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                 result = await place_trade(symbol, side="Buy", manual_qty_override=manual_override)
                 if result and "error" not in result:
                     order_id = result.get("orderId", "\u2014")
-                    # Get actual fill price from Bybit (not candle close)
                     await asyncio.sleep(1)
                     real_entry = await get_position_entry_price(symbol)
                     fill_price = real_entry if real_entry else last_close
                     _set_entry_risk_state(symbol, fill_price, atr)
-                    # Set server-side stop-loss based on actual fill price
                     sl_price = fill_price - (STOP_LOSS_ATR_MULT * atr)
                     await set_server_stop_loss(symbol, "Buy", sl_price)
                     await context.bot.send_message(chat_id=chat_id, text=f"\u2705 Long order(s) placed for {symbol}\nLast Order ID: <code>{order_id}</code>\nFill Price: {fill_price:.6g}\nServer-side SL: {sl_price:.6g}", parse_mode="HTML")
                     symbol_trends[symbol] = "upward"
                     symbol_open_trade_side[symbol] = "Buy"
+                    symbol_post_exit_flat[symbol] = False
+                    save_state()
                 elif result and "error" in result:
                     await context.bot.send_message(chat_id=chat_id, text=f"\u274c Failed to place Long for {symbol}: {result['error']}")
-                    symbol_trends[symbol] = None
                     symbol_open_trade_side[symbol] = None
+                    symbol_post_exit_flat[symbol] = True
+                    save_state()
             else:
-                # No reverse signal -> go FLAT
+                reason = []
+                if adx <= ADX_REVERSAL_THRESHOLD:
+                    reason.append(f"ADX ({adx:.2f}) <= {ADX_REVERSAL_THRESHOLD}")
+                if rsi >= RSI_OVERBOUGHT:
+                    reason.append(f"RSI overbought ({rsi:.2f})")
                 await context.bot.send_message(
                     chat_id=chat_id,
                     text=(
                         f"\U0001f7e1 GOING FLAT for {symbol}\n"
-                        f"No reverse signal (need: Price > 50 EMA 1h + MACD > Signal 1h + ADX > {ADX_REVERSAL_THRESHOLD} + RSI < {RSI_OVERBOUGHT})\n"
-                        f"MACD 1h: {macd_line_1h:.6g} / Signal 1h: {signal_line_1h:.6g} | ADX: {adx:.2f} | RSI: {rsi:.2f}\n"
-                        f"Waiting for next entry signal..."
+                        f"Reversal conditions not met: {', '.join(reason) if reason else 'conditions not aligned'}\n"
+                        f"ADX: {adx:.2f} (need > {ADX_REVERSAL_THRESHOLD}) | RSI: {rsi:.2f}\n"
+                        f"Waiting for reversal conditions (ADX > {ADX_REVERSAL_THRESHOLD})..."
                     )
                 )
-                symbol_trends[symbol] = None
                 symbol_open_trade_side[symbol] = None
-                _clear_risk_state(symbol)
+                symbol_post_exit_flat[symbol] = True
+                save_state()
             return
 
     # ──────────────────────────────────────────────
-    # 3. INITIAL TRADE ENTRY (no open position)
-    #    4-layer filter (ALL must pass):
-    #      1. ADX > 20
-    #      2. Long: Price > 50 EMA (1h) | Short: Price < 50 EMA (1h)
-    #      3. RSI NOT extreme (not > 70 for longs, not < 30 for shorts)
-    #      4. Long: MACD Line > Signal Line (1h) | Short: MACD Line < Signal Line (1h)
+    # 3. TRADE ENTRY (no open position)
+    #    If post-exit FLAT: use reversal conditions (ADX > 27)
+    #    If fresh entry: use normal conditions (ADX > 20)
+    #    Other filters same: EMA 50 (1h), RSI not extreme, MACD (1h)
     # ──────────────────────────────────────────────
     if current_open_trade_side is None:
+        is_post_exit = symbol_post_exit_flat.get(symbol, False)
+        required_adx = ADX_REVERSAL_THRESHOLD if is_post_exit else ADX_THRESHOLD
+
         # Filter 1: ADX must be above threshold
-        if adx < ADX_THRESHOLD:
+        if adx < required_adx:
             return
 
         new_trend = None
         side = None
         # Long: last_close > 50 EMA (1h)
         if last_close > ema_50:
-            # Filter 3: RSI not overbought for longs
             if rsi > RSI_OVERBOUGHT:
                 print(f"[FILTER] {symbol}: Long entry blocked — RSI overbought ({rsi:.2f} > {RSI_OVERBOUGHT})")
                 return
-            # Filter 4: MACD Line must be above Signal Line (1h chart) for longs
             if macd_line_1h <= signal_line_1h:
                 print(f"[FILTER] {symbol}: Long entry blocked — MACD Line 1h ({macd_line_1h:.6g}) <= Signal Line 1h ({signal_line_1h:.6g})")
                 return
@@ -1994,11 +2110,9 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
             side = "Buy"
         # Short: last_close < 50 EMA (1h)
         elif last_close < ema_50:
-            # Filter 3: RSI not oversold for shorts
             if rsi < RSI_OVERSOLD:
                 print(f"[FILTER] {symbol}: Short entry blocked — RSI oversold ({rsi:.2f} < {RSI_OVERSOLD})")
                 return
-            # Filter 4: MACD Line must be below Signal Line (1h chart) for shorts
             if macd_line_1h >= signal_line_1h:
                 print(f"[FILTER] {symbol}: Short entry blocked — MACD Line 1h ({macd_line_1h:.6g}) >= Signal Line 1h ({signal_line_1h:.6g})")
                 return
@@ -2008,10 +2122,11 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
         if new_trend and side and (previous_trend is None or new_trend != previous_trend):
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             side_text = "Long (Buy)" if side == "Buy" else "Short (Sell)"
+            entry_type = "REVERSAL" if is_post_exit else "ENTRY"
             msg = (
-                f"{ts} \u2014 {symbol} ENTRY SIGNAL: <b>{new_trend.upper()}</b>\n"
+                f"{ts} \u2014 {symbol} {entry_type} SIGNAL: <b>{new_trend.upper()}</b>\n"
                 f"Last Close: {last_close} | 50 EMA 1h: {ema_50:.6g}\n"
-                f"+DI: {plus_di:.2f} | -DI: {minus_di:.2f} | ADX: {adx:.2f}\n"
+                f"+DI: {plus_di:.2f} | -DI: {minus_di:.2f} | ADX: {adx:.2f} (threshold: {required_adx})\n"
                 f"RSI: {rsi:.2f} | MACD 1h: {macd_line_1h:.6g} / Signal 1h: {signal_line_1h:.6g}\n"
                 f"Direction: {side_text}"
             )
@@ -2021,12 +2136,10 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
 
             if result and "error" not in result:
                 order_id = result.get("orderId", "\u2014")
-                # Get actual fill price from Bybit (not candle close)
                 await asyncio.sleep(1)
                 real_entry = await get_position_entry_price(symbol)
                 fill_price = real_entry if real_entry else last_close
                 _set_entry_risk_state(symbol, fill_price, atr)
-                # Set server-side stop-loss based on actual fill price
                 if side == "Buy":
                     sl_price = fill_price - (STOP_LOSS_ATR_MULT * atr)
                 else:
@@ -2038,10 +2151,11 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
 
             symbol_trends[symbol] = new_trend
             symbol_open_trade_side[symbol] = await get_open_position_side(symbol)
+            symbol_post_exit_flat[symbol] = False
             save_state()
 
     # ──────────────────────────────────────────────
-    # 5. 30-Minute Status Report
+    # 4. 30-Minute Status Report
     # ──────────────────────────────────────────────
     current_time = time.time()
     last_report_time = context.job.data.get("last_report_time", 0)
@@ -2051,7 +2165,11 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
         if current_open_trade_side:
             trade_status = f"\u2705 {current_open_trade_side} trade open for {symbol}"
         else:
-            trade_status = f"\u274c No open trade for {symbol} (FLAT)"
+            is_post_exit = symbol_post_exit_flat.get(symbol, False)
+            if is_post_exit:
+                trade_status = f"\u274c No open trade for {symbol} (FLAT — awaiting reversal ADX > {ADX_REVERSAL_THRESHOLD})"
+            else:
+                trade_status = f"\u274c No open trade for {symbol} (FLAT)"
 
         entry_price = symbol_entry_price.get(symbol)
         entry_atr = symbol_entry_atr.get(symbol)
@@ -2077,39 +2195,50 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
             stage2_active_flag = symbol_stage2_active.get(symbol, False)
             stage2_taken_flag = symbol_stage2_taken.get(symbol, False)
             sl1_taken_flag = symbol_sl1_taken.get(symbol, False)
+            tp1_taken_flag = symbol_tp1_taken.get(symbol, False)
+            tp2_taken_flag = symbol_tp2_taken.get(symbol, False)
             server_sl = symbol_server_sl_set.get(symbol, False)
             server_ts = symbol_server_ts_set.get(symbol, False)
             trail_price = symbol_trail_price.get(symbol)
             trail2_price = symbol_trail2_price.get(symbol)
+            # TP status
+            tp_status = f"TP1 ({'HIT' if tp1_taken_flag else 'pending'} @ {TP1_ATR_MULT}x ATR/20%) | TP2 ({'HIT' if tp2_taken_flag else 'pending'} @ {TP2_ATR_MULT}x ATR/25%)"
+            risk_info += f"\n\u2022 Take-Profit: {tp_status}"
+            # Trailing status
             if stage2_taken_flag:
-                trailing_status = '60% + 30% CLOSED by trail. 10% riding until Exit Rules exit'
+                trailing_status = '30% + 20% CLOSED by trail. 5% riding until Exit Rules'
             elif stage2_active_flag and trail2_price:
-                trailing_status = f'Stage 2 ACTIVE - trail on 30% @ {trail2_price:.6g} (1x ATR)'
+                trailing_status = f'Stage 2 ACTIVE - trail on 20% @ {trail2_price:.6g} (1x ATR)'
             elif partial_taken_flag:
-                trailing_status = f'60% CLOSED by trail. Placing 30% trail...'
+                trailing_status = f'30% CLOSED by trail. Placing 20% trail...'
             elif trailing and trail_price:
-                trailing_status = f'Stage 1 ACTIVE - trail on 60% @ {trail_price:.6g} (1x ATR)'
+                trailing_status = f'Stage 1 ACTIVE - trail on 30% @ {trail_price:.6g} (1x ATR)'
             elif trailing:
                 trailing_status = 'Stage 1 ACTIVE (placing trail order...)'
             else:
-                trailing_status = 'Not yet'
+                trailing_status = 'Not yet (activates at 2.0x ATR)'
             risk_info += f"\n\u2022 Trailing Stop: {trailing_status}"
             # SL status
-            if sl1_taken_flag:
+            if tp1_taken_flag:
+                if tp2_taken_flag:
+                    sl_status = f'SL at {TP2_SL_MOVE_ATR}x ATR profit (locked after TP2)'
+                else:
+                    sl_status = f'SL at {TP1_SL_MOVE_ATR}x ATR profit (locked after TP1)'
+            elif sl1_taken_flag:
                 sl_status = f'Tier 1 HIT (50% closed at {SL_STAGE1_ATR_MULT}x ATR). Tier 2 at {STOP_LOSS_ATR_MULT}x ATR protects remaining 50%'
             else:
                 sl_status = f"Tier 1: {'SET' if symbol_sl1_order_id.get(symbol) else 'Not set'} (50% @ {SL_STAGE1_ATR_MULT}x ATR) | Tier 2: {'SET' if server_sl else 'Not set'} (50% @ {STOP_LOSS_ATR_MULT}x ATR)"
             risk_info += f"\n\u2022 Stop-Loss: {sl_status}"
             risk_info += f"\n\u2022 Server-Side SL: {'SET' if server_sl else 'Not set'}"
-            risk_info += f"\n\u2022 Server-Side TS: {'SET' if server_ts else 'Not set'}"
 
         report_msg = (
             f"Still monitoring {symbol}\n"
-            f"\u2022 Entry: 4-layer filter (ADX>{ADX_THRESHOLD}, 50 EMA 1h, RSI, MACD 1h Line/Signal)\n"
-            f"\u2022 Exit: Long exits when Price < 50 EMA (1h) AND MACD < Signal (1h) AND ADX > {ADX_EXIT_THRESHOLD} | Short exits when Price > 50 EMA (1h) AND MACD > Signal (1h) AND ADX > {ADX_EXIT_THRESHOLD}\n"
-            f"\u2022 Reverse: Only if ADX > {ADX_REVERSAL_THRESHOLD} + 50 EMA (1h) + MACD alignment (1h) + RSI not extreme, else FLAT\n"
-            f"\u2022 SL: 50% at {SL_STAGE1_ATR_MULT}x ATR + 50% at {STOP_LOSS_ATR_MULT}x ATR (server SL always active)\n"
-            f"\u2022 Trail: 60% at {TRAILING_ACTIVATE_ATR}x ATR, then 30% at 1x ATR, 10% rides\n"
+            f"\u2022 Entry: 4-layer filter (ADX>{ADX_THRESHOLD}, 50 EMA 1h, RSI, MACD 1h)\n"
+            f"\u2022 Exit: Price crosses 50 EMA (1h) + MACD crosses (1h) + ADX > {ADX_EXIT_THRESHOLD}\n"
+            f"\u2022 Reverse: ADX > {ADX_REVERSAL_THRESHOLD} + EMA/MACD/RSI, else FLAT\n"
+            f"\u2022 SL: 50% at {SL_STAGE1_ATR_MULT}x ATR + 50% at {STOP_LOSS_ATR_MULT}x ATR\n"
+            f"\u2022 TP: 20% at {TP1_ATR_MULT}x ATR, 25% at {TP2_ATR_MULT}x ATR\n"
+            f"\u2022 Trail: 30% at {TRAILING_ACTIVATE_ATR}x ATR, then 20% at 1x ATR, 5% rides\n"
             f"\u2022 WebSocket prices + polling every {POLL_INTERVAL_SECONDS}s\n"
             f"\u2022 50 EMA (1h): {ema_50:.6g} | +DI: {plus_di:.2f} | -DI: {minus_di:.2f} | ADX: {adx:.2f}\n"
             f"\u2022 RSI: {rsi:.2f} | MACD 1h: {macd_line_1h:.6g} / Signal 1h: {signal_line_1h:.6g}\n"
@@ -2279,10 +2408,11 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"Monitoring {symbol}!\n"
         f"\u2022 {qty_info}\n"
         f"\u2022 Entry filters: ADX > {ADX_THRESHOLD} + 50 EMA (1h) + RSI + MACD Line/Signal (1h)\n"
-        f"\u2022 Exit: Long exits when Price < 50 EMA (1h) AND MACD < Signal (1h) AND ADX > {ADX_EXIT_THRESHOLD} | Short exits when Price > 50 EMA (1h) AND MACD > Signal (1h) AND ADX > {ADX_EXIT_THRESHOLD}\n"
-        f"\u2022 Reverse only if ADX > {ADX_REVERSAL_THRESHOLD} + 50 EMA (1h) + MACD alignment (1h) + RSI not extreme, else FLAT\n"
-        f"\u2022 SL: 50% at {SL_STAGE1_ATR_MULT}x ATR + 50% at {STOP_LOSS_ATR_MULT}x ATR (server-side SL always active)\n"
-        f"\u2022 Trail: 60% at {TRAILING_ACTIVATE_ATR}x ATR profit ({TRAILING_STOP_ATR}x ATR dist), then 30% ({TRAILING_STOP_ATR_STAGE2}x ATR dist), 10% rides until Exit Rules exit\n"
+        f"\u2022 Exit: Price crosses 50 EMA (1h) + MACD crosses (1h) + ADX > {ADX_EXIT_THRESHOLD}\n"
+        f"\u2022 Reverse: ADX > {ADX_REVERSAL_THRESHOLD} + EMA/MACD/RSI, else FLAT\n"
+        f"\u2022 SL: 50% at {SL_STAGE1_ATR_MULT}x ATR + 50% at {STOP_LOSS_ATR_MULT}x ATR (server-side)\n"
+        f"\u2022 TP: 20% at {TP1_ATR_MULT}x ATR, 25% at {TP2_ATR_MULT}x ATR\n"
+        f"\u2022 Trail: 30% at {TRAILING_ACTIVATE_ATR}x ATR ({TRAILING_STOP_ATR}x ATR dist), then 20% ({TRAILING_STOP_ATR_STAGE2}x ATR dist), 5% rides\n"
         f"\u2022 WebSocket real-time price feeds + polling every {POLL_INTERVAL_SECONDS}s\n"
         f"\u2022 State persistence: crash recovery via {STATE_FILE}\n"
         f"\u2022 Status report every 30 minutes"
@@ -2329,7 +2459,8 @@ async def remove_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                         symbol_trail_order_id, symbol_trail_qty, symbol_trail_price,
                         symbol_stage2_active, symbol_stage2_taken, symbol_trail2_order_id,
                         symbol_trail2_qty, symbol_trail2_price, symbol_peak_stage2,
-                        symbol_sl1_order_id, symbol_sl1_qty, symbol_sl1_taken, symbol_original_qty]:
+                        symbol_sl1_order_id, symbol_sl1_qty, symbol_sl1_taken, symbol_original_qty,
+                        symbol_tp1_taken, symbol_tp2_taken, symbol_post_exit_flat]:
         if symbol in state_dict:
             del state_dict[symbol]
 
@@ -2347,7 +2478,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("\u26d4 Unauthorized. This bot is private.")
         return
     await update.message.reply_text(
-        "Bot ready! (v15 - 4-Layer Filter + 1h EMA/MACD Entry/Exit/Reversal + WebSocket)\n\n"
+        "Bot ready! (v16 - TP Levels + Tiered SL + Multi-Stage Trail + Reversal Rules)\n\n"
         "Commands:\n"
         "1. /start - Display this message\n"
         "2. /add_symbol <symbol> - Start monitoring with auto-sizing (20% balance)\n"
@@ -2361,12 +2492,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Stop-Loss (Tiered):\n"
         f"\u2022 Tier 1: 50% closed INSTANTLY at {SL_STAGE1_ATR_MULT}x ATR loss\n"
         f"\u2022 Tier 2: Remaining 50% closed at {STOP_LOSS_ATR_MULT}x ATR loss (server-side, always active)\n\n"
+        "Take-Profit Levels:\n"
+        f"\u2022 TP1: At {TP1_ATR_MULT}x ATR profit \u2192 Close {TP1_CLOSE_PCT*100:.0f}%, move SL to {TP1_SL_MOVE_ATR}x ATR profit\n"
+        f"\u2022 TP2: At {TP2_ATR_MULT}x ATR profit \u2192 Close {TP2_CLOSE_PCT*100:.0f}%, move SL to {TP2_SL_MOVE_ATR}x ATR profit\n\n"
         "Trailing Stop (Multi-Stage):\n"
         f"\u2022 At {TRAILING_ACTIVATE_ATR}x ATR profit: Stage 1 trail activates on {TRAILING_CLOSE_PCT*100:.0f}%\n"
         f"\u2022 Stage 1 trail: {TRAILING_STOP_ATR}x ATR distance. Bybit closes {TRAILING_CLOSE_PCT*100:.0f}% INSTANTLY when hit\n"
-        f"\u2022 Stage 2 trail: After 60% closed, 30% gets trail ({TRAILING_STOP_ATR_STAGE2}x ATR distance)\n"
-        f"\u2022 Stage 2 trail will never be placed below entry price (long) or above entry price (short)\n"
-        f"\u2022 Remaining 10% protected by server-side SL + Exit Rules\n\n"
+        f"\u2022 Stage 2 trail: After 30% closed, {TRAILING_STAGE2_QTY_PCT*100:.0f}% gets trail ({TRAILING_STOP_ATR_STAGE2}x ATR distance)\n"
+        "\u2022 Stage 2 trail will never be placed below entry price (long) or above entry price (short)\n"
+        "\u2022 Remaining 5% protected by server-side SL + Exit Rules\n\n"
         "Exit Rules:\n"
         "\u2022 Long exits: Price < 50 EMA (1h) AND MACD Line < Signal Line (1h)\n"
         "\u2022 Short exits: Price > 50 EMA (1h) AND MACD Line > Signal Line (1h)\n"
@@ -2375,8 +2509,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"\u2022 ADX > {ADX_REVERSAL_THRESHOLD}\n"
         "\u2022 Long reversal: Price > 50 EMA (1h) + MACD > Signal (1h)\n"
         "\u2022 Short reversal: Price < 50 EMA (1h) + MACD < Signal (1h)\n"
-        "\u2022 If conditions not met, bot goes FLAT\n"
-        f"\u2022 RSI NOT extreme (not > {RSI_OVERBOUGHT} for longs, not < {RSI_OVERSOLD} for shorts)\n\n"
+        f"\u2022 RSI NOT extreme (not > {RSI_OVERBOUGHT} for longs, not < {RSI_OVERSOLD} for shorts)\n"
+        "\u2022 If conditions not met, bot goes FLAT\n\n"
         "Infrastructure:\n"
         "\u2022 WebSocket real-time price feeds (REST fallback)\n"
         f"\u2022 State persistence: {STATE_FILE} (crash recovery)\n"
