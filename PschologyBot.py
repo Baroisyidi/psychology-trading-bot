@@ -5,6 +5,7 @@ import asyncio
 import random
 import time
 import threading
+import concurrent.futures
 import pandas as pd
 from datetime import datetime
 from typing import Optional, Tuple, List, Dict
@@ -17,6 +18,14 @@ from telegram.ext import (
     ContextTypes,
 )
 from aiohttp import web
+
+# ────────────────────────────────────────────────
+#  Thread pool & concurrency controls
+#  Prevents bot from freezing when monitoring many symbols
+# ────────────────────────────────────────────────
+_executor = concurrent.futures.ThreadPoolExecutor(max_workers=32)
+# Limit concurrent Bybit REST API calls to prevent rate-limiting
+_api_semaphore: asyncio.Semaphore = asyncio.Semaphore(5)
 
 # ────────────────────────────────────────────────
 #  Load environment variables
@@ -257,6 +266,9 @@ symbol_post_exit_flat: dict[str, bool] = {}            # True when FLAT after ex
 # MACD crossover tracking (previous candle state for detecting fresh crosses)
 symbol_prev_macd_above_signal: dict[str, Optional[bool]] = {}  # Was MACD > Signal on previous check?
 
+# Per-symbol monitor execution guard (prevents overlapping monitor runs)
+symbol_monitor_running: dict[str, bool] = {}
+
 
 # ────────────────────────────────────────────────
 #  Constants
@@ -328,194 +340,205 @@ async def get_current_price(symbol: str) -> Optional[float]:
         return None
 
 
+def _compute_indicators_sync(symbol: str, interval: str = "30", limit: int = 100) -> dict:
+    """
+    Synchronous helper: fetches klines from Bybit AND computes all pandas indicators
+    in ONE thread call so that neither the API call nor the heavy pandas math
+    blocks the asyncio event loop.
+    """
+    resp = bybit_session.get_kline(
+        category="linear",
+        symbol=symbol,
+        interval=interval,
+        limit=limit,
+    )
+    klines = resp["result"]["list"]
+    if not klines:
+        raise ValueError("No klines returned")
+
+    df = pd.DataFrame(
+        klines,
+        columns=["timestamp", "open", "high", "low", "close", "volume", "turnover"],
+    ).iloc[::-1].reset_index(drop=True)
+    df["high"] = pd.to_numeric(df["high"], errors="coerce")
+    df["low"] = pd.to_numeric(df["low"], errors="coerce")
+    df["close"] = pd.to_numeric(df["close"], errors="coerce")
+    df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
+
+    if df["close"].isna().any():
+        raise ValueError("Invalid prices")
+
+    # 1. ATR (14) using Wilder's smoothing
+    df["prev_close"] = df["close"].shift(1)
+    df["tr1"] = df["high"] - df["low"]
+    df["tr2"] = (df["high"] - df["prev_close"]).abs()
+    df["tr3"] = (df["low"] - df["prev_close"]).abs()
+    df["tr"] = df[["tr1", "tr2", "tr3"]].max(axis=1)
+    df["atr"] = df["tr"].ewm(alpha=1/14, min_periods=14).mean()
+    atr = float(df["atr"].iloc[-1])
+
+    # 2. DMI: +DI / -DI (14-period, Wilder's smoothing)
+    df["up_move"] = df["high"] - df["high"].shift(1)
+    df["down_move"] = df["low"].shift(1) - df["low"]
+
+    df["+dm"] = 0.0
+    df["-dm"] = 0.0
+    plus_dm_mask = (df["up_move"] > df["down_move"]) & (df["up_move"] > 0)
+    minus_dm_mask = (df["down_move"] > df["up_move"]) & (df["down_move"] > 0)
+    df.loc[plus_dm_mask, "+dm"] = df.loc[plus_dm_mask, "up_move"]
+    df.loc[minus_dm_mask, "-dm"] = df.loc[minus_dm_mask, "down_move"]
+
+    df["+dm_smooth"] = df["+dm"].ewm(alpha=1/14, min_periods=14).mean()
+    df["-dm_smooth"] = df["-dm"].ewm(alpha=1/14, min_periods=14).mean()
+
+    df["+di"] = (df["+dm_smooth"] / df["atr"]) * 100
+    df["-di"] = (df["-dm_smooth"] / df["atr"]) * 100
+
+    plus_di = float(df["+di"].iloc[-1])
+    minus_di = float(df["-di"].iloc[-1])
+    prev_plus_di = float(df["+di"].iloc[-2])
+    prev_minus_di = float(df["-di"].iloc[-2])
+
+    # 3. ADX (Average Directional Index) - 14-period Wilder's smoothing of DX
+    di_sum = df["+di"] + df["-di"]
+    di_sum = di_sum.replace(0, float('nan'))
+    df["dx"] = (abs(df["+di"] - df["-di"]) / di_sum) * 100
+    df["adx"] = df["dx"].ewm(alpha=1/14, min_periods=14).mean()
+    adx = float(df["adx"].iloc[-1])
+    # ADX value from 2 candles ago (for reference/logging)
+    adx_prev2 = float(df["adx"].iloc[-3]) if len(df) >= 3 else adx
+
+    # 4. RSI (14-period, Wilder's smoothing)
+    delta = df["close"].diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = (-delta.where(delta < 0, 0.0))
+    avg_gain = gain.ewm(alpha=1/14, min_periods=14).mean()
+    avg_loss = loss.ewm(alpha=1/14, min_periods=14).mean()
+    rs = avg_gain / avg_loss.replace(0, float('nan'))
+    df["rsi"] = 100 - (100 / (1 + rs))
+    rsi = float(df["rsi"].iloc[-1]) if not pd.isna(df["rsi"].iloc[-1]) else 50.0
+
+    # Detect DI crossover on the latest candle
+    prev_diff = prev_plus_di - prev_minus_di
+    curr_diff = plus_di - minus_di
+
+    di_crossed = False
+    di_cross_type = None
+    if prev_diff <= 0 and curr_diff > 0:
+        di_crossed = True
+        di_cross_type = "bullish"
+    elif prev_diff >= 0 and curr_diff < 0:
+        di_crossed = True
+        di_cross_type = "bearish"
+
+    last_candle_ts = str(df["timestamp"].iloc[-1])
+
+    # Last closed candle price (used for all trading decisions)
+    last_close = float(df["close"].iloc[-2])
+
+    return {
+        "atr": atr,
+        "plus_di": plus_di,
+        "minus_di": minus_di,
+        "prev_plus_di": prev_plus_di,
+        "prev_minus_di": prev_minus_di,
+        "di_crossed": di_crossed,
+        "di_cross_type": di_cross_type,
+        "adx": adx,
+        "adx_prev2": adx_prev2,
+        "rsi": rsi,
+        "last_close": last_close,
+        "last_candle_ts": last_candle_ts,
+    }
+
+
 async def get_all_indicators(
     symbol: str,
     interval: str = "30",
     limit: int = 100,
 ) -> Optional[dict]:
     """
-    Returns a dict with trading indicators from the 30-minute chart:
-    - atr
-    - plus_di, minus_di (current candle)
-    - prev_plus_di, prev_minus_di (previous candle)
-    - di_crossed (bool), di_cross_type ("bullish"/"bearish"/None)
-    - adx, adx_prev2 (ADX 2 candles ago for rising check)
-    - rsi
-    - current_price (live tick via WebSocket or REST)
-    - last_close (closed candle price - used for decisions)
-    - last_candle_ts (for dedup)
-    Note: EMA 50 and MACD are now computed from the 1-hour chart via get_1h_ema_macd().
+    Returns a dict with trading indicators from the 30-minute chart.
+    API call + pandas computation run entirely in a background thread
+    so the asyncio event loop stays responsive for Telegram commands.
     """
     try:
-        resp = await asyncio.to_thread(
-            bybit_session.get_kline,
-            category="linear",
-            symbol=symbol,
-            interval=interval,
-            limit=limit,
-        )
-        klines = resp["result"]["list"]
-        if not klines:
-            raise ValueError("No klines returned")
-
-        df = pd.DataFrame(
-            klines,
-            columns=["timestamp", "open", "high", "low", "close", "volume", "turnover"],
-        ).iloc[::-1].reset_index(drop=True)
-        df["high"] = pd.to_numeric(df["high"], errors="coerce")
-        df["low"] = pd.to_numeric(df["low"], errors="coerce")
-        df["close"] = pd.to_numeric(df["close"], errors="coerce")
-        df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
-
-        if df["close"].isna().any():
-            raise ValueError("Invalid prices")
-
-        # 1. ATR (14) using Wilder's smoothing
-        df["prev_close"] = df["close"].shift(1)
-        df["tr1"] = df["high"] - df["low"]
-        df["tr2"] = (df["high"] - df["prev_close"]).abs()
-        df["tr3"] = (df["low"] - df["prev_close"]).abs()
-        df["tr"] = df[["tr1", "tr2", "tr3"]].max(axis=1)
-        df["atr"] = df["tr"].ewm(alpha=1/14, min_periods=14).mean()
-        atr = float(df["atr"].iloc[-1])
-
-        # 2. DMI: +DI / -DI (14-period, Wilder's smoothing)
-        df["up_move"] = df["high"] - df["high"].shift(1)
-        df["down_move"] = df["low"].shift(1) - df["low"]
-
-        df["+dm"] = 0.0
-        df["-dm"] = 0.0
-        plus_dm_mask = (df["up_move"] > df["down_move"]) & (df["up_move"] > 0)
-        minus_dm_mask = (df["down_move"] > df["up_move"]) & (df["down_move"] > 0)
-        df.loc[plus_dm_mask, "+dm"] = df.loc[plus_dm_mask, "up_move"]
-        df.loc[minus_dm_mask, "-dm"] = df.loc[minus_dm_mask, "down_move"]
-
-        df["+dm_smooth"] = df["+dm"].ewm(alpha=1/14, min_periods=14).mean()
-        df["-dm_smooth"] = df["-dm"].ewm(alpha=1/14, min_periods=14).mean()
-
-        df["+di"] = (df["+dm_smooth"] / df["atr"]) * 100
-        df["-di"] = (df["-dm_smooth"] / df["atr"]) * 100
-
-        plus_di = float(df["+di"].iloc[-1])
-        minus_di = float(df["-di"].iloc[-1])
-        prev_plus_di = float(df["+di"].iloc[-2])
-        prev_minus_di = float(df["-di"].iloc[-2])
-
-        # 3. ADX (Average Directional Index) - 14-period Wilder's smoothing of DX
-        di_sum = df["+di"] + df["-di"]
-        di_sum = di_sum.replace(0, float('nan'))
-        df["dx"] = (abs(df["+di"] - df["-di"]) / di_sum) * 100
-        df["adx"] = df["dx"].ewm(alpha=1/14, min_periods=14).mean()
-        adx = float(df["adx"].iloc[-1])
-        # ADX value from 2 candles ago (for reference/logging)
-        adx_prev2 = float(df["adx"].iloc[-3]) if len(df) >= 3 else adx
-
-        # 4. RSI (14-period, Wilder's smoothing)
-        delta = df["close"].diff()
-        gain = delta.where(delta > 0, 0.0)
-        loss = (-delta.where(delta < 0, 0.0))
-        avg_gain = gain.ewm(alpha=1/14, min_periods=14).mean()
-        avg_loss = loss.ewm(alpha=1/14, min_periods=14).mean()
-        rs = avg_gain / avg_loss.replace(0, float('nan'))
-        df["rsi"] = 100 - (100 / (1 + rs))
-        rsi = float(df["rsi"].iloc[-1]) if not pd.isna(df["rsi"].iloc[-1]) else 50.0
-
-        # Detect DI crossover on the latest candle
-        prev_diff = prev_plus_di - prev_minus_di
-        curr_diff = plus_di - minus_di
-
-        di_crossed = False
-        di_cross_type = None
-        if prev_diff <= 0 and curr_diff > 0:
-            di_crossed = True
-            di_cross_type = "bullish"
-        elif prev_diff >= 0 and curr_diff < 0:
-            di_crossed = True
-            di_cross_type = "bearish"
-
-        last_candle_ts = str(df["timestamp"].iloc[-1])
-
-        # Last closed candle price (used for all trading decisions)
-        last_close = float(df["close"].iloc[-2])
+        async with _api_semaphore:
+            result = await asyncio.to_thread(
+                _compute_indicators_sync, symbol, interval, limit
+            )
 
         # Current price from WebSocket (instant) or REST ticker (fallback)
         current_price = await get_current_price(symbol)
         if current_price is None:
-            current_price = last_close  # ultimate fallback
+            current_price = result["last_close"]  # ultimate fallback
+        result["current_price"] = current_price
 
-        return {
-            "atr": atr,
-            "plus_di": plus_di,
-            "minus_di": minus_di,
-            "prev_plus_di": prev_plus_di,
-            "prev_minus_di": prev_minus_di,
-            "di_crossed": di_crossed,
-            "di_cross_type": di_cross_type,
-            "adx": adx,
-            "adx_prev2": adx_prev2,
-            "rsi": rsi,
-            "current_price": current_price,
-            "last_close": last_close,
-            "last_candle_ts": last_candle_ts,
-        }
+        return result
 
     except Exception as exc:
         print(f"Error in get_all_indicators for {symbol}: {exc}")
         return None
 
 
+def _compute_1h_ema_macd_sync(symbol: str) -> dict:
+    """
+    Synchronous helper: fetches 1-hour klines AND computes EMA/MACD in ONE thread call
+    so neither the API request nor the pandas math blocks the event loop.
+    """
+    resp = bybit_session.get_kline(
+        category="linear",
+        symbol=symbol,
+        interval="60",
+        limit=200,  # 200 1-hour candles (~8 days, enough for EMA 50 and MACD 12,26,9)
+    )
+    klines = resp["result"]["list"]
+    if not klines:
+        raise ValueError("No 1-hour klines returned")
+
+    df = pd.DataFrame(
+        klines,
+        columns=["timestamp", "open", "high", "low", "close", "volume", "turnover"],
+    ).iloc[::-1].reset_index(drop=True)
+    df["close"] = pd.to_numeric(df["close"], errors="coerce")
+
+    if df["close"].isna().any():
+        raise ValueError("Invalid 1-hour prices")
+
+    # 50 EMA (1-hour chart)
+    df["ema_50"] = df["close"].ewm(span=50, adjust=False).mean()
+    ema_50_1h = float(df["ema_50"].iloc[-1])
+
+    # MACD (12, 26, 9) on 1-hour chart
+    df["ema_12"] = df["close"].ewm(span=12, adjust=False).mean()
+    df["ema_26"] = df["close"].ewm(span=26, adjust=False).mean()
+    df["macd_line"] = df["ema_12"] - df["ema_26"]
+    df["signal_line"] = df["macd_line"].ewm(span=9, adjust=False).mean()
+
+    macd_line_1h = float(df["macd_line"].iloc[-1])
+    signal_line_1h = float(df["signal_line"].iloc[-1])
+
+    # Previous candle's MACD/Signal for crossover detection
+    macd_line_1h_prev = float(df["macd_line"].iloc[-2])
+    signal_line_1h_prev = float(df["signal_line"].iloc[-2])
+
+    return {
+        "ema_50_1h": ema_50_1h,
+        "macd_line_1h": macd_line_1h,
+        "signal_line_1h": signal_line_1h,
+        "macd_line_1h_prev": macd_line_1h_prev,
+        "signal_line_1h_prev": signal_line_1h_prev,
+    }
+
+
 async def get_1h_ema_macd(symbol: str) -> Optional[dict]:
     """
     Fetch 1-hour klines and compute 50 EMA and MACD (12, 26, 9).
-    Returns EMA 50, MACD Line, and Signal Line values for entry/exit/reversal decisions.
-    All based on the 1-hour chart as specified by the trading strategy.
+    API call + pandas computation run entirely in a background thread.
     """
     try:
-        resp = await asyncio.to_thread(
-            bybit_session.get_kline,
-            category="linear",
-            symbol=symbol,
-            interval="60",
-            limit=200,  # 200 1-hour candles (~8 days, enough for EMA 50 and MACD 12,26,9)
-        )
-        klines = resp["result"]["list"]
-        if not klines:
-            raise ValueError("No 1-hour klines returned")
-
-        df = pd.DataFrame(
-            klines,
-            columns=["timestamp", "open", "high", "low", "close", "volume", "turnover"],
-        ).iloc[::-1].reset_index(drop=True)
-        df["close"] = pd.to_numeric(df["close"], errors="coerce")
-
-        if df["close"].isna().any():
-            raise ValueError("Invalid 1-hour prices")
-
-        # 50 EMA (1-hour chart)
-        df["ema_50"] = df["close"].ewm(span=50, adjust=False).mean()
-        ema_50_1h = float(df["ema_50"].iloc[-1])
-
-        # MACD (12, 26, 9) on 1-hour chart
-        df["ema_12"] = df["close"].ewm(span=12, adjust=False).mean()
-        df["ema_26"] = df["close"].ewm(span=26, adjust=False).mean()
-        df["macd_line"] = df["ema_12"] - df["ema_26"]
-        df["signal_line"] = df["macd_line"].ewm(span=9, adjust=False).mean()
-
-        macd_line_1h = float(df["macd_line"].iloc[-1])
-        signal_line_1h = float(df["signal_line"].iloc[-1])
-
-        # Previous candle's MACD/Signal for crossover detection
-        macd_line_1h_prev = float(df["macd_line"].iloc[-2])
-        signal_line_1h_prev = float(df["signal_line"].iloc[-2])
-
-        return {
-            "ema_50_1h": ema_50_1h,
-            "macd_line_1h": macd_line_1h,
-            "signal_line_1h": signal_line_1h,
-            "macd_line_1h_prev": macd_line_1h_prev,
-            "signal_line_1h_prev": signal_line_1h_prev,
-        }
-
+        async with _api_semaphore:
+            return await asyncio.to_thread(_compute_1h_ema_macd_sync, symbol)
     except Exception as exc:
         print(f"Error in get_1h_ema_macd for {symbol}: {exc}")
         return None
@@ -1201,6 +1224,23 @@ async def place_trade(symbol: str, side: str = "Buy", manual_qty_override: Optio
 
 async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
     symbol = context.job.data["symbol"]
+
+    # ── Execution guard: skip if previous run hasn't finished yet ──
+    if symbol_monitor_running.get(symbol, False):
+        print(f"[GUARD] {symbol}: Previous monitor cycle still running, skipping this tick")
+        return
+    symbol_monitor_running[symbol] = True
+
+    try:
+        await _monitor_symbol_inner(context, symbol)
+    except Exception as exc:
+        print(f"[MONITOR] {symbol}: Unhandled error: {exc}")
+    finally:
+        symbol_monitor_running[symbol] = False
+
+
+async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str) -> None:
+    """Inner monitor logic, wrapped by execution guard in monitor_symbol()."""
     previous_trend = symbol_trends.get(symbol, None)
     current_open_trade_side = await get_open_position_side(symbol)
     symbol_open_trade_side[symbol] = current_open_trade_side
@@ -2498,10 +2538,13 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if context.job_queue:
         existing_jobs = context.job_queue.get_jobs_by_name(f"{symbol}_monitor")
         if not existing_jobs:
+            # Stagger the first run so all symbols don't fire at once
+            symbol_index = monitored_symbols.index(symbol) if symbol in monitored_symbols else 0
+            stagger_delay = POLL_INTERVAL_SECONDS + (symbol_index * 1.25)
             context.job_queue.run_repeating(
                 callback=monitor_symbol,
                 interval=POLL_INTERVAL_SECONDS,
-                first=POLL_INTERVAL_SECONDS,
+                first=stagger_delay,
                 chat_id=chat_id,
                 name=f"{symbol}_monitor",
                 data={"symbol": symbol, "last_report_time": time.time()},
@@ -2538,7 +2581,7 @@ async def remove_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                         symbol_trail2_qty, symbol_trail2_price, symbol_peak_stage2,
                         symbol_sl1_order_id, symbol_sl1_qty, symbol_sl1_taken, symbol_original_qty,
                         symbol_tp1_taken, symbol_tp2_taken, symbol_post_exit_flat,
-                        symbol_prev_macd_above_signal]:
+                        symbol_prev_macd_above_signal, symbol_monitor_running]:
         if symbol in state_dict:
             del state_dict[symbol]
 
@@ -2556,7 +2599,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("\u26d4 Unauthorized. This bot is private.")
         return
     await update.message.reply_text(
-        "Bot ready! (v17 - MACD Crossover Entry/Exit + Tiered SL + TP + Multi-Stage Trail)\n\n"
+        "Bot ready! (v18 - Concurrency Fix + MACD Crossover Entry/Exit + Tiered SL + TP + Multi-Stage Trail)\n\n"
         "Commands:\n"
         "1. /start - Display this message\n"
         "2. /add_symbol <symbol> - Start monitoring with auto-sizing (20% balance)\n"
@@ -2614,6 +2657,11 @@ async def main():
     print(f"TELEGRAM_TOKEN loaded (length: {len(TELEGRAM_TOKEN)} chars)")
     print(f"CHAT_ID loaded: {CHAT_ID}")
 
+    # Set the larger thread pool so many symbols don't starve the default pool
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(_executor)
+    print(f"[STARTUP] Thread pool set to {_executor._max_workers} workers")
+
     # Load persisted state from disk (crash recovery)
     if load_state():
         print(f"[STARTUP] Restored {len(monitored_symbols)} monitored symbols from state file")
@@ -2640,6 +2688,25 @@ async def main():
             chat_id=CHAT_ID,
             name="motivational_quote_sender",
         )
+
+        # Recreate monitoring jobs for symbols restored from state (crash recovery)
+        # Stagger first-run times so all symbols don't hit the API at once
+        for i, sym in enumerate(monitored_symbols):
+            existing = application.job_queue.get_jobs_by_name(f"{sym}_monitor")
+            if not existing:
+                stagger_delay = POLL_INTERVAL_SECONDS + (i * 1.25)
+                application.job_queue.run_repeating(
+                    callback=monitor_symbol,
+                    interval=POLL_INTERVAL_SECONDS,
+                    first=stagger_delay,
+                    chat_id=CHAT_ID,
+                    name=f"{sym}_monitor",
+                    data={"symbol": sym, "last_report_time": time.time()},
+                )
+                print(f"[STARTUP] Recreated monitor job for {sym} (first run in {stagger_delay:.1f}s)")
+        if monitored_symbols:
+            print(f"[STARTUP] {len(monitored_symbols)} monitor jobs recreated with staggered starts")
+
     print("Telegram application built.")
 
     port = int(os.environ.get("PORT", 10000))
