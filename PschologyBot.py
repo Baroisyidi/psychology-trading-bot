@@ -1237,10 +1237,16 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
 async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str) -> None:
     """Inner monitor logic, wrapped by execution guard in monitor_symbol()."""
     previous_trend = symbol_trends.get(symbol, None)
-    current_open_trade_side = await get_open_position_side(symbol)
+
+    # Fetch all market data in PARALLEL to minimize cycle time and free the
+    # event loop / API semaphore for Telegram command handlers.
+    current_open_trade_side, indicators, ema_macd_1h = await asyncio.gather(
+        get_open_position_side(symbol),
+        get_all_indicators(symbol),
+        get_1h_ema_macd(symbol),
+    )
     symbol_open_trade_side[symbol] = current_open_trade_side
 
-    indicators = await get_all_indicators(symbol)
     if indicators is None:
         print(f"Skipping monitoring for {symbol}: Could not fetch indicators")
         return
@@ -1251,8 +1257,6 @@ async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str)
     adx = indicators["adx"]
     rsi = indicators["rsi"]
 
-    # Fetch 1-hour EMA 50 and MACD for entry/exit/reversal decisions
-    ema_macd_1h = await get_1h_ema_macd(symbol)
     if ema_macd_1h is None:
         print(f"Skipping monitoring for {symbol}: Could not fetch 1h EMA/MACD")
         return
