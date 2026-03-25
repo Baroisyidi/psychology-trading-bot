@@ -25,7 +25,25 @@ from aiohttp import web
 # ────────────────────────────────────────────────
 _executor = concurrent.futures.ThreadPoolExecutor(max_workers=32)
 # Limit concurrent Bybit REST API calls to prevent rate-limiting
-_api_semaphore: asyncio.Semaphore = asyncio.Semaphore(5)
+_api_semaphore: asyncio.Semaphore = asyncio.Semaphore(10)
+
+
+async def _api_call(func, *args, **kwargs):
+    """Wrap ANY synchronous Bybit API call with semaphore + thread.
+    This ensures:
+      1. At most 10 concurrent Bybit REST requests (prevents rate-limiting)
+      2. The call runs in a background thread (event loop stays free)
+      3. A 15-second timeout prevents indefinite hangs
+    """
+    async with _api_semaphore:
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(func, *args, **kwargs),
+                timeout=15.0,
+            )
+        except asyncio.TimeoutError:
+            print(f"[API-TIMEOUT] {func.__name__} timed out after 15s")
+            raise
 
 # ────────────────────────────────────────────────
 #  Load environment variables
@@ -133,44 +151,56 @@ def get_ws_price(symbol: str) -> Optional[float]:
 # ────────────────────────────────────────────────
 STATE_FILE = os.getenv("STATE_FILE", "/opt/render/project/src/bot_state.json")
 
-def save_state():
-    """Save all bot state to JSON file for crash recovery."""
+def _save_state_sync():
+    """Synchronous disk write — called inside a thread to avoid blocking event loop."""
     try:
         state = {
-            "symbol_trends": symbol_trends,
-            "monitored_symbols": monitored_symbols,
-            "symbol_open_trade_side": symbol_open_trade_side,
-            "symbol_manual_quantities": symbol_manual_quantities,
-            "symbol_entry_price": symbol_entry_price,
-            "symbol_entry_atr": symbol_entry_atr,
-            "symbol_peak_price": symbol_peak_price,
-            "symbol_trailing_active": symbol_trailing_active,
-            "symbol_partial_taken": symbol_partial_taken,
-            "symbol_server_sl_set": symbol_server_sl_set,
-            "symbol_server_ts_set": symbol_server_ts_set,
-            "symbol_trail_order_id": symbol_trail_order_id,
-            "symbol_trail_qty": symbol_trail_qty,
-            "symbol_trail_price": symbol_trail_price,
-            "symbol_stage2_active": symbol_stage2_active,
-            "symbol_stage2_taken": symbol_stage2_taken,
-            "symbol_trail2_order_id": symbol_trail2_order_id,
-            "symbol_trail2_qty": symbol_trail2_qty,
-            "symbol_trail2_price": symbol_trail2_price,
-            "symbol_peak_stage2": symbol_peak_stage2,
-            "symbol_sl1_order_id": symbol_sl1_order_id,
-            "symbol_sl1_qty": symbol_sl1_qty,
-            "symbol_sl1_taken": symbol_sl1_taken,
-            "symbol_original_qty": symbol_original_qty,
-            "symbol_tp1_taken": symbol_tp1_taken,
-            "symbol_tp2_taken": symbol_tp2_taken,
-            "symbol_post_exit_flat": symbol_post_exit_flat,
-            "symbol_prev_macd_above_signal": symbol_prev_macd_above_signal,
+            "symbol_trends": dict(symbol_trends),
+            "monitored_symbols": list(monitored_symbols),
+            "symbol_open_trade_side": dict(symbol_open_trade_side),
+            "symbol_manual_quantities": dict(symbol_manual_quantities),
+            "symbol_entry_price": dict(symbol_entry_price),
+            "symbol_entry_atr": dict(symbol_entry_atr),
+            "symbol_peak_price": dict(symbol_peak_price),
+            "symbol_trailing_active": dict(symbol_trailing_active),
+            "symbol_partial_taken": dict(symbol_partial_taken),
+            "symbol_server_sl_set": dict(symbol_server_sl_set),
+            "symbol_server_ts_set": dict(symbol_server_ts_set),
+            "symbol_trail_order_id": dict(symbol_trail_order_id),
+            "symbol_trail_qty": dict(symbol_trail_qty),
+            "symbol_trail_price": dict(symbol_trail_price),
+            "symbol_stage2_active": dict(symbol_stage2_active),
+            "symbol_stage2_taken": dict(symbol_stage2_taken),
+            "symbol_trail2_order_id": dict(symbol_trail2_order_id),
+            "symbol_trail2_qty": dict(symbol_trail2_qty),
+            "symbol_trail2_price": dict(symbol_trail2_price),
+            "symbol_peak_stage2": dict(symbol_peak_stage2),
+            "symbol_sl1_order_id": dict(symbol_sl1_order_id),
+            "symbol_sl1_qty": dict(symbol_sl1_qty),
+            "symbol_sl1_taken": dict(symbol_sl1_taken),
+            "symbol_original_qty": dict(symbol_original_qty),
+            "symbol_tp1_taken": dict(symbol_tp1_taken),
+            "symbol_tp2_taken": dict(symbol_tp2_taken),
+            "symbol_post_exit_flat": dict(symbol_post_exit_flat),
+            "symbol_prev_macd_above_signal": dict(symbol_prev_macd_above_signal),
         }
         with open(STATE_FILE, "w") as f:
             json.dump(state, f, indent=2, default=str)
         print(f"[STATE] Saved state to {STATE_FILE}")
     except Exception as e:
         print(f"[STATE] Failed to save state: {e}")
+
+
+def save_state():
+    """Non-blocking state save: snapshot current dicts and write in a background thread.
+    Safe to call from both sync and async contexts."""
+    try:
+        loop = asyncio.get_running_loop()
+        # We're inside the event loop — schedule the write in a thread
+        loop.run_in_executor(_executor, _save_state_sync)
+    except RuntimeError:
+        # No running loop (e.g., called during module setup) — write synchronously
+        _save_state_sync()
 
 def load_state():
     """Load bot state from JSON file on startup."""
@@ -228,7 +258,6 @@ symbol_trends: dict[str, Optional[str]] = {}
 monitored_symbols: list[str] = []
 symbol_open_trade_side: dict[str, Optional[str]] = {}
 symbol_manual_quantities: dict[str, Optional[float]] = {}
-symbol_last_di_cross_candle: dict[str, Optional[str]] = {}
 
 # Per-symbol risk management tracking
 symbol_entry_price: dict[str, Optional[float]] = {}
@@ -329,7 +358,7 @@ async def get_current_price(symbol: str) -> Optional[float]:
     if ws_price is not None:
         return ws_price
     try:
-        ticker_resp = await asyncio.to_thread(
+        ticker_resp = await _api_call(
             bybit_session.get_tickers,
             category="linear",
             symbol=symbol
@@ -340,11 +369,19 @@ async def get_current_price(symbol: str) -> Optional[float]:
         return None
 
 
-def _compute_indicators_sync(symbol: str, interval: str = "30", limit: int = 100) -> dict:
+def _compute_indicators_sync(symbol: str, interval: str = "30", limit: int = 50) -> dict:
     """
-    Synchronous helper: fetches klines from Bybit AND computes all pandas indicators
-    in ONE thread call so that neither the API call nor the heavy pandas math
-    blocks the asyncio event loop.
+    Synchronous helper: fetches klines from Bybit AND computes ATR, ADX, RSI
+    in ONE thread call so neither the API call nor the pandas math blocks the
+    asyncio event loop.
+
+    Only computes indicators actually used by the trading strategy:
+      - ATR (14)  → stop-loss / take-profit / trailing distances
+      - ADX (14)  → trend strength filter (> 20)
+      - RSI (14)  → overbought/oversold filter
+      - last_close → price vs 50 EMA comparison
+    DI crossover, +DI/-DI values, volume, and timestamps are NOT used by
+    the strategy and have been removed to cut computation time.
     """
     resp = bybit_session.get_kline(
         category="linear",
@@ -363,92 +400,49 @@ def _compute_indicators_sync(symbol: str, interval: str = "30", limit: int = 100
     df["high"] = pd.to_numeric(df["high"], errors="coerce")
     df["low"] = pd.to_numeric(df["low"], errors="coerce")
     df["close"] = pd.to_numeric(df["close"], errors="coerce")
-    df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
 
     if df["close"].isna().any():
         raise ValueError("Invalid prices")
 
     # 1. ATR (14) using Wilder's smoothing
     df["prev_close"] = df["close"].shift(1)
-    df["tr1"] = df["high"] - df["low"]
-    df["tr2"] = (df["high"] - df["prev_close"]).abs()
-    df["tr3"] = (df["low"] - df["prev_close"]).abs()
-    df["tr"] = df[["tr1", "tr2", "tr3"]].max(axis=1)
+    df["tr"] = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - df["prev_close"]).abs(),
+        (df["low"] - df["prev_close"]).abs(),
+    ], axis=1).max(axis=1)
     df["atr"] = df["tr"].ewm(alpha=1/14, min_periods=14).mean()
     atr = float(df["atr"].iloc[-1])
 
-    # 2. DMI: +DI / -DI (14-period, Wilder's smoothing)
+    # 2. ADX (14) — only need DX internally, not +DI/-DI values
     df["up_move"] = df["high"] - df["high"].shift(1)
     df["down_move"] = df["low"].shift(1) - df["low"]
+    plus_dm = df["up_move"].where((df["up_move"] > df["down_move"]) & (df["up_move"] > 0), 0.0)
+    minus_dm = df["down_move"].where((df["down_move"] > df["up_move"]) & (df["down_move"] > 0), 0.0)
+    plus_di = (plus_dm.ewm(alpha=1/14, min_periods=14).mean() / df["atr"]) * 100
+    minus_di = (minus_dm.ewm(alpha=1/14, min_periods=14).mean() / df["atr"]) * 100
+    di_sum = (plus_di + minus_di).replace(0, float('nan'))
+    dx = ((plus_di - minus_di).abs() / di_sum) * 100
+    adx = float(dx.ewm(alpha=1/14, min_periods=14).mean().iloc[-1])
 
-    df["+dm"] = 0.0
-    df["-dm"] = 0.0
-    plus_dm_mask = (df["up_move"] > df["down_move"]) & (df["up_move"] > 0)
-    minus_dm_mask = (df["down_move"] > df["up_move"]) & (df["down_move"] > 0)
-    df.loc[plus_dm_mask, "+dm"] = df.loc[plus_dm_mask, "up_move"]
-    df.loc[minus_dm_mask, "-dm"] = df.loc[minus_dm_mask, "down_move"]
-
-    df["+dm_smooth"] = df["+dm"].ewm(alpha=1/14, min_periods=14).mean()
-    df["-dm_smooth"] = df["-dm"].ewm(alpha=1/14, min_periods=14).mean()
-
-    df["+di"] = (df["+dm_smooth"] / df["atr"]) * 100
-    df["-di"] = (df["-dm_smooth"] / df["atr"]) * 100
-
-    plus_di = float(df["+di"].iloc[-1])
-    minus_di = float(df["-di"].iloc[-1])
-    prev_plus_di = float(df["+di"].iloc[-2])
-    prev_minus_di = float(df["-di"].iloc[-2])
-
-    # 3. ADX (Average Directional Index) - 14-period Wilder's smoothing of DX
-    di_sum = df["+di"] + df["-di"]
-    di_sum = di_sum.replace(0, float('nan'))
-    df["dx"] = (abs(df["+di"] - df["-di"]) / di_sum) * 100
-    df["adx"] = df["dx"].ewm(alpha=1/14, min_periods=14).mean()
-    adx = float(df["adx"].iloc[-1])
-    # ADX value from 2 candles ago (for reference/logging)
-    adx_prev2 = float(df["adx"].iloc[-3]) if len(df) >= 3 else adx
-
-    # 4. RSI (14-period, Wilder's smoothing)
+    # 3. RSI (14-period, Wilder's smoothing)
     delta = df["close"].diff()
     gain = delta.where(delta > 0, 0.0)
     loss = (-delta.where(delta < 0, 0.0))
     avg_gain = gain.ewm(alpha=1/14, min_periods=14).mean()
     avg_loss = loss.ewm(alpha=1/14, min_periods=14).mean()
     rs = avg_gain / avg_loss.replace(0, float('nan'))
-    df["rsi"] = 100 - (100 / (1 + rs))
-    rsi = float(df["rsi"].iloc[-1]) if not pd.isna(df["rsi"].iloc[-1]) else 50.0
-
-    # Detect DI crossover on the latest candle
-    prev_diff = prev_plus_di - prev_minus_di
-    curr_diff = plus_di - minus_di
-
-    di_crossed = False
-    di_cross_type = None
-    if prev_diff <= 0 and curr_diff > 0:
-        di_crossed = True
-        di_cross_type = "bullish"
-    elif prev_diff >= 0 and curr_diff < 0:
-        di_crossed = True
-        di_cross_type = "bearish"
-
-    last_candle_ts = str(df["timestamp"].iloc[-1])
+    rsi_series = 100 - (100 / (1 + rs))
+    rsi = float(rsi_series.iloc[-1]) if not pd.isna(rsi_series.iloc[-1]) else 50.0
 
     # Last closed candle price (used for all trading decisions)
     last_close = float(df["close"].iloc[-2])
 
     return {
         "atr": atr,
-        "plus_di": plus_di,
-        "minus_di": minus_di,
-        "prev_plus_di": prev_plus_di,
-        "prev_minus_di": prev_minus_di,
-        "di_crossed": di_crossed,
-        "di_cross_type": di_cross_type,
         "adx": adx,
-        "adx_prev2": adx_prev2,
         "rsi": rsi,
         "last_close": last_close,
-        "last_candle_ts": last_candle_ts,
     }
 
 
@@ -463,10 +457,7 @@ async def get_all_indicators(
     so the asyncio event loop stays responsive for Telegram commands.
     """
     try:
-        async with _api_semaphore:
-            result = await asyncio.to_thread(
-                _compute_indicators_sync, symbol, interval, limit
-            )
+        result = await _api_call(_compute_indicators_sync, symbol, interval, limit)
 
         # Current price from WebSocket (instant) or REST ticker (fallback)
         current_price = await get_current_price(symbol)
@@ -537,8 +528,7 @@ async def get_1h_ema_macd(symbol: str) -> Optional[dict]:
     API call + pandas computation run entirely in a background thread.
     """
     try:
-        async with _api_semaphore:
-            return await asyncio.to_thread(_compute_1h_ema_macd_sync, symbol)
+        return await _api_call(_compute_1h_ema_macd_sync, symbol)
     except Exception as exc:
         print(f"Error in get_1h_ema_macd for {symbol}: {exc}")
         return None
@@ -548,7 +538,7 @@ async def get_1h_ema_macd(symbol: str) -> Optional[dict]:
 
 async def get_open_position_side(symbol: str) -> Optional[str]:
     try:
-        positions_resp = await asyncio.to_thread(
+        positions_resp = await _api_call(
             bybit_session.get_positions,
             category="linear",
             symbol=symbol
@@ -564,7 +554,7 @@ async def get_open_position_side(symbol: str) -> Optional[str]:
 
 async def get_instrument_constraints(symbol: str) -> Tuple[float, float, float, float]:
     try:
-        info = await asyncio.to_thread(
+        info = await _api_call(
             bybit_session.get_instruments_info,
             category="linear",
             symbol=symbol
@@ -608,7 +598,7 @@ async def get_trade_qty(symbol: str) -> float:
             min_qty, max_qty, qty_step, _ = await get_instrument_constraints(symbol)
             return round_qty_to_step(manual_qty, qty_step, min_qty)
 
-        balance_resp = await asyncio.to_thread(
+        balance_resp = await _api_call(
             bybit_session.get_wallet_balance,
             accountType="UNIFIED"
         )
@@ -655,7 +645,7 @@ async def close_position(symbol: str, side_to_close: str = "Buy") -> Optional[fl
     Also clears risk management state for the symbol.
     """
     try:
-        positions_resp = await asyncio.to_thread(
+        positions_resp = await _api_call(
             bybit_session.get_positions,
             category="linear",
             symbol=symbol
@@ -677,7 +667,7 @@ async def close_position(symbol: str, side_to_close: str = "Buy") -> Optional[fl
 
                     qty_str = format_qty_str(current_batch_qty, qty_step)
 
-                    order = await asyncio.to_thread(
+                    order = await _api_call(
                         bybit_session.place_order,
                         category="linear",
                         symbol=symbol,
@@ -712,7 +702,7 @@ async def close_partial_position(symbol: str, side_to_close: str = "Buy", close_
     Does NOT clear risk management state — the remaining position stays open.
     """
     try:
-        positions_resp = await asyncio.to_thread(
+        positions_resp = await _api_call(
             bybit_session.get_positions,
             category="linear",
             symbol=symbol
@@ -742,7 +732,7 @@ async def close_partial_position(symbol: str, side_to_close: str = "Buy", close_
 
                     qty_str = format_qty_str(current_batch_qty, qty_step)
 
-                    order = await asyncio.to_thread(
+                    order = await _api_call(
                         bybit_session.place_order,
                         category="linear",
                         symbol=symbol,
@@ -839,7 +829,7 @@ async def set_server_stop_loss(symbol: str, side: str, stop_price: float) -> boo
     Bybit's engine will execute this instantly when price hits the stop level.
     """
     try:
-        resp = await asyncio.to_thread(
+        resp = await _api_call(
             bybit_session.set_trading_stop,
             category="linear",
             symbol=symbol,
@@ -863,7 +853,7 @@ async def set_server_stop_loss(symbol: str, side: str, stop_price: float) -> boo
 async def get_position_size(symbol: str) -> Optional[float]:
     """Get current position size (qty) for a symbol. Returns None if no position."""
     try:
-        resp = await asyncio.to_thread(
+        resp = await _api_call(
             bybit_session.get_positions,
             category="linear",
             symbol=symbol,
@@ -883,7 +873,7 @@ async def get_position_entry_price(symbol: str) -> Optional[float]:
     """Get the actual average entry price of the current position from Bybit.
     This is the real fill price, not the candle close price at signal time."""
     try:
-        resp = await asyncio.to_thread(
+        resp = await _api_call(
             bybit_session.get_positions,
             category="linear",
             symbol=symbol,
@@ -919,7 +909,7 @@ async def place_trail_stop_order(symbol: str, side: str, qty: float, trigger_pri
         rounded_qty = round_qty_to_step(qty, qty_step, min_qty)
         qty_str = format_qty_str(rounded_qty, qty_step)
 
-        resp = await asyncio.to_thread(
+        resp = await _api_call(
             bybit_session.place_order,
             category="linear",
             symbol=symbol,
@@ -954,7 +944,7 @@ async def amend_trail_stop_price(symbol: str, new_trigger_price: float) -> bool:
         print(f"[TRAIL-ORDER] {symbol}: No trail order to amend")
         return False
     try:
-        resp = await asyncio.to_thread(
+        resp = await _api_call(
             bybit_session.amend_order,
             category="linear",
             symbol=symbol,
@@ -979,7 +969,7 @@ async def cancel_trail_stop_order(symbol: str) -> bool:
     if not order_id:
         return True  # Nothing to cancel
     try:
-        resp = await asyncio.to_thread(
+        resp = await _api_call(
             bybit_session.cancel_order,
             category="linear",
             symbol=symbol,
@@ -1013,7 +1003,7 @@ async def place_conditional_close_order(symbol: str, side: str, qty: float, trig
         rounded_qty = round_qty_to_step(qty, qty_step, min_qty)
         qty_str = format_qty_str(rounded_qty, qty_step)
 
-        resp = await asyncio.to_thread(
+        resp = await _api_call(
             bybit_session.place_order,
             category="linear",
             symbol=symbol,
@@ -1040,7 +1030,7 @@ async def place_conditional_close_order(symbol: str, side: str, qty: float, trig
 async def amend_conditional_order(symbol: str, order_id: str, new_trigger_price: float) -> bool:
     """Amend trigger price of any conditional order by ID."""
     try:
-        resp = await asyncio.to_thread(
+        resp = await _api_call(
             bybit_session.amend_order,
             category="linear",
             symbol=symbol,
@@ -1061,7 +1051,7 @@ async def amend_conditional_order(symbol: str, order_id: str, new_trigger_price:
 async def cancel_conditional_order_by_id(symbol: str, order_id: str) -> bool:
     """Cancel a specific conditional order by ID."""
     try:
-        resp = await asyncio.to_thread(
+        resp = await _api_call(
             bybit_session.cancel_order,
             category="linear",
             symbol=symbol,
@@ -1111,7 +1101,7 @@ async def cancel_server_stops(symbol: str) -> bool:
     await cancel_stage2_trail_order(symbol)
     await cancel_sl1_order(symbol)
     try:
-        resp = await asyncio.to_thread(
+        resp = await _api_call(
             bybit_session.set_trading_stop,
             category="linear",
             symbol=symbol,
@@ -1146,7 +1136,7 @@ async def close_position_by_qty(symbol: str, side_to_close: str, qty: float) -> 
             current_batch_qty = round_qty_to_step(current_batch_qty, qty_step, min_qty)
             qty_str = format_qty_str(current_batch_qty, qty_step)
 
-            order = await asyncio.to_thread(
+            order = await _api_call(
                 bybit_session.place_order,
                 category="linear",
                 symbol=symbol,
@@ -1196,7 +1186,7 @@ async def place_trade(symbol: str, side: str = "Buy", manual_qty_override: Optio
 
             print(f"[DEBUG] {symbol} batch -> qty_str={qty_str}, remaining_after={remaining_qty - current_batch_qty}")
 
-            order = await asyncio.to_thread(
+            order = await _api_call(
                 bybit_session.place_order,
                 category="linear",
                 symbol=symbol,
@@ -1232,7 +1222,12 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
     symbol_monitor_running[symbol] = True
 
     try:
-        await _monitor_symbol_inner(context, symbol)
+        await asyncio.wait_for(
+            _monitor_symbol_inner(context, symbol),
+            timeout=55.0,  # hard cap: never let a single cycle exceed 55 seconds
+        )
+    except asyncio.TimeoutError:
+        print(f"[MONITOR] {symbol}: Cycle TIMED OUT after 55s — releasing for next tick")
     except Exception as exc:
         print(f"[MONITOR] {symbol}: Unhandled error: {exc}")
     finally:
@@ -1254,13 +1249,7 @@ async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str)
     last_close = indicators["last_close"]       # CLOSED candle price (for decisions)
     atr = indicators["atr"]
     adx = indicators["adx"]
-    adx_prev2 = indicators["adx_prev2"]
     rsi = indicators["rsi"]
-    plus_di = indicators["plus_di"]
-    minus_di = indicators["minus_di"]
-    di_crossed = indicators["di_crossed"]
-    di_cross_type = indicators["di_cross_type"]
-    last_candle_ts = indicators["last_candle_ts"]
 
     # Fetch 1-hour EMA 50 and MACD for entry/exit/reversal decisions
     ema_macd_1h = await get_1h_ema_macd(symbol)
@@ -2239,8 +2228,8 @@ async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str)
             msg = (
                 f"{ts} \u2014 {symbol} {entry_type} SIGNAL: <b>{new_trend.upper()}</b>\n"
                 f"Last Close: {last_close} | 50 EMA 1h: {ema_50:.6g}\n"
-                f"+DI: {plus_di:.2f} | -DI: {minus_di:.2f} | ADX: {adx:.2f}\n"
-                f"RSI: {rsi:.2f} | MACD 1h: {macd_line_1h:.6g} / Signal 1h: {signal_line_1h:.6g}\n"
+                f"ADX: {adx:.2f} | RSI: {rsi:.2f}\n"
+                f"MACD 1h: {macd_line_1h:.6g} / Signal 1h: {signal_line_1h:.6g}\n"
                 f"MACD CROSSOVER detected (perfect entry)\n"
                 f"Direction: {side_text}"
             )
@@ -2357,7 +2346,7 @@ async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str)
             f"\u2022 TP: 20% at {TP1_ATR_MULT}x ATR, 25% at {TP2_ATR_MULT}x ATR (SL closes 95%, 5% rides)\n"
             f"\u2022 Trail: 30% at {TRAILING_ACTIVATE_ATR}x ATR, then 20% at 1x ATR, 5% rides\n"
             f"\u2022 WebSocket prices + polling every {POLL_INTERVAL_SECONDS}s\n"
-            f"\u2022 50 EMA (1h): {ema_50:.6g} | +DI: {plus_di:.2f} | -DI: {minus_di:.2f} | ADX: {adx:.2f}\n"
+            f"\u2022 50 EMA (1h): {ema_50:.6g} | ADX: {adx:.2f}\n"
             f"\u2022 RSI: {rsi:.2f} | MACD 1h: {macd_line_1h:.6g} / Signal 1h: {signal_line_1h:.6g} ({macd_state})\n"
             f"\u2022 Last Close: {last_close} | Current Price: {current_price}\n"
             f"\u2022 {symbol} state: {current_market_state}\n"
@@ -2420,8 +2409,6 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         ema_macd_1h = await get_1h_ema_macd(symbol)
         if indicators and indicators["current_price"] and ema_macd_1h:
             last_close = indicators["last_close"]
-            plus_di = indicators["plus_di"]
-            minus_di = indicators["minus_di"]
             adx = indicators["adx"]
             atr = indicators["atr"]
             rsi = indicators["rsi"]
@@ -2485,8 +2472,8 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
                     await update.message.reply_text(
                         f"\U0001f4ca {symbol}: Last Close={last_close} | 50 EMA 1h={ema_50:.6g}\n"
-                        f"+DI: {plus_di:.2f} | -DI: {minus_di:.2f} | ADX: {adx:.2f}\n"
-                        f"MACD 1h: {macd_line_1h:.6g} / Signal 1h: {signal_line_1h:.6g}\n"
+                            f"ADX: {adx:.2f}\n"
+                            f"MACD 1h: {macd_line_1h:.6g} / Signal 1h: {signal_line_1h:.6g}\n"
                         f"Direction: {side_text}"
                     )
 
@@ -2569,8 +2556,6 @@ async def remove_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         del symbol_trends[symbol]
     if symbol in symbol_manual_quantities:
         del symbol_manual_quantities[symbol]
-    if symbol in symbol_last_di_cross_candle:
-        del symbol_last_di_cross_candle[symbol]
     # Cancel any server-side stops before removing
     await cancel_server_stops(symbol)
     # Clean up risk management state
@@ -2599,7 +2584,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("\u26d4 Unauthorized. This bot is private.")
         return
     await update.message.reply_text(
-        "Bot ready! (v18 - Concurrency Fix + MACD Crossover Entry/Exit + Tiered SL + TP + Multi-Stage Trail)\n\n"
+        "Bot ready! (v19 - Full Concurrency Fix + MACD Crossover Entry/Exit + Tiered SL + TP + Multi-Stage Trail)\n\n"
         "Commands:\n"
         "1. /start - Display this message\n"
         "2. /add_symbol <symbol> - Start monitoring with auto-sizing (20% balance)\n"
@@ -2673,7 +2658,7 @@ async def main():
             subscribe_ws_symbol(sym)
         print(f"[STARTUP] WebSocket subscribed to {len(monitored_symbols)} symbols")
 
-    application = Application.builder().token(TELEGRAM_TOKEN).updater(None).build()
+    application = Application.builder().token(TELEGRAM_TOKEN).updater(None).concurrent_updates(True).build()
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("add_symbol", add_symbol))
