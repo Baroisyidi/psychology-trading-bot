@@ -183,6 +183,10 @@ def _save_state_sync():
             "symbol_tp2_taken": dict(symbol_tp2_taken),
             "symbol_post_exit_flat": dict(symbol_post_exit_flat),
             "symbol_prev_macd_above_signal": dict(symbol_prev_macd_above_signal),
+            "symbol_entry_cross_time": dict(symbol_entry_cross_time),
+            "symbol_entry_cross_dir": dict(symbol_entry_cross_dir),
+            "symbol_exit_cross_time": dict(symbol_exit_cross_time),
+            "symbol_exit_cross_dir": dict(symbol_exit_cross_dir),
         }
         with open(STATE_FILE, "w") as f:
             json.dump(state, f, indent=2, default=str)
@@ -244,6 +248,10 @@ def load_state():
         symbol_tp2_taken.update({k: v for k, v in state.get("symbol_tp2_taken", {}).items()})
         symbol_post_exit_flat.update({k: v for k, v in state.get("symbol_post_exit_flat", {}).items()})
         symbol_prev_macd_above_signal.update({k: v for k, v in state.get("symbol_prev_macd_above_signal", {}).items()})
+        symbol_entry_cross_time.update({k: v for k, v in state.get("symbol_entry_cross_time", {}).items()})
+        symbol_entry_cross_dir.update({k: v for k, v in state.get("symbol_entry_cross_dir", {}).items()})
+        symbol_exit_cross_time.update({k: v for k, v in state.get("symbol_exit_cross_time", {}).items()})
+        symbol_exit_cross_dir.update({k: v for k, v in state.get("symbol_exit_cross_dir", {}).items()})
 
         print(f"[STATE] Loaded state from {STATE_FILE} — {len(monitored_symbols)} symbols restored")
         return True
@@ -295,6 +303,13 @@ symbol_post_exit_flat: dict[str, bool] = {}            # True when FLAT after ex
 # MACD crossover tracking (previous candle state for detecting fresh crosses)
 symbol_prev_macd_above_signal: dict[str, Optional[bool]] = {}  # Was MACD > Signal on previous check?
 
+# 5-minute MACD confirmation tracking
+# After a crossover is detected, we wait 5 minutes and re-check before acting
+symbol_entry_cross_time: dict[str, Optional[float]] = {}   # Timestamp when entry crossover was first detected
+symbol_entry_cross_dir: dict[str, Optional[str]] = {}      # Direction: "bullish" or "bearish"
+symbol_exit_cross_time: dict[str, Optional[float]] = {}    # Timestamp when exit crossover was first detected
+symbol_exit_cross_dir: dict[str, Optional[str]] = {}       # Direction: "bullish" or "bearish"
+
 # Per-symbol monitor execution guard (prevents overlapping monitor runs)
 symbol_monitor_running: dict[str, bool] = {}
 
@@ -321,6 +336,7 @@ TRAILING_CLOSE_PCT = 0.30    # Close 30% of original position on Stage 1 trail
 TRAILING_STAGE2_QTY_PCT = 0.20  # Close 20% of original position on Stage 2 trail
 # Remaining 5% protected by Exit Rules ONLY (no server-side SL on final 5%)
 POLL_INTERVAL_SECONDS = 10   # Poll every 10 seconds (faster for risk management)
+MACD_CONFIRM_SECONDS = 300   # Wait 5 minutes (300s) after MACD crossover before acting
 RSI_OVERBOUGHT = 70          # Block long entries when RSI > 70
 RSI_OVERSOLD = 30            # Block short entries when RSI < 30
 
@@ -786,6 +802,9 @@ def _clear_risk_state(symbol: str) -> None:
     # Take-Profit
     symbol_tp1_taken[symbol] = False
     symbol_tp2_taken[symbol] = False
+    # MACD exit confirmation tracking
+    symbol_exit_cross_time[symbol] = None
+    symbol_exit_cross_dir[symbol] = None
     save_state()
 
 
@@ -2037,229 +2056,389 @@ async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str)
                         print(f"[STAGE2-RETRY] {symbol}: Stage 2 trail placed (retry) at {stage2_trail_price:.6g}")
 
     # ──────────────────────────────────────────────
-    # 2. EXIT RULES
-    #    Long: MACD Line crosses below Signal Line (1h) -> close instantly
-    #    Short: MACD Line crosses above Signal Line (1h) -> close instantly
-    #    No EMA or ADX requirement for exit -- MACD cross alone triggers it
+    # 2. EXIT RULES (with 5-minute MACD confirmation)
+    #    Long: MACD crosses BELOW Signal (1h) + stays below for 5 min -> close
+    #    Short: MACD crosses ABOVE Signal (1h) + stays above for 5 min -> close
+    #    No EMA or ADX requirement for exit -- MACD cross + 5m confirm triggers it
     # ──────────────────────────────────────────────
     if current_open_trade_side is not None:
 
-        # ── Long Exit: MACD crosses below Signal (1h) ──
+        # ── Detect fresh exit crossover → start 5-min confirmation timer ──
         if current_open_trade_side == "Buy" and macd_bearish_cross:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    f"\u26a0\ufe0f EXIT SIGNAL for {symbol} (Long)\n"
-                    f"MACD Line 1h ({macd_line_1h:.6g}) CROSSED BELOW Signal Line 1h ({signal_line_1h:.6g})\n"
-                    f"Prev MACD: {macd_line_1h_prev:.6g} > Prev Signal: {signal_line_1h_prev:.6g}\n"
-                    f"Closing Long position INSTANTLY..."
-                )
-            )
-
-            await cancel_server_stops(symbol)
-            closed_qty = await close_position(symbol, side_to_close="Buy")
-            _clear_risk_state(symbol)
-            manual_override = None
-            if symbol in symbol_manual_quantities and symbol_manual_quantities[symbol] is not None:
-                manual_override = closed_qty
-
-            # Check REVERSAL conditions: ADX > 20, Price < EMA, MACD just crossed below Signal, RSI not oversold
-            if adx > ADX_THRESHOLD and last_close < ema_50 and macd_bearish_cross and rsi > RSI_OVERSOLD:
+            if symbol_exit_cross_time.get(symbol) is None or symbol_exit_cross_dir.get(symbol) != "bearish":
+                symbol_exit_cross_time[symbol] = time.time()
+                symbol_exit_cross_dir[symbol] = "bearish"
+                print(f"[5m-CONFIRM] {symbol}: Bearish MACD cross detected (Long exit), starting 5-min confirmation")
                 await context.bot.send_message(
                     chat_id=chat_id,
                     text=(
-                        f"\U0001f504 REVERSE to Short for {symbol}\n"
-                        f"ADX: {adx:.2f} > {ADX_THRESHOLD}\n"
-                        f"Price ({last_close}) < 50 EMA 1h ({ema_50:.6g})\n"
-                        f"MACD 1h ({macd_line_1h:.6g}) just crossed below Signal 1h ({signal_line_1h:.6g})\n"
-                        f"RSI: {rsi:.2f} (not oversold)\n"
-                        f"Opening Short..."
+                        f"\u23f3 {symbol}: MACD crossed BELOW Signal (1h)\n"
+                        f"MACD: {macd_line_1h:.6g} < Signal: {signal_line_1h:.6g}\n"
+                        f"Waiting 5-min confirmation before closing Long..."
                     )
                 )
-                result = await place_trade(symbol, side="Sell", manual_qty_override=manual_override)
-                if result and "error" not in result:
-                    order_id = result.get("orderId", "\u2014")
-                    await asyncio.sleep(1)
-                    real_entry = await get_position_entry_price(symbol)
-                    fill_price = real_entry if real_entry else last_close
-                    _set_entry_risk_state(symbol, fill_price, atr)
-                    sl_price = fill_price + (STOP_LOSS_ATR_MULT * atr)
-                    await set_server_stop_loss(symbol, "Sell", sl_price)
-                    await context.bot.send_message(chat_id=chat_id, text=f"\u2705 Short order(s) placed for {symbol}\nLast Order ID: <code>{order_id}</code>\nFill Price: {fill_price:.6g}\nServer-side SL: {sl_price:.6g}", parse_mode="HTML")
-                    symbol_trends[symbol] = "downward"
-                    symbol_open_trade_side[symbol] = "Sell"
-                    symbol_post_exit_flat[symbol] = False
-                    save_state()
-                elif result and "error" in result:
-                    await context.bot.send_message(chat_id=chat_id, text=f"\u274c Failed to place Short for {symbol}: {result['error']}")
-                    symbol_open_trade_side[symbol] = None
-                    symbol_post_exit_flat[symbol] = True
-                    save_state()
-            else:
-                # Reversal conditions not met -> go FLAT and wait for MACD crossover
-                reason = []
-                if adx <= ADX_THRESHOLD:
-                    reason.append(f"ADX ({adx:.2f}) <= {ADX_THRESHOLD}")
-                if last_close >= ema_50:
-                    reason.append(f"Price ({last_close}) >= 50 EMA ({ema_50:.6g})")
-                if rsi <= RSI_OVERSOLD:
-                    reason.append(f"RSI oversold ({rsi:.2f})")
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        f"\U0001f7e1 GOING FLAT for {symbol}\n"
-                        f"Reversal conditions not met: {', '.join(reason) if reason else 'waiting for MACD crossover'}\n"
-                        f"Will wait for MACD crossover + ADX > {ADX_THRESHOLD} + RSI filter before re-entering."
-                    )
-                )
-                symbol_open_trade_side[symbol] = None
-                symbol_post_exit_flat[symbol] = True
                 save_state()
-            return
 
-        # ── Short Exit: MACD crosses above Signal (1h) ──
         elif current_open_trade_side == "Sell" and macd_bullish_cross:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    f"\u26a0\ufe0f EXIT SIGNAL for {symbol} (Short)\n"
-                    f"MACD Line 1h ({macd_line_1h:.6g}) CROSSED ABOVE Signal Line 1h ({signal_line_1h:.6g})\n"
-                    f"Prev MACD: {macd_line_1h_prev:.6g} < Prev Signal: {signal_line_1h_prev:.6g}\n"
-                    f"Closing Short position INSTANTLY..."
-                )
-            )
-
-            await cancel_server_stops(symbol)
-            closed_qty = await close_position(symbol, side_to_close="Sell")
-            _clear_risk_state(symbol)
-            manual_override = None
-            if symbol in symbol_manual_quantities and symbol_manual_quantities[symbol] is not None:
-                manual_override = closed_qty
-
-            # Check REVERSAL conditions: ADX > 20, Price > EMA, MACD just crossed above Signal, RSI not overbought
-            if adx > ADX_THRESHOLD and last_close > ema_50 and macd_bullish_cross and rsi < RSI_OVERBOUGHT:
+            if symbol_exit_cross_time.get(symbol) is None or symbol_exit_cross_dir.get(symbol) != "bullish":
+                symbol_exit_cross_time[symbol] = time.time()
+                symbol_exit_cross_dir[symbol] = "bullish"
+                print(f"[5m-CONFIRM] {symbol}: Bullish MACD cross detected (Short exit), starting 5-min confirmation")
                 await context.bot.send_message(
                     chat_id=chat_id,
                     text=(
-                        f"\U0001f504 REVERSE to Long for {symbol}\n"
-                        f"ADX: {adx:.2f} > {ADX_THRESHOLD}\n"
-                        f"Price ({last_close}) > 50 EMA 1h ({ema_50:.6g})\n"
-                        f"MACD 1h ({macd_line_1h:.6g}) just crossed above Signal 1h ({signal_line_1h:.6g})\n"
-                        f"RSI: {rsi:.2f} (not overbought)\n"
-                        f"Opening Long..."
+                        f"\u23f3 {symbol}: MACD crossed ABOVE Signal (1h)\n"
+                        f"MACD: {macd_line_1h:.6g} > Signal: {signal_line_1h:.6g}\n"
+                        f"Waiting 5-min confirmation before closing Short..."
                     )
                 )
-                result = await place_trade(symbol, side="Buy", manual_qty_override=manual_override)
-                if result and "error" not in result:
-                    order_id = result.get("orderId", "\u2014")
-                    await asyncio.sleep(1)
-                    real_entry = await get_position_entry_price(symbol)
-                    fill_price = real_entry if real_entry else last_close
-                    _set_entry_risk_state(symbol, fill_price, atr)
-                    sl_price = fill_price - (STOP_LOSS_ATR_MULT * atr)
-                    await set_server_stop_loss(symbol, "Buy", sl_price)
-                    await context.bot.send_message(chat_id=chat_id, text=f"\u2705 Long order(s) placed for {symbol}\nLast Order ID: <code>{order_id}</code>\nFill Price: {fill_price:.6g}\nServer-side SL: {sl_price:.6g}", parse_mode="HTML")
-                    symbol_trends[symbol] = "upward"
-                    symbol_open_trade_side[symbol] = "Buy"
-                    symbol_post_exit_flat[symbol] = False
-                    save_state()
-                elif result and "error" in result:
-                    await context.bot.send_message(chat_id=chat_id, text=f"\u274c Failed to place Long for {symbol}: {result['error']}")
-                    symbol_open_trade_side[symbol] = None
-                    symbol_post_exit_flat[symbol] = True
-                    save_state()
-            else:
-                reason = []
-                if adx <= ADX_THRESHOLD:
-                    reason.append(f"ADX ({adx:.2f}) <= {ADX_THRESHOLD}")
-                if last_close <= ema_50:
-                    reason.append(f"Price ({last_close}) <= 50 EMA ({ema_50:.6g})")
-                if rsi >= RSI_OVERBOUGHT:
-                    reason.append(f"RSI overbought ({rsi:.2f})")
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        f"\U0001f7e1 GOING FLAT for {symbol}\n"
-                        f"Reversal conditions not met: {', '.join(reason) if reason else 'waiting for MACD crossover'}\n"
-                        f"Will wait for MACD crossover + ADX > {ADX_THRESHOLD} + RSI filter before re-entering."
-                    )
-                )
-                symbol_open_trade_side[symbol] = None
-                symbol_post_exit_flat[symbol] = True
                 save_state()
-            return
+
+        # ── Check pending exit confirmation ──
+        exit_cross_time = symbol_exit_cross_time.get(symbol)
+        exit_cross_dir = symbol_exit_cross_dir.get(symbol)
+
+        if exit_cross_time is not None and exit_cross_dir is not None:
+            elapsed = time.time() - exit_cross_time
+
+            # ── Long exit: waiting for bearish confirmation ──
+            if current_open_trade_side == "Buy" and exit_cross_dir == "bearish":
+                if macd_currently_above:
+                    # MACD went back above Signal — cancel exit
+                    symbol_exit_cross_time[symbol] = None
+                    symbol_exit_cross_dir[symbol] = None
+                    print(f"[5m-CONFIRM] {symbol}: Long exit CANCELLED — MACD went back above Signal")
+                    await context.bot.send_message(chat_id=chat_id, text=f"\u21a9\ufe0f {symbol}: MACD went back above Signal. Long exit cancelled.")
+                    save_state()
+                elif elapsed >= MACD_CONFIRM_SECONDS:
+                    # CONFIRMED after 5 min — execute Long exit
+                    symbol_exit_cross_time[symbol] = None
+                    symbol_exit_cross_dir[symbol] = None
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"\u26a0\ufe0f EXIT SIGNAL CONFIRMED for {symbol} (Long)\n"
+                            f"MACD stayed BELOW Signal for 5 minutes\n"
+                            f"MACD: {macd_line_1h:.6g} < Signal: {signal_line_1h:.6g}\n"
+                            f"Closing Long position NOW..."
+                        )
+                    )
+                    await cancel_server_stops(symbol)
+                    closed_qty = await close_position(symbol, side_to_close="Buy")
+                    _clear_risk_state(symbol)
+                    manual_override = None
+                    if symbol in symbol_manual_quantities and symbol_manual_quantities[symbol] is not None:
+                        manual_override = closed_qty
+
+                    # Check REVERSAL conditions (MACD cross already confirmed for 5m)
+                    if adx > ADX_THRESHOLD and last_close < ema_50 and rsi > RSI_OVERSOLD:
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=(
+                                f"\U0001f504 REVERSE to Short for {symbol}\n"
+                                f"ADX: {adx:.2f} > {ADX_THRESHOLD}\n"
+                                f"Price ({last_close}) < 50 EMA 1h ({ema_50:.6g})\n"
+                                f"MACD 1h ({macd_line_1h:.6g}) confirmed below Signal 1h ({signal_line_1h:.6g}) for 5 min\n"
+                                f"RSI: {rsi:.2f} (not oversold)\n"
+                                f"Opening Short..."
+                            )
+                        )
+                        result = await place_trade(symbol, side="Sell", manual_qty_override=manual_override)
+                        if result and "error" not in result:
+                            order_id = result.get("orderId", "\u2014")
+                            await asyncio.sleep(1)
+                            real_entry = await get_position_entry_price(symbol)
+                            fill_price = real_entry if real_entry else last_close
+                            _set_entry_risk_state(symbol, fill_price, atr)
+                            sl_price = fill_price + (STOP_LOSS_ATR_MULT * atr)
+                            await set_server_stop_loss(symbol, "Sell", sl_price)
+                            await context.bot.send_message(chat_id=chat_id, text=f"\u2705 Short order(s) placed for {symbol}\nLast Order ID: <code>{order_id}</code>\nFill Price: {fill_price:.6g}\nServer-side SL: {sl_price:.6g}", parse_mode="HTML")
+                            symbol_trends[symbol] = "downward"
+                            symbol_open_trade_side[symbol] = "Sell"
+                            symbol_post_exit_flat[symbol] = False
+                            save_state()
+                        elif result and "error" in result:
+                            await context.bot.send_message(chat_id=chat_id, text=f"\u274c Failed to place Short for {symbol}: {result['error']}")
+                            symbol_open_trade_side[symbol] = None
+                            symbol_post_exit_flat[symbol] = True
+                            save_state()
+                    else:
+                        # Reversal conditions not met -> go FLAT
+                        reason = []
+                        if adx <= ADX_THRESHOLD:
+                            reason.append(f"ADX ({adx:.2f}) <= {ADX_THRESHOLD}")
+                        if last_close >= ema_50:
+                            reason.append(f"Price ({last_close}) >= 50 EMA ({ema_50:.6g})")
+                        if rsi <= RSI_OVERSOLD:
+                            reason.append(f"RSI oversold ({rsi:.2f})")
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=(
+                                f"\U0001f7e1 GOING FLAT for {symbol}\n"
+                                f"Reversal conditions not met: {', '.join(reason) if reason else 'waiting for MACD crossover'}\n"
+                                f"Will wait for MACD crossover + 5-min confirmation + ADX > {ADX_THRESHOLD} + RSI filter before re-entering."
+                            )
+                        )
+                        symbol_open_trade_side[symbol] = None
+                        symbol_post_exit_flat[symbol] = True
+                        save_state()
+                    return
+
+            # ── Short exit: waiting for bullish confirmation ──
+            elif current_open_trade_side == "Sell" and exit_cross_dir == "bullish":
+                if not macd_currently_above:
+                    # MACD went back below Signal — cancel exit
+                    symbol_exit_cross_time[symbol] = None
+                    symbol_exit_cross_dir[symbol] = None
+                    print(f"[5m-CONFIRM] {symbol}: Short exit CANCELLED — MACD went back below Signal")
+                    await context.bot.send_message(chat_id=chat_id, text=f"\u21a9\ufe0f {symbol}: MACD went back below Signal. Short exit cancelled.")
+                    save_state()
+                elif elapsed >= MACD_CONFIRM_SECONDS:
+                    # CONFIRMED after 5 min — execute Short exit
+                    symbol_exit_cross_time[symbol] = None
+                    symbol_exit_cross_dir[symbol] = None
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"\u26a0\ufe0f EXIT SIGNAL CONFIRMED for {symbol} (Short)\n"
+                            f"MACD stayed ABOVE Signal for 5 minutes\n"
+                            f"MACD: {macd_line_1h:.6g} > Signal: {signal_line_1h:.6g}\n"
+                            f"Closing Short position NOW..."
+                        )
+                    )
+                    await cancel_server_stops(symbol)
+                    closed_qty = await close_position(symbol, side_to_close="Sell")
+                    _clear_risk_state(symbol)
+                    manual_override = None
+                    if symbol in symbol_manual_quantities and symbol_manual_quantities[symbol] is not None:
+                        manual_override = closed_qty
+
+                    # Check REVERSAL conditions (MACD cross already confirmed for 5m)
+                    if adx > ADX_THRESHOLD and last_close > ema_50 and rsi < RSI_OVERBOUGHT:
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=(
+                                f"\U0001f504 REVERSE to Long for {symbol}\n"
+                                f"ADX: {adx:.2f} > {ADX_THRESHOLD}\n"
+                                f"Price ({last_close}) > 50 EMA 1h ({ema_50:.6g})\n"
+                                f"MACD 1h ({macd_line_1h:.6g}) confirmed above Signal 1h ({signal_line_1h:.6g}) for 5 min\n"
+                                f"RSI: {rsi:.2f} (not overbought)\n"
+                                f"Opening Long..."
+                            )
+                        )
+                        result = await place_trade(symbol, side="Buy", manual_qty_override=manual_override)
+                        if result and "error" not in result:
+                            order_id = result.get("orderId", "\u2014")
+                            await asyncio.sleep(1)
+                            real_entry = await get_position_entry_price(symbol)
+                            fill_price = real_entry if real_entry else last_close
+                            _set_entry_risk_state(symbol, fill_price, atr)
+                            sl_price = fill_price - (STOP_LOSS_ATR_MULT * atr)
+                            await set_server_stop_loss(symbol, "Buy", sl_price)
+                            await context.bot.send_message(chat_id=chat_id, text=f"\u2705 Long order(s) placed for {symbol}\nLast Order ID: <code>{order_id}</code>\nFill Price: {fill_price:.6g}\nServer-side SL: {sl_price:.6g}", parse_mode="HTML")
+                            symbol_trends[symbol] = "upward"
+                            symbol_open_trade_side[symbol] = "Buy"
+                            symbol_post_exit_flat[symbol] = False
+                            save_state()
+                        elif result and "error" in result:
+                            await context.bot.send_message(chat_id=chat_id, text=f"\u274c Failed to place Long for {symbol}: {result['error']}")
+                            symbol_open_trade_side[symbol] = None
+                            symbol_post_exit_flat[symbol] = True
+                            save_state()
+                    else:
+                        reason = []
+                        if adx <= ADX_THRESHOLD:
+                            reason.append(f"ADX ({adx:.2f}) <= {ADX_THRESHOLD}")
+                        if last_close <= ema_50:
+                            reason.append(f"Price ({last_close}) <= 50 EMA ({ema_50:.6g})")
+                        if rsi >= RSI_OVERBOUGHT:
+                            reason.append(f"RSI overbought ({rsi:.2f})")
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=(
+                                f"\U0001f7e1 GOING FLAT for {symbol}\n"
+                                f"Reversal conditions not met: {', '.join(reason) if reason else 'waiting for MACD crossover'}\n"
+                                f"Will wait for MACD crossover + 5-min confirmation + ADX > {ADX_THRESHOLD} + RSI filter before re-entering."
+                            )
+                        )
+                        symbol_open_trade_side[symbol] = None
+                        symbol_post_exit_flat[symbol] = True
+                        save_state()
+                    return
 
     # ──────────────────────────────────────────────
-    # 3. TRADE ENTRY (no open position)
+    # 3. TRADE ENTRY (no open position, with 5-minute MACD confirmation)
     #    ALL filters must pass:
     #      1. ADX > 20
     #      2. Long: Price > 50 EMA (1h) | Short: Price < 50 EMA (1h)
     #      3. RSI NOT extreme (not > 70 for longs, not < 30 for shorts)
-    #      4. Wait for MACD crossover: Long: MACD just crossed above Signal (1h)
-    #         Short: MACD just crossed below Signal (1h)
+    #      4. MACD crossover + 5-min confirmation on correct side
     #    A perfect entry is more important than rush!
-    #    Post-exit FLAT state also uses these same conditions (ADX > 20 + crossover)
     # ──────────────────────────────────────────────
     if current_open_trade_side is None:
-        # Filter 1: ADX must be above threshold
-        if adx < ADX_THRESHOLD:
-            return
 
-        new_trend = None
-        side = None
-
-        # Long: last_close > 50 EMA (1h) AND MACD just crossed above Signal (1h)
-        if last_close > ema_50 and macd_bullish_cross:
-            if rsi > RSI_OVERBOUGHT:
+        # ── Detect fresh crossover → start 5-min confirmation timer ──
+        if macd_bullish_cross and last_close > ema_50 and adx >= ADX_THRESHOLD:
+            if rsi <= RSI_OVERBOUGHT:
+                symbol_entry_cross_time[symbol] = time.time()
+                symbol_entry_cross_dir[symbol] = "bullish"
+                print(f"[5m-CONFIRM] {symbol}: Bullish MACD cross detected (Long entry), starting 5-min confirmation")
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"\u23f3 {symbol}: MACD crossed ABOVE Signal (1h)\n"
+                        f"MACD: {macd_line_1h:.6g} > Signal: {signal_line_1h:.6g}\n"
+                        f"ADX: {adx:.2f} | RSI: {rsi:.2f} | Price > 50 EMA\n"
+                        f"Waiting 5-min confirmation before entering Long..."
+                    )
+                )
+                save_state()
+            else:
                 print(f"[FILTER] {symbol}: Long entry blocked -- RSI overbought ({rsi:.2f} > {RSI_OVERBOUGHT})")
-                return
-            new_trend = "upward"
-            side = "Buy"
 
-        # Short: last_close < 50 EMA (1h) AND MACD just crossed below Signal (1h)
-        elif last_close < ema_50 and macd_bearish_cross:
-            if rsi < RSI_OVERSOLD:
+        elif macd_bearish_cross and last_close < ema_50 and adx >= ADX_THRESHOLD:
+            if rsi >= RSI_OVERSOLD:
+                symbol_entry_cross_time[symbol] = time.time()
+                symbol_entry_cross_dir[symbol] = "bearish"
+                print(f"[5m-CONFIRM] {symbol}: Bearish MACD cross detected (Short entry), starting 5-min confirmation")
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"\u23f3 {symbol}: MACD crossed BELOW Signal (1h)\n"
+                        f"MACD: {macd_line_1h:.6g} < Signal: {signal_line_1h:.6g}\n"
+                        f"ADX: {adx:.2f} | RSI: {rsi:.2f} | Price < 50 EMA\n"
+                        f"Waiting 5-min confirmation before entering Short..."
+                    )
+                )
+                save_state()
+            else:
                 print(f"[FILTER] {symbol}: Short entry blocked -- RSI oversold ({rsi:.2f} < {RSI_OVERSOLD})")
-                return
-            new_trend = "downward"
-            side = "Sell"
 
-        if new_trend and side:
-            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            side_text = "Long (Buy)" if side == "Buy" else "Short (Sell)"
-            is_post_exit = symbol_post_exit_flat.get(symbol, False)
-            entry_type = "REVERSAL" if is_post_exit else "ENTRY"
-            msg = (
-                f"{ts} \u2014 {symbol} {entry_type} SIGNAL: <b>{new_trend.upper()}</b>\n"
-                f"Last Close: {last_close} | 50 EMA 1h: {ema_50:.6g}\n"
-                f"ADX: {adx:.2f} | RSI: {rsi:.2f}\n"
-                f"MACD 1h: {macd_line_1h:.6g} / Signal 1h: {signal_line_1h:.6g}\n"
-                f"MACD CROSSOVER detected (perfect entry)\n"
-                f"Direction: {side_text}"
-            )
-            await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
+        # ── Check pending entry confirmation ──
+        entry_cross_time = symbol_entry_cross_time.get(symbol)
+        entry_cross_dir = symbol_entry_cross_dir.get(symbol)
 
-            result = await place_trade(symbol, side=side)
+        if entry_cross_time is not None and entry_cross_dir is not None:
+            elapsed = time.time() - entry_cross_time
 
-            if result and "error" not in result:
-                order_id = result.get("orderId", "\u2014")
-                await asyncio.sleep(1)
-                real_entry = await get_position_entry_price(symbol)
-                fill_price = real_entry if real_entry else last_close
-                _set_entry_risk_state(symbol, fill_price, atr)
-                if side == "Buy":
-                    sl_price = fill_price - (STOP_LOSS_ATR_MULT * atr)
-                else:
-                    sl_price = fill_price + (STOP_LOSS_ATR_MULT * atr)
-                await set_server_stop_loss(symbol, side, sl_price)
-                await context.bot.send_message(chat_id=chat_id, text=f"\u2705 {side_text} order(s) placed for {symbol}\nLast Order ID: <code>{order_id}</code>\nFill Price: {fill_price:.6g}\nServer-side SL: {sl_price:.6g}", parse_mode="HTML")
-            elif result and "error" in result:
-                await context.bot.send_message(chat_id=chat_id, text=f"\u274c Failed to place {side_text} for {symbol}: {result['error']}")
+            # Cancel if ADX dropped below threshold
+            if adx < ADX_THRESHOLD:
+                symbol_entry_cross_time[symbol] = None
+                symbol_entry_cross_dir[symbol] = None
+                print(f"[5m-CONFIRM] {symbol}: Entry confirmation cancelled — ADX ({adx:.2f}) dropped below {ADX_THRESHOLD}")
+                save_state()
 
-            symbol_trends[symbol] = new_trend
-            symbol_open_trade_side[symbol] = await get_open_position_side(symbol)
-            symbol_post_exit_flat[symbol] = False
-            save_state()
+            # ── Bullish entry confirmation ──
+            elif entry_cross_dir == "bullish":
+                if not macd_currently_above:
+                    symbol_entry_cross_time[symbol] = None
+                    symbol_entry_cross_dir[symbol] = None
+                    print(f"[5m-CONFIRM] {symbol}: Long entry cancelled — MACD dropped back below Signal")
+                    await context.bot.send_message(chat_id=chat_id, text=f"\u21a9\ufe0f {symbol}: MACD went back below Signal. Long entry cancelled.")
+                    save_state()
+                elif last_close <= ema_50:
+                    symbol_entry_cross_time[symbol] = None
+                    symbol_entry_cross_dir[symbol] = None
+                    print(f"[5m-CONFIRM] {symbol}: Long entry cancelled — price dropped below 50 EMA")
+                    save_state()
+                elif rsi > RSI_OVERBOUGHT:
+                    symbol_entry_cross_time[symbol] = None
+                    symbol_entry_cross_dir[symbol] = None
+                    print(f"[5m-CONFIRM] {symbol}: Long entry cancelled — RSI overbought ({rsi:.2f})")
+                    save_state()
+                elif elapsed >= MACD_CONFIRM_SECONDS:
+                    # CONFIRMED! Execute Long entry
+                    symbol_entry_cross_time[symbol] = None
+                    symbol_entry_cross_dir[symbol] = None
+                    new_trend = "upward"
+                    side = "Buy"
+                    side_text = "Long (Buy)"
+                    is_post_exit = symbol_post_exit_flat.get(symbol, False)
+                    entry_type = "REVERSAL" if is_post_exit else "ENTRY"
+                    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    msg = (
+                        f"{ts} \u2014 {symbol} {entry_type} SIGNAL: <b>UPWARD</b>\n"
+                        f"Last Close: {last_close} | 50 EMA 1h: {ema_50:.6g}\n"
+                        f"ADX: {adx:.2f} | RSI: {rsi:.2f}\n"
+                        f"MACD 1h: {macd_line_1h:.6g} / Signal 1h: {signal_line_1h:.6g}\n"
+                        f"MACD confirmed ABOVE Signal for 5 minutes (perfect entry)\n"
+                        f"Direction: {side_text}"
+                    )
+                    await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
+
+                    result = await place_trade(symbol, side=side)
+                    if result and "error" not in result:
+                        order_id = result.get("orderId", "\u2014")
+                        await asyncio.sleep(1)
+                        real_entry = await get_position_entry_price(symbol)
+                        fill_price = real_entry if real_entry else last_close
+                        _set_entry_risk_state(symbol, fill_price, atr)
+                        sl_price = fill_price - (STOP_LOSS_ATR_MULT * atr)
+                        await set_server_stop_loss(symbol, side, sl_price)
+                        await context.bot.send_message(chat_id=chat_id, text=f"\u2705 {side_text} order(s) placed for {symbol}\nLast Order ID: <code>{order_id}</code>\nFill Price: {fill_price:.6g}\nServer-side SL: {sl_price:.6g}", parse_mode="HTML")
+                    elif result and "error" in result:
+                        await context.bot.send_message(chat_id=chat_id, text=f"\u274c Failed to place {side_text} for {symbol}: {result['error']}")
+
+                    symbol_trends[symbol] = new_trend
+                    symbol_open_trade_side[symbol] = await get_open_position_side(symbol)
+                    symbol_post_exit_flat[symbol] = False
+                    save_state()
+
+            # ── Bearish entry confirmation ──
+            elif entry_cross_dir == "bearish":
+                if macd_currently_above:
+                    symbol_entry_cross_time[symbol] = None
+                    symbol_entry_cross_dir[symbol] = None
+                    print(f"[5m-CONFIRM] {symbol}: Short entry cancelled — MACD went back above Signal")
+                    await context.bot.send_message(chat_id=chat_id, text=f"\u21a9\ufe0f {symbol}: MACD went back above Signal. Short entry cancelled.")
+                    save_state()
+                elif last_close >= ema_50:
+                    symbol_entry_cross_time[symbol] = None
+                    symbol_entry_cross_dir[symbol] = None
+                    print(f"[5m-CONFIRM] {symbol}: Short entry cancelled — price rose above 50 EMA")
+                    save_state()
+                elif rsi < RSI_OVERSOLD:
+                    symbol_entry_cross_time[symbol] = None
+                    symbol_entry_cross_dir[symbol] = None
+                    print(f"[5m-CONFIRM] {symbol}: Short entry cancelled — RSI oversold ({rsi:.2f})")
+                    save_state()
+                elif elapsed >= MACD_CONFIRM_SECONDS:
+                    # CONFIRMED! Execute Short entry
+                    symbol_entry_cross_time[symbol] = None
+                    symbol_entry_cross_dir[symbol] = None
+                    new_trend = "downward"
+                    side = "Sell"
+                    side_text = "Short (Sell)"
+                    is_post_exit = symbol_post_exit_flat.get(symbol, False)
+                    entry_type = "REVERSAL" if is_post_exit else "ENTRY"
+                    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    msg = (
+                        f"{ts} \u2014 {symbol} {entry_type} SIGNAL: <b>DOWNWARD</b>\n"
+                        f"Last Close: {last_close} | 50 EMA 1h: {ema_50:.6g}\n"
+                        f"ADX: {adx:.2f} | RSI: {rsi:.2f}\n"
+                        f"MACD 1h: {macd_line_1h:.6g} / Signal 1h: {signal_line_1h:.6g}\n"
+                        f"MACD confirmed BELOW Signal for 5 minutes (perfect entry)\n"
+                        f"Direction: {side_text}"
+                    )
+                    await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
+
+                    result = await place_trade(symbol, side=side)
+                    if result and "error" not in result:
+                        order_id = result.get("orderId", "\u2014")
+                        await asyncio.sleep(1)
+                        real_entry = await get_position_entry_price(symbol)
+                        fill_price = real_entry if real_entry else last_close
+                        _set_entry_risk_state(symbol, fill_price, atr)
+                        sl_price = fill_price + (STOP_LOSS_ATR_MULT * atr)
+                        await set_server_stop_loss(symbol, side, sl_price)
+                        await context.bot.send_message(chat_id=chat_id, text=f"\u2705 {side_text} order(s) placed for {symbol}\nLast Order ID: <code>{order_id}</code>\nFill Price: {fill_price:.6g}\nServer-side SL: {sl_price:.6g}", parse_mode="HTML")
+                    elif result and "error" in result:
+                        await context.bot.send_message(chat_id=chat_id, text=f"\u274c Failed to place {side_text} for {symbol}: {result['error']}")
+
+                    symbol_trends[symbol] = new_trend
+                    symbol_open_trade_side[symbol] = await get_open_position_side(symbol)
+                    symbol_post_exit_flat[symbol] = False
+                    save_state()
 
     # ──────────────────────────────────────────────
     # 4. 30-Minute Status Report
@@ -2341,11 +2520,26 @@ async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str)
         # MACD state for report
         macd_state = "ABOVE Signal (Bullish)" if macd_currently_above else "BELOW Signal (Bearish)"
 
+        # Pending confirmation status
+        pending_info = ""
+        e_cross_t = symbol_entry_cross_time.get(symbol)
+        e_cross_d = symbol_entry_cross_dir.get(symbol)
+        x_cross_t = symbol_exit_cross_time.get(symbol)
+        x_cross_d = symbol_exit_cross_dir.get(symbol)
+        if e_cross_t and e_cross_d:
+            e_elapsed = int(time.time() - e_cross_t)
+            e_remaining = max(0, MACD_CONFIRM_SECONDS - e_elapsed)
+            pending_info = f"\n\u2022 PENDING ENTRY: {e_cross_d} cross confirming ({e_elapsed}s / {MACD_CONFIRM_SECONDS}s, ~{e_remaining}s remaining)"
+        if x_cross_t and x_cross_d:
+            x_elapsed = int(time.time() - x_cross_t)
+            x_remaining = max(0, MACD_CONFIRM_SECONDS - x_elapsed)
+            pending_info += f"\n\u2022 PENDING EXIT: {x_cross_d} cross confirming ({x_elapsed}s / {MACD_CONFIRM_SECONDS}s, ~{x_remaining}s remaining)"
+
         report_msg = (
             f"Still monitoring {symbol}\n"
-            f"\u2022 Entry: ADX>{ADX_THRESHOLD} + 50 EMA 1h + RSI + MACD crossover (1h)\n"
-            f"\u2022 Exit: MACD crosses opposite direction (1h) -> close instantly\n"
-            f"\u2022 Reverse: ADX > {ADX_THRESHOLD} + EMA/MACD crossover/RSI, else FLAT\n"
+            f"\u2022 Entry: ADX>{ADX_THRESHOLD} + 50 EMA 1h + RSI + MACD crossover + 5-min confirm (1h)\n"
+            f"\u2022 Exit: MACD crosses opposite (1h) + 5-min confirm -> close\n"
+            f"\u2022 Reverse: ADX > {ADX_THRESHOLD} + EMA/MACD crossover + 5-min confirm/RSI, else FLAT\n"
             f"\u2022 SL: 50% at {SL_STAGE1_ATR_MULT}x ATR + 50% at {STOP_LOSS_ATR_MULT}x ATR\n"
             f"\u2022 TP: 20% at {TP1_ATR_MULT}x ATR, 25% at {TP2_ATR_MULT}x ATR (SL closes 95%, 5% rides)\n"
             f"\u2022 Trail: 30% at {TRAILING_ACTIVATE_ATR}x ATR, then 20% at 1x ATR, 5% rides\n"
@@ -2356,6 +2550,7 @@ async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str)
             f"\u2022 {symbol} state: {current_market_state}\n"
             f"\u2022 {trade_status}"
             f"{risk_info}"
+            f"{pending_info}"
         )
         if symbol in symbol_manual_quantities and symbol_manual_quantities[symbol] is not None:
             report_msg += f"\n\u2022 Manual Quantity: {symbol_manual_quantities[symbol]}"
@@ -2406,6 +2601,9 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     chat_id = update.effective_chat.id
 
     # Handle instant trade for manual quantity
+    # NOTE: Instant trade still requires current alignment (ADX + EMA + MACD position + RSI)
+    # but does NOT wait 5 minutes — the 5-min confirmation applies to monitoring entries only.
+    # If MACD is already on the correct side, the trade is placed immediately.
     if manual_qty:
         await update.message.reply_text(f"\U0001f680 INSTANT TRADE for {symbol} with quantity {manual_qty}...")
 
@@ -2434,10 +2632,10 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             if entry_blocked:
                 await update.message.reply_text(
                     f"\u26a0\ufe0f Instant trade blocked for {symbol}: {block_reason}\n"
-                    f"Monitoring will wait for proper conditions."
+                    f"Monitoring will wait for MACD crossover + 5-min confirmation."
                 )
             else:
-                # Require EMA 50 (1h) + RSI + MACD (1h) filters
+                # Require EMA 50 (1h) + RSI + MACD position (1h) filters
                 side = None
                 if last_close > ema_50:
                     if rsi > RSI_OVERBOUGHT:
@@ -2461,7 +2659,7 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 if entry_blocked:
                     await update.message.reply_text(
                         f"\u26a0\ufe0f Instant trade blocked for {symbol}: {block_reason}\n"
-                        f"Monitoring will wait for proper conditions."
+                        f"Monitoring will wait for MACD crossover + 5-min confirmation."
                     )
                 elif side is None:
                     await update.message.reply_text(
@@ -2469,7 +2667,7 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                         f"Last Close: {last_close} | 50 EMA 1h: {ema_50:.6g}\n"
                         f"MACD 1h: {macd_line_1h:.6g} / Signal 1h: {signal_line_1h:.6g} | ADX: {adx:.2f}\n"
                         f"Need: Price > 50 EMA + MACD > Signal (1h) for Long, or Price < 50 EMA + MACD < Signal (1h) for Short.\n"
-                        f"Monitoring will wait for proper alignment."
+                        f"Monitoring will wait for MACD crossover + 5-min confirmation."
                     )
                 else:
                     side_text = "Long (Buy)" if side == "Buy" else "Short (Sell)"
@@ -2515,9 +2713,9 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(
         f"Monitoring {symbol}!\n"
         f"\u2022 {qty_info}\n"
-        f"\u2022 Entry filters: ADX > {ADX_THRESHOLD} + 50 EMA (1h) + RSI + MACD crossover (1h)\n"
-        f"\u2022 Exit: MACD crosses opposite direction (1h) -> close instantly\n"
-        f"\u2022 Reverse: ADX > {ADX_THRESHOLD} + EMA/MACD crossover/RSI, else FLAT\n"
+        f"\u2022 Entry: ADX > {ADX_THRESHOLD} + 50 EMA (1h) + RSI + MACD crossover + 5-min confirm (1h)\n"
+        f"\u2022 Exit: MACD crosses opposite (1h) + 5-min confirm -> close\n"
+        f"\u2022 Reverse: ADX > {ADX_THRESHOLD} + EMA/MACD crossover + 5-min confirm/RSI, else FLAT\n"
         f"\u2022 SL: 50% at {SL_STAGE1_ATR_MULT}x ATR + 50% at {STOP_LOSS_ATR_MULT}x ATR (server-side)\n"
         f"\u2022 TP: 20% at {TP1_ATR_MULT}x ATR, 25% at {TP2_ATR_MULT}x ATR\n"
         f"\u2022 Trail: 30% at {TRAILING_ACTIVATE_ATR}x ATR ({TRAILING_STOP_ATR}x ATR dist), then 20% ({TRAILING_STOP_ATR_STAGE2}x ATR dist), 5% rides\n"
@@ -2570,7 +2768,9 @@ async def remove_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                         symbol_trail2_qty, symbol_trail2_price, symbol_peak_stage2,
                         symbol_sl1_order_id, symbol_sl1_qty, symbol_sl1_taken, symbol_original_qty,
                         symbol_tp1_taken, symbol_tp2_taken, symbol_post_exit_flat,
-                        symbol_prev_macd_above_signal, symbol_monitor_running]:
+                        symbol_prev_macd_above_signal, symbol_monitor_running,
+                        symbol_entry_cross_time, symbol_entry_cross_dir,
+                        symbol_exit_cross_time, symbol_exit_cross_dir]:
         if symbol in state_dict:
             del state_dict[symbol]
 
@@ -2588,7 +2788,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("\u26d4 Unauthorized. This bot is private.")
         return
     await update.message.reply_text(
-        "Bot ready! (v19 - Full Concurrency Fix + MACD Crossover Entry/Exit + Tiered SL + TP + Multi-Stage Trail)\n\n"
+        "Bot ready! (v20 - 5-Min MACD Confirmation + Tiered SL + TP + Multi-Stage Trail)\n\n"
         "Commands:\n"
         "1. /start - Display this message\n"
         "2. /add_symbol <symbol> - Start monitoring with auto-sizing (20% balance)\n"
@@ -2598,7 +2798,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"\u2022 1. ADX > {ADX_THRESHOLD}\n"
         "\u2022 2. Long: Price > 50 EMA (1h) | Short: Price < 50 EMA (1h)\n"
         f"\u2022 3. RSI NOT extreme (not > {RSI_OVERBOUGHT} for longs, not < {RSI_OVERSOLD} for shorts)\n"
-        "\u2022 4. Wait for MACD crossover: Long = MACD crosses ABOVE Signal (1h) | Short = MACD crosses BELOW Signal (1h)\n"
+        "\u2022 4. Wait for MACD crossover + 5-min confirmation:\n"
+        "\u2022    Long = MACD crosses ABOVE Signal (1h), then stays above for 5 min\n"
+        "\u2022    Short = MACD crosses BELOW Signal (1h), then stays below for 5 min\n"
         "\u2022 A perfect entry is more important than rush!\n\n"
         "Stop-Loss (Tiered):\n"
         f"\u2022 Tier 1: 50% closed INSTANTLY at {SL_STAGE1_ATR_MULT}x ATR loss\n"
@@ -2614,12 +2816,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "\u2022 Stage 2 trail will never be placed below entry price (long) or above entry price (short)\n"
         "\u2022 Remaining 5% protected by Exit Rules ONLY\n\n"
         "Exit Rules:\n"
-        "\u2022 Long: MACD crosses BELOW Signal (1h) -> close instantly\n"
-        "\u2022 Short: MACD crosses ABOVE Signal (1h) -> close instantly\n\n"
+        "\u2022 Long: MACD crosses BELOW Signal (1h) + stays below for 5 min -> close\n"
+        "\u2022 Short: MACD crosses ABOVE Signal (1h) + stays above for 5 min -> close\n\n"
         "Reversal Rules:\n"
         f"\u2022 ADX > {ADX_THRESHOLD}\n"
-        "\u2022 Long: Price > 50 EMA (1h) + wait for MACD to cross ABOVE Signal (1h)\n"
-        "\u2022 Short: Price < 50 EMA (1h) + wait for MACD to cross BELOW Signal (1h)\n"
+        "\u2022 Long: Price > 50 EMA (1h) + MACD cross ABOVE Signal (1h) + 5-min confirmation\n"
+        "\u2022 Short: Price < 50 EMA (1h) + MACD cross BELOW Signal (1h) + 5-min confirmation\n"
         f"\u2022 RSI NOT extreme (not > {RSI_OVERBOUGHT} for longs, not < {RSI_OVERSOLD} for shorts)\n"
         "\u2022 If conditions not met, bot goes FLAT\n\n"
         "Infrastructure:\n"
