@@ -155,6 +155,7 @@ def save_state():
             "symbol_tp1_taken": symbol_tp1_taken,
             "symbol_tp2_taken": symbol_tp2_taken,
             "symbol_post_exit_flat": symbol_post_exit_flat,
+            "symbol_prev_macd_above_signal": symbol_prev_macd_above_signal,
         }
         with open(STATE_FILE, "w") as f:
             json.dump(state, f, indent=2, default=str)
@@ -203,6 +204,7 @@ def load_state():
         symbol_tp1_taken.update({k: v for k, v in state.get("symbol_tp1_taken", {}).items()})
         symbol_tp2_taken.update({k: v for k, v in state.get("symbol_tp2_taken", {}).items()})
         symbol_post_exit_flat.update({k: v for k, v in state.get("symbol_post_exit_flat", {}).items()})
+        symbol_prev_macd_above_signal.update({k: v for k, v in state.get("symbol_prev_macd_above_signal", {}).items()})
 
         print(f"[STATE] Loaded state from {STATE_FILE} — {len(monitored_symbols)} symbols restored")
         return True
@@ -246,34 +248,37 @@ symbol_sl1_taken: dict[str, bool] = {}                 # Has 50% SL at 0.5x ATR 
 symbol_original_qty: dict[str, Optional[float]] = {}   # Original position qty at entry
 
 # Take-Profit tracking
-symbol_tp1_taken: dict[str, bool] = {}                 # Has TP1 (20% at 1.5x ATR) been taken?
-symbol_tp2_taken: dict[str, bool] = {}                 # Has TP2 (25% at 3.5x ATR) been taken?
+symbol_tp1_taken: dict[str, bool] = {}                 # Has TP1 (20% at 2.0x ATR) been taken?
+symbol_tp2_taken: dict[str, bool] = {}                 # Has TP2 (25% at 4.5x ATR) been taken?
 
-# Post-exit FLAT state (use reversal conditions ADX>27 instead of entry ADX>20)
+# Post-exit FLAT state (awaiting MACD crossover for reversal)
 symbol_post_exit_flat: dict[str, bool] = {}            # True when FLAT after exit, awaiting reversal conditions
+
+# MACD crossover tracking (previous candle state for detecting fresh crosses)
+symbol_prev_macd_above_signal: dict[str, Optional[bool]] = {}  # Was MACD > Signal on previous check?
 
 
 # ────────────────────────────────────────────────
 #  Constants
 # ────────────────────────────────────────────────
 ADX_THRESHOLD = 20           # Only trade when ADX > 20 (trending)
-ADX_EXIT_THRESHOLD = 25      # Exit requires ADX > 25
-ADX_REVERSAL_THRESHOLD = 27  # Reversal requires ADX > 27
 STOP_LOSS_ATR_MULT = 1.0     # Tier 2: remaining 50% closed at 1.0x ATR loss (server-side)
 SL_STAGE1_ATR_MULT = 0.5    # Tier 1: 50% closed INSTANTLY at 0.5x ATR loss
 SL_STAGE1_CLOSE_PCT = 0.50  # Close 50% of position at first SL level
-TP1_ATR_MULT = 1.5           # TP1: close 20% at 1.5x ATR profit
+TP1_ATR_MULT = 2.0           # TP1: close 20% at 2.0x ATR profit
 TP1_CLOSE_PCT = 0.20         # Close 20% of original position at TP1
 TP1_SL_MOVE_ATR = 0.5        # After TP1: move SL to lock in 0.5x ATR profit
-TP2_ATR_MULT = 3.5           # TP2: close 25% at 3.5x ATR profit
+TP1_SL_CLOSE_PCT = 0.95      # TP1 SL closes 95% of remaining, leaves 5% for Exit Rules
+TP2_ATR_MULT = 4.5           # TP2: close 25% at 4.5x ATR profit
 TP2_CLOSE_PCT = 0.25         # Close 25% of original position at TP2
 TP2_SL_MOVE_ATR = 1.0        # After TP2: move SL to lock in 1.0x ATR profit
-TRAILING_ACTIVATE_ATR = 2.0  # Activate Stage 1 trailing stop after 2.0x ATR profit
+TP2_SL_CLOSE_PCT = 0.95      # TP2 SL closes 95% of remaining, leaves 5% for Exit Rules
+TRAILING_ACTIVATE_ATR = 1.5  # Activate Stage 1 trailing stop after 1.5x ATR profit
 TRAILING_STOP_ATR = 1.0      # Stage 1 trailing stop distance: 1x ATR from peak
 TRAILING_STOP_ATR_STAGE2 = 1.0  # Stage 2 trailing stop distance: 1x ATR from peak
 TRAILING_CLOSE_PCT = 0.30    # Close 30% of original position on Stage 1 trail
 TRAILING_STAGE2_QTY_PCT = 0.20  # Close 20% of original position on Stage 2 trail
-# Remaining 5% protected by server-side SL + Exit Rules
+# Remaining 5% protected by Exit Rules ONLY (no server-side SL on final 5%)
 POLL_INTERVAL_SECONDS = 10   # Poll every 10 seconds (faster for risk management)
 RSI_OVERBOUGHT = 70          # Block long entries when RSI > 70
 RSI_OVERSOLD = 30            # Block short entries when RSI < 30
@@ -499,10 +504,16 @@ async def get_1h_ema_macd(symbol: str) -> Optional[dict]:
         macd_line_1h = float(df["macd_line"].iloc[-1])
         signal_line_1h = float(df["signal_line"].iloc[-1])
 
+        # Previous candle's MACD/Signal for crossover detection
+        macd_line_1h_prev = float(df["macd_line"].iloc[-2])
+        signal_line_1h_prev = float(df["signal_line"].iloc[-2])
+
         return {
             "ema_50_1h": ema_50_1h,
             "macd_line_1h": macd_line_1h,
             "signal_line_1h": signal_line_1h,
+            "macd_line_1h_prev": macd_line_1h_prev,
+            "signal_line_1h_prev": signal_line_1h_prev,
         }
 
     except Exception as exc:
@@ -1219,8 +1230,29 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
     ema_50 = ema_macd_1h["ema_50_1h"]
     macd_line_1h = ema_macd_1h["macd_line_1h"]
     signal_line_1h = ema_macd_1h["signal_line_1h"]
+    macd_line_1h_prev = ema_macd_1h["macd_line_1h_prev"]
+    signal_line_1h_prev = ema_macd_1h["signal_line_1h_prev"]
 
     chat_id = context.job.chat_id if context.job else CHAT_ID
+
+    # ── MACD Crossover Detection ──
+    # Current state: is MACD above Signal right now?
+    macd_currently_above = macd_line_1h > signal_line_1h
+    # Previous candle state (from 1h chart)
+    macd_prev_above = macd_line_1h_prev > signal_line_1h_prev
+    # Detect fresh crossovers (just happened on this candle)
+    macd_bullish_cross = macd_currently_above and not macd_prev_above  # MACD just crossed ABOVE Signal
+    macd_bearish_cross = not macd_currently_above and macd_prev_above  # MACD just crossed BELOW Signal
+
+    # Also check our tracked state for crossover since last check (10s polling)
+    prev_macd_state = symbol_prev_macd_above_signal.get(symbol)
+    if prev_macd_state is not None:
+        if macd_currently_above and not prev_macd_state:
+            macd_bullish_cross = True  # Detected cross between polls
+        if not macd_currently_above and prev_macd_state:
+            macd_bearish_cross = True  # Detected cross between polls
+    # Update tracked state
+    symbol_prev_macd_above_signal[symbol] = macd_currently_above
 
     # Use CLOSED candle price for all market state decisions
     if last_close > ema_50:
@@ -1236,12 +1268,14 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
     #      - Tier 1: 50% closed INSTANTLY at 0.5x ATR loss
     #      - Tier 2: Remaining 50% at 1.0x ATR loss (server-side, always active)
     #    TAKE-PROFIT (price goes in our favor):
-    #      - TP1: At 1.5x ATR profit → close 20%, move SL to 0.5x ATR profit
-    #      - TP2: At 3.5x ATR profit → close 25%, move SL to 1.0x ATR profit
+    #      - TP1: At 2.0x ATR profit -> close 20%, move SL to 0.5x ATR profit
+    #        (SL after TP1 closes only 95% of remaining, leaves 5% for Exit Rules)
+    #      - TP2: At 4.5x ATR profit -> close 25%, move SL to 1.0x ATR profit
+    #        (SL after TP2 closes only 95% of remaining, leaves 5% for Exit Rules)
     #    TRAILING STOP:
-    #      - Stage 1: At 2.0x ATR profit, trail on 30% (1.0x ATR distance)
+    #      - Stage 1: At 1.5x ATR profit, trail on 30% (1.0x ATR distance)
     #      - Stage 2: After 30% closed, trail on 20% (1.0x ATR distance, never below/above entry)
-    #      - Remaining 5% protected by server-side SL + Exit Rules
+    #      - Remaining 5% protected by Exit Rules ONLY
     #    Uses current_price (real-time) for all risk checks
     # ──────────────────────────────────────────────
     if current_open_trade_side is not None:
@@ -1354,6 +1388,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                     await close_position(symbol, side_to_close="Buy")
                     symbol_trends[symbol] = None
                     symbol_open_trade_side[symbol] = None
+                    _clear_risk_state(symbol)
                     return
 
                 if not sl1_taken:
@@ -1388,6 +1423,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                     await close_position(symbol, side_to_close="Sell")
                     symbol_trends[symbol] = None
                     symbol_open_trade_side[symbol] = None
+                    _clear_risk_state(symbol)
                     return
 
                 if not sl1_taken:
@@ -1416,34 +1452,8 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
         if current_open_trade_side == "Buy":
             unrealized_profit_atr = (current_price - entry_price) / entry_atr if entry_atr else 0
 
-            # ── TP1: At 1.5x ATR profit → close 20%, move SL to 0.5x ATR profit ──
-            if not tp1_taken and unrealized_profit_atr >= TP1_ATR_MULT and original_qty:
-                tp1_qty = original_qty * TP1_CLOSE_PCT
-                closed = await close_position_by_qty(symbol, "Buy", tp1_qty)
-                if closed:
-                    symbol_tp1_taken[symbol] = True
-                    tp1_taken = True
-                    # Cancel SL1 order (no longer needed, SL moving to profit)
-                    await cancel_sl1_order(symbol)
-                    symbol_sl1_taken[symbol] = True
-                    sl1_taken = True
-                    # Move server SL to lock in 0.5x ATR profit
-                    new_sl = entry_price + (TP1_SL_MOVE_ATR * entry_atr)
-                    await set_server_stop_loss(symbol, "Buy", new_sl)
-                    save_state()
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=(
-                            f"\U0001f3af TP1 HIT for {symbol} (Long)\n"
-                            f"Closed 20% at {TP1_ATR_MULT}x ATR profit\n"
-                            f"Entry: {entry_price:.6g} | Current: {current_price:.6g}\n"
-                            f"SL moved to {new_sl:.6g} (locking in {TP1_SL_MOVE_ATR}x ATR profit)\n"
-                            f"Remaining: 80% of original position"
-                        )
-                    )
-
-            # ── Stage 1 Trail: At 2.0x ATR profit, trail on 30% ──
-            if tp1_taken and not trailing_active and unrealized_profit_atr >= TRAILING_ACTIVATE_ATR and original_qty:
+            # ── Stage 1 Trail: At 1.5x ATR profit, trail on 30% ──
+            if not trailing_active and unrealized_profit_atr >= TRAILING_ACTIVATE_ATR and original_qty:
                 symbol_trailing_active[symbol] = True
                 trailing_active = True
                 save_state()
@@ -1468,16 +1478,61 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                         text=f"\u26a0\ufe0f {symbol}: Stage 1 trail failed to place. Will retry."
                     )
 
-            # ── TP2: At 3.5x ATR profit → close 25%, move SL to 1.0x ATR profit ──
+            # ── TP1: At 2.0x ATR profit -> close 20%, move SL to 0.5x ATR profit ──
+            # (SL after TP1 closes only 95% of remaining, leaves 5% for Exit Rules)
+            if not tp1_taken and unrealized_profit_atr >= TP1_ATR_MULT and original_qty:
+                tp1_qty = original_qty * TP1_CLOSE_PCT
+                closed = await close_position_by_qty(symbol, "Buy", tp1_qty)
+                if closed:
+                    symbol_tp1_taken[symbol] = True
+                    tp1_taken = True
+                    # Cancel SL1 order and full-position server SL
+                    await cancel_sl1_order(symbol)
+                    symbol_sl1_taken[symbol] = True
+                    sl1_taken = True
+                    await cancel_server_stops(symbol)
+                    # Place partial SL for 95% of remaining (leaves 5% for Exit Rules)
+                    new_sl = entry_price + (TP1_SL_MOVE_ATR * entry_atr)
+                    remaining_qty = await get_position_size(symbol)
+                    if remaining_qty:
+                        sl_qty = remaining_qty * TP1_SL_CLOSE_PCT
+                        sl_order_id = await place_conditional_close_order(symbol, "Buy", sl_qty, new_sl)
+                        if sl_order_id:
+                            print(f"[TP1-SL] {symbol}: Placed 95% SL order at {new_sl:.6g} for qty {sl_qty:.6g}")
+                        else:
+                            # Fallback to full server SL if conditional order fails
+                            await set_server_stop_loss(symbol, "Buy", new_sl)
+                    save_state()
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"\U0001f3af TP1 HIT for {symbol} (Long)\n"
+                            f"Closed 20% at {TP1_ATR_MULT}x ATR profit\n"
+                            f"Entry: {entry_price:.6g} | Current: {current_price:.6g}\n"
+                            f"SL moved to {new_sl:.6g} (locking in {TP1_SL_MOVE_ATR}x ATR profit)\n"
+                            f"SL will close 95% if triggered, leaving 5% for Exit Rules\n"
+                            f"Remaining: 80% of original position"
+                        )
+                    )
+
+            # ── TP2: At 4.5x ATR profit -> close 25%, move SL to 1.0x ATR profit ──
             if tp1_taken and not tp2_taken and unrealized_profit_atr >= TP2_ATR_MULT and original_qty:
                 tp2_qty = original_qty * TP2_CLOSE_PCT
                 closed = await close_position_by_qty(symbol, "Buy", tp2_qty)
                 if closed:
                     symbol_tp2_taken[symbol] = True
                     tp2_taken = True
-                    # Move server SL to lock in 1.0x ATR profit
+                    # Cancel existing SL and place partial SL for 95% of remaining
+                    await cancel_server_stops(symbol)
                     new_sl = entry_price + (TP2_SL_MOVE_ATR * entry_atr)
-                    await set_server_stop_loss(symbol, "Buy", new_sl)
+                    remaining_qty = await get_position_size(symbol)
+                    if remaining_qty:
+                        sl_qty = remaining_qty * TP2_SL_CLOSE_PCT
+                        sl_order_id = await place_conditional_close_order(symbol, "Buy", sl_qty, new_sl)
+                        if sl_order_id:
+                            print(f"[TP2-SL] {symbol}: Placed 95% SL order at {new_sl:.6g} for qty {sl_qty:.6g}")
+                        else:
+                            await set_server_stop_loss(symbol, "Buy", new_sl)
                     save_state()
                     await context.bot.send_message(
                         chat_id=chat_id,
@@ -1486,6 +1541,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                             f"Closed 25% at {TP2_ATR_MULT}x ATR profit\n"
                             f"Entry: {entry_price:.6g} | Current: {current_price:.6g}\n"
                             f"SL moved to {new_sl:.6g} (locking in {TP2_SL_MOVE_ATR}x ATR profit)\n"
+                            f"SL will close 95% if triggered, leaving 5% for Exit Rules\n"
                             f"Remaining: 55% (30% trail + 20% stage2 + 5% exit rules)"
                         )
                     )
@@ -1552,7 +1608,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                                 f"\U0001f3c1 STAGE 1 TRAIL closed 30% for {symbol} (Long)\n"
                                 f"Trail price hit: {trail_price_display:.6g}\n"
                                 f"Now placing Stage 2 trail on 20% ({TRAILING_STOP_ATR_STAGE2}x ATR distance).\n"
-                                f"Remaining 5% will ride until Exit Rules exit."
+                                f"Remaining 5% will ride until Exit Rules close it."
                             )
                         )
 
@@ -1649,7 +1705,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                                 f"\U0001f3c1 STAGE 2 TRAIL closed 20% for {symbol} (Long)\n"
                                 f"Trail price hit: {trail_price_display:.6g}\n"
                                 f"Remaining 5% continues trading.\n"
-                                f"No trailing stop on final 5% — exits on Exit Rules only."
+                                f"No trailing stop on final 5% -- exits on Exit Rules only."
                             )
                         )
 
@@ -1676,33 +1732,8 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
         elif current_open_trade_side == "Sell":
             unrealized_profit_atr = (entry_price - current_price) / entry_atr if entry_atr else 0
 
-            # ── TP1: At 1.5x ATR profit → close 20%, move SL to 0.5x ATR profit ──
-            if not tp1_taken and unrealized_profit_atr >= TP1_ATR_MULT and original_qty:
-                tp1_qty = original_qty * TP1_CLOSE_PCT
-                closed = await close_position_by_qty(symbol, "Sell", tp1_qty)
-                if closed:
-                    symbol_tp1_taken[symbol] = True
-                    tp1_taken = True
-                    await cancel_sl1_order(symbol)
-                    symbol_sl1_taken[symbol] = True
-                    sl1_taken = True
-                    # Move server SL to lock in 0.5x ATR profit (for shorts, SL goes DOWN)
-                    new_sl = entry_price - (TP1_SL_MOVE_ATR * entry_atr)
-                    await set_server_stop_loss(symbol, "Sell", new_sl)
-                    save_state()
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=(
-                            f"\U0001f3af TP1 HIT for {symbol} (Short)\n"
-                            f"Closed 20% at {TP1_ATR_MULT}x ATR profit\n"
-                            f"Entry: {entry_price:.6g} | Current: {current_price:.6g}\n"
-                            f"SL moved to {new_sl:.6g} (locking in {TP1_SL_MOVE_ATR}x ATR profit)\n"
-                            f"Remaining: 80% of original position"
-                        )
-                    )
-
-            # ── Stage 1 Trail: At 2.0x ATR profit, trail on 30% ──
-            if tp1_taken and not trailing_active and unrealized_profit_atr >= TRAILING_ACTIVATE_ATR and original_qty:
+            # ── Stage 1 Trail: At 1.5x ATR profit, trail on 30% ──
+            if not trailing_active and unrealized_profit_atr >= TRAILING_ACTIVATE_ATR and original_qty:
                 symbol_trailing_active[symbol] = True
                 trailing_active = True
                 save_state()
@@ -1727,15 +1758,57 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                         text=f"\u26a0\ufe0f {symbol}: Stage 1 trail failed to place. Will retry."
                     )
 
-            # ── TP2: At 3.5x ATR profit → close 25%, move SL to 1.0x ATR profit ──
+            # ── TP1: At 2.0x ATR profit -> close 20%, move SL to 0.5x ATR profit ──
+            if not tp1_taken and unrealized_profit_atr >= TP1_ATR_MULT and original_qty:
+                tp1_qty = original_qty * TP1_CLOSE_PCT
+                closed = await close_position_by_qty(symbol, "Sell", tp1_qty)
+                if closed:
+                    symbol_tp1_taken[symbol] = True
+                    tp1_taken = True
+                    await cancel_sl1_order(symbol)
+                    symbol_sl1_taken[symbol] = True
+                    sl1_taken = True
+                    await cancel_server_stops(symbol)
+                    # Place partial SL for 95% of remaining (leaves 5% for Exit Rules)
+                    new_sl = entry_price - (TP1_SL_MOVE_ATR * entry_atr)
+                    remaining_qty = await get_position_size(symbol)
+                    if remaining_qty:
+                        sl_qty = remaining_qty * TP1_SL_CLOSE_PCT
+                        sl_order_id = await place_conditional_close_order(symbol, "Sell", sl_qty, new_sl)
+                        if sl_order_id:
+                            print(f"[TP1-SL] {symbol}: Placed 95% SL order at {new_sl:.6g} for qty {sl_qty:.6g}")
+                        else:
+                            await set_server_stop_loss(symbol, "Sell", new_sl)
+                    save_state()
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"\U0001f3af TP1 HIT for {symbol} (Short)\n"
+                            f"Closed 20% at {TP1_ATR_MULT}x ATR profit\n"
+                            f"Entry: {entry_price:.6g} | Current: {current_price:.6g}\n"
+                            f"SL moved to {new_sl:.6g} (locking in {TP1_SL_MOVE_ATR}x ATR profit)\n"
+                            f"SL will close 95% if triggered, leaving 5% for Exit Rules\n"
+                            f"Remaining: 80% of original position"
+                        )
+                    )
+
+            # ── TP2: At 4.5x ATR profit -> close 25%, move SL to 1.0x ATR profit ──
             if tp1_taken and not tp2_taken and unrealized_profit_atr >= TP2_ATR_MULT and original_qty:
                 tp2_qty = original_qty * TP2_CLOSE_PCT
                 closed = await close_position_by_qty(symbol, "Sell", tp2_qty)
                 if closed:
                     symbol_tp2_taken[symbol] = True
                     tp2_taken = True
+                    await cancel_server_stops(symbol)
                     new_sl = entry_price - (TP2_SL_MOVE_ATR * entry_atr)
-                    await set_server_stop_loss(symbol, "Sell", new_sl)
+                    remaining_qty = await get_position_size(symbol)
+                    if remaining_qty:
+                        sl_qty = remaining_qty * TP2_SL_CLOSE_PCT
+                        sl_order_id = await place_conditional_close_order(symbol, "Sell", sl_qty, new_sl)
+                        if sl_order_id:
+                            print(f"[TP2-SL] {symbol}: Placed 95% SL order at {new_sl:.6g} for qty {sl_qty:.6g}")
+                        else:
+                            await set_server_stop_loss(symbol, "Sell", new_sl)
                     save_state()
                     await context.bot.send_message(
                         chat_id=chat_id,
@@ -1744,6 +1817,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                             f"Closed 25% at {TP2_ATR_MULT}x ATR profit\n"
                             f"Entry: {entry_price:.6g} | Current: {current_price:.6g}\n"
                             f"SL moved to {new_sl:.6g} (locking in {TP2_SL_MOVE_ATR}x ATR profit)\n"
+                            f"SL will close 95% if triggered, leaving 5% for Exit Rules\n"
                             f"Remaining: 55% (30% trail + 20% stage2 + 5% exit rules)"
                         )
                     )
@@ -1809,7 +1883,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                                 f"\U0001f3c1 STAGE 1 TRAIL closed 30% for {symbol} (Short)\n"
                                 f"Trail price hit: {trail_price_display:.6g}\n"
                                 f"Now placing Stage 2 trail on 20% ({TRAILING_STOP_ATR_STAGE2}x ATR distance).\n"
-                                f"Remaining 5% will ride until Exit Rules exit."
+                                f"Remaining 5% will ride until Exit Rules close it."
                             )
                         )
 
@@ -1905,7 +1979,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                                 f"\U0001f3c1 STAGE 2 TRAIL closed 20% for {symbol} (Short)\n"
                                 f"Trail price hit: {trail_price_display:.6g}\n"
                                 f"Remaining 5% continues trading.\n"
-                                f"No trailing stop on final 5% — exits on Exit Rules only."
+                                f"No trailing stop on final 5% -- exits on Exit Rules only."
                             )
                         )
 
@@ -1930,23 +2004,22 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                         print(f"[STAGE2-RETRY] {symbol}: Stage 2 trail placed (retry) at {stage2_trail_price:.6g}")
 
     # ──────────────────────────────────────────────
-    # 2. EXIT + REVERSAL
-    #    Exit requires: Price crosses 50 EMA (1h) AND MACD crosses (1h) AND ADX > 25
-    #    Reversal requires: ADX > 27, EMA/MACD alignment, RSI not extreme
-    #    If reversal conditions not met → go FLAT (wait for reversal conditions)
+    # 2. EXIT RULES
+    #    Long: MACD Line crosses below Signal Line (1h) -> close instantly
+    #    Short: MACD Line crosses above Signal Line (1h) -> close instantly
+    #    No EMA or ADX requirement for exit -- MACD cross alone triggers it
     # ──────────────────────────────────────────────
     if current_open_trade_side is not None:
 
-        # ── Long Exit ──
-        if current_open_trade_side == "Buy" and last_close < ema_50 and macd_line_1h < signal_line_1h and adx > ADX_EXIT_THRESHOLD:
+        # ── Long Exit: MACD crosses below Signal (1h) ──
+        if current_open_trade_side == "Buy" and macd_bearish_cross:
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=(
                     f"\u26a0\ufe0f EXIT SIGNAL for {symbol} (Long)\n"
-                    f"Last Close ({last_close}) < 50 EMA 1h ({ema_50:.6g})\n"
-                    f"MACD Line 1h ({macd_line_1h:.6g}) < Signal Line 1h ({signal_line_1h:.6g})\n"
-                    f"ADX: {adx:.2f} > {ADX_EXIT_THRESHOLD}\n"
-                    f"Closing Long position..."
+                    f"MACD Line 1h ({macd_line_1h:.6g}) CROSSED BELOW Signal Line 1h ({signal_line_1h:.6g})\n"
+                    f"Prev MACD: {macd_line_1h_prev:.6g} > Prev Signal: {signal_line_1h_prev:.6g}\n"
+                    f"Closing Long position INSTANTLY..."
                 )
             )
 
@@ -1957,15 +2030,15 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
             if symbol in symbol_manual_quantities and symbol_manual_quantities[symbol] is not None:
                 manual_override = closed_qty
 
-            # Check REVERSAL conditions: ADX > 27, Price < EMA, MACD < Signal, RSI not oversold
-            if adx > ADX_REVERSAL_THRESHOLD and last_close < ema_50 and macd_line_1h < signal_line_1h and rsi > RSI_OVERSOLD:
+            # Check REVERSAL conditions: ADX > 20, Price < EMA, MACD just crossed below Signal, RSI not oversold
+            if adx > ADX_THRESHOLD and last_close < ema_50 and macd_bearish_cross and rsi > RSI_OVERSOLD:
                 await context.bot.send_message(
                     chat_id=chat_id,
                     text=(
                         f"\U0001f504 REVERSE to Short for {symbol}\n"
-                        f"ADX: {adx:.2f} > {ADX_REVERSAL_THRESHOLD} (reversal threshold)\n"
+                        f"ADX: {adx:.2f} > {ADX_THRESHOLD}\n"
                         f"Price ({last_close}) < 50 EMA 1h ({ema_50:.6g})\n"
-                        f"MACD 1h ({macd_line_1h:.6g}) < Signal 1h ({signal_line_1h:.6g})\n"
+                        f"MACD 1h ({macd_line_1h:.6g}) just crossed below Signal 1h ({signal_line_1h:.6g})\n"
                         f"RSI: {rsi:.2f} (not oversold)\n"
                         f"Opening Short..."
                     )
@@ -1990,19 +2063,20 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                     symbol_post_exit_flat[symbol] = True
                     save_state()
             else:
-                # Reversal conditions not met → go FLAT
+                # Reversal conditions not met -> go FLAT and wait for MACD crossover
                 reason = []
-                if adx <= ADX_REVERSAL_THRESHOLD:
-                    reason.append(f"ADX ({adx:.2f}) <= {ADX_REVERSAL_THRESHOLD}")
+                if adx <= ADX_THRESHOLD:
+                    reason.append(f"ADX ({adx:.2f}) <= {ADX_THRESHOLD}")
+                if last_close >= ema_50:
+                    reason.append(f"Price ({last_close}) >= 50 EMA ({ema_50:.6g})")
                 if rsi <= RSI_OVERSOLD:
                     reason.append(f"RSI oversold ({rsi:.2f})")
                 await context.bot.send_message(
                     chat_id=chat_id,
                     text=(
                         f"\U0001f7e1 GOING FLAT for {symbol}\n"
-                        f"Reversal conditions not met: {', '.join(reason) if reason else 'conditions not aligned'}\n"
-                        f"ADX: {adx:.2f} (need > {ADX_REVERSAL_THRESHOLD}) | RSI: {rsi:.2f}\n"
-                        f"Waiting for reversal conditions (ADX > {ADX_REVERSAL_THRESHOLD})..."
+                        f"Reversal conditions not met: {', '.join(reason) if reason else 'waiting for MACD crossover'}\n"
+                        f"Will wait for MACD crossover + ADX > {ADX_THRESHOLD} + RSI filter before re-entering."
                     )
                 )
                 symbol_open_trade_side[symbol] = None
@@ -2010,16 +2084,15 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                 save_state()
             return
 
-        # ── Short Exit ──
-        elif current_open_trade_side == "Sell" and last_close > ema_50 and macd_line_1h > signal_line_1h and adx > ADX_EXIT_THRESHOLD:
+        # ── Short Exit: MACD crosses above Signal (1h) ──
+        elif current_open_trade_side == "Sell" and macd_bullish_cross:
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=(
                     f"\u26a0\ufe0f EXIT SIGNAL for {symbol} (Short)\n"
-                    f"Last Close ({last_close}) > 50 EMA 1h ({ema_50:.6g})\n"
-                    f"MACD Line 1h ({macd_line_1h:.6g}) > Signal Line 1h ({signal_line_1h:.6g})\n"
-                    f"ADX: {adx:.2f} > {ADX_EXIT_THRESHOLD}\n"
-                    f"Closing Short position..."
+                    f"MACD Line 1h ({macd_line_1h:.6g}) CROSSED ABOVE Signal Line 1h ({signal_line_1h:.6g})\n"
+                    f"Prev MACD: {macd_line_1h_prev:.6g} < Prev Signal: {signal_line_1h_prev:.6g}\n"
+                    f"Closing Short position INSTANTLY..."
                 )
             )
 
@@ -2030,15 +2103,15 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
             if symbol in symbol_manual_quantities and symbol_manual_quantities[symbol] is not None:
                 manual_override = closed_qty
 
-            # Check REVERSAL conditions: ADX > 27, Price > EMA, MACD > Signal, RSI not overbought
-            if adx > ADX_REVERSAL_THRESHOLD and last_close > ema_50 and macd_line_1h > signal_line_1h and rsi < RSI_OVERBOUGHT:
+            # Check REVERSAL conditions: ADX > 20, Price > EMA, MACD just crossed above Signal, RSI not overbought
+            if adx > ADX_THRESHOLD and last_close > ema_50 and macd_bullish_cross and rsi < RSI_OVERBOUGHT:
                 await context.bot.send_message(
                     chat_id=chat_id,
                     text=(
                         f"\U0001f504 REVERSE to Long for {symbol}\n"
-                        f"ADX: {adx:.2f} > {ADX_REVERSAL_THRESHOLD} (reversal threshold)\n"
+                        f"ADX: {adx:.2f} > {ADX_THRESHOLD}\n"
                         f"Price ({last_close}) > 50 EMA 1h ({ema_50:.6g})\n"
-                        f"MACD 1h ({macd_line_1h:.6g}) > Signal 1h ({signal_line_1h:.6g})\n"
+                        f"MACD 1h ({macd_line_1h:.6g}) just crossed above Signal 1h ({signal_line_1h:.6g})\n"
                         f"RSI: {rsi:.2f} (not overbought)\n"
                         f"Opening Long..."
                     )
@@ -2064,17 +2137,18 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
                     save_state()
             else:
                 reason = []
-                if adx <= ADX_REVERSAL_THRESHOLD:
-                    reason.append(f"ADX ({adx:.2f}) <= {ADX_REVERSAL_THRESHOLD}")
+                if adx <= ADX_THRESHOLD:
+                    reason.append(f"ADX ({adx:.2f}) <= {ADX_THRESHOLD}")
+                if last_close <= ema_50:
+                    reason.append(f"Price ({last_close}) <= 50 EMA ({ema_50:.6g})")
                 if rsi >= RSI_OVERBOUGHT:
                     reason.append(f"RSI overbought ({rsi:.2f})")
                 await context.bot.send_message(
                     chat_id=chat_id,
                     text=(
                         f"\U0001f7e1 GOING FLAT for {symbol}\n"
-                        f"Reversal conditions not met: {', '.join(reason) if reason else 'conditions not aligned'}\n"
-                        f"ADX: {adx:.2f} (need > {ADX_REVERSAL_THRESHOLD}) | RSI: {rsi:.2f}\n"
-                        f"Waiting for reversal conditions (ADX > {ADX_REVERSAL_THRESHOLD})..."
+                        f"Reversal conditions not met: {', '.join(reason) if reason else 'waiting for MACD crossover'}\n"
+                        f"Will wait for MACD crossover + ADX > {ADX_THRESHOLD} + RSI filter before re-entering."
                     )
                 )
                 symbol_open_trade_side[symbol] = None
@@ -2084,50 +2158,50 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     # ──────────────────────────────────────────────
     # 3. TRADE ENTRY (no open position)
-    #    If post-exit FLAT: use reversal conditions (ADX > 27)
-    #    If fresh entry: use normal conditions (ADX > 20)
-    #    Other filters same: EMA 50 (1h), RSI not extreme, MACD (1h)
+    #    ALL filters must pass:
+    #      1. ADX > 20
+    #      2. Long: Price > 50 EMA (1h) | Short: Price < 50 EMA (1h)
+    #      3. RSI NOT extreme (not > 70 for longs, not < 30 for shorts)
+    #      4. Wait for MACD crossover: Long: MACD just crossed above Signal (1h)
+    #         Short: MACD just crossed below Signal (1h)
+    #    A perfect entry is more important than rush!
+    #    Post-exit FLAT state also uses these same conditions (ADX > 20 + crossover)
     # ──────────────────────────────────────────────
     if current_open_trade_side is None:
-        is_post_exit = symbol_post_exit_flat.get(symbol, False)
-        required_adx = ADX_REVERSAL_THRESHOLD if is_post_exit else ADX_THRESHOLD
-
         # Filter 1: ADX must be above threshold
-        if adx < required_adx:
+        if adx < ADX_THRESHOLD:
             return
 
         new_trend = None
         side = None
-        # Long: last_close > 50 EMA (1h)
-        if last_close > ema_50:
+
+        # Long: last_close > 50 EMA (1h) AND MACD just crossed above Signal (1h)
+        if last_close > ema_50 and macd_bullish_cross:
             if rsi > RSI_OVERBOUGHT:
-                print(f"[FILTER] {symbol}: Long entry blocked — RSI overbought ({rsi:.2f} > {RSI_OVERBOUGHT})")
-                return
-            if macd_line_1h <= signal_line_1h:
-                print(f"[FILTER] {symbol}: Long entry blocked — MACD Line 1h ({macd_line_1h:.6g}) <= Signal Line 1h ({signal_line_1h:.6g})")
+                print(f"[FILTER] {symbol}: Long entry blocked -- RSI overbought ({rsi:.2f} > {RSI_OVERBOUGHT})")
                 return
             new_trend = "upward"
             side = "Buy"
-        # Short: last_close < 50 EMA (1h)
-        elif last_close < ema_50:
+
+        # Short: last_close < 50 EMA (1h) AND MACD just crossed below Signal (1h)
+        elif last_close < ema_50 and macd_bearish_cross:
             if rsi < RSI_OVERSOLD:
-                print(f"[FILTER] {symbol}: Short entry blocked — RSI oversold ({rsi:.2f} < {RSI_OVERSOLD})")
-                return
-            if macd_line_1h >= signal_line_1h:
-                print(f"[FILTER] {symbol}: Short entry blocked — MACD Line 1h ({macd_line_1h:.6g}) >= Signal Line 1h ({signal_line_1h:.6g})")
+                print(f"[FILTER] {symbol}: Short entry blocked -- RSI oversold ({rsi:.2f} < {RSI_OVERSOLD})")
                 return
             new_trend = "downward"
             side = "Sell"
 
-        if new_trend and side and (previous_trend is None or new_trend != previous_trend):
+        if new_trend and side:
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             side_text = "Long (Buy)" if side == "Buy" else "Short (Sell)"
+            is_post_exit = symbol_post_exit_flat.get(symbol, False)
             entry_type = "REVERSAL" if is_post_exit else "ENTRY"
             msg = (
                 f"{ts} \u2014 {symbol} {entry_type} SIGNAL: <b>{new_trend.upper()}</b>\n"
                 f"Last Close: {last_close} | 50 EMA 1h: {ema_50:.6g}\n"
-                f"+DI: {plus_di:.2f} | -DI: {minus_di:.2f} | ADX: {adx:.2f} (threshold: {required_adx})\n"
+                f"+DI: {plus_di:.2f} | -DI: {minus_di:.2f} | ADX: {adx:.2f}\n"
                 f"RSI: {rsi:.2f} | MACD 1h: {macd_line_1h:.6g} / Signal 1h: {signal_line_1h:.6g}\n"
+                f"MACD CROSSOVER detected (perfect entry)\n"
                 f"Direction: {side_text}"
             )
             await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
@@ -2167,7 +2241,7 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
         else:
             is_post_exit = symbol_post_exit_flat.get(symbol, False)
             if is_post_exit:
-                trade_status = f"\u274c No open trade for {symbol} (FLAT — awaiting reversal ADX > {ADX_REVERSAL_THRESHOLD})"
+                trade_status = f"\u274c No open trade for {symbol} (FLAT -- awaiting MACD crossover)"
             else:
                 trade_status = f"\u274c No open trade for {symbol} (FLAT)"
 
@@ -2216,14 +2290,14 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
             elif trailing:
                 trailing_status = 'Stage 1 ACTIVE (placing trail order...)'
             else:
-                trailing_status = 'Not yet (activates at 2.0x ATR)'
+                trailing_status = f'Not yet (activates at {TRAILING_ACTIVATE_ATR}x ATR)'
             risk_info += f"\n\u2022 Trailing Stop: {trailing_status}"
             # SL status
             if tp1_taken_flag:
                 if tp2_taken_flag:
-                    sl_status = f'SL at {TP2_SL_MOVE_ATR}x ATR profit (locked after TP2)'
+                    sl_status = f'SL at {TP2_SL_MOVE_ATR}x ATR profit (locked after TP2, closes 95%)'
                 else:
-                    sl_status = f'SL at {TP1_SL_MOVE_ATR}x ATR profit (locked after TP1)'
+                    sl_status = f'SL at {TP1_SL_MOVE_ATR}x ATR profit (locked after TP1, closes 95%)'
             elif sl1_taken_flag:
                 sl_status = f'Tier 1 HIT (50% closed at {SL_STAGE1_ATR_MULT}x ATR). Tier 2 at {STOP_LOSS_ATR_MULT}x ATR protects remaining 50%'
             else:
@@ -2231,17 +2305,20 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
             risk_info += f"\n\u2022 Stop-Loss: {sl_status}"
             risk_info += f"\n\u2022 Server-Side SL: {'SET' if server_sl else 'Not set'}"
 
+        # MACD state for report
+        macd_state = "ABOVE Signal (Bullish)" if macd_currently_above else "BELOW Signal (Bearish)"
+
         report_msg = (
             f"Still monitoring {symbol}\n"
-            f"\u2022 Entry: 4-layer filter (ADX>{ADX_THRESHOLD}, 50 EMA 1h, RSI, MACD 1h)\n"
-            f"\u2022 Exit: Price crosses 50 EMA (1h) + MACD crosses (1h) + ADX > {ADX_EXIT_THRESHOLD}\n"
-            f"\u2022 Reverse: ADX > {ADX_REVERSAL_THRESHOLD} + EMA/MACD/RSI, else FLAT\n"
+            f"\u2022 Entry: ADX>{ADX_THRESHOLD} + 50 EMA 1h + RSI + MACD crossover (1h)\n"
+            f"\u2022 Exit: MACD crosses opposite direction (1h) -> close instantly\n"
+            f"\u2022 Reverse: ADX > {ADX_THRESHOLD} + EMA/MACD crossover/RSI, else FLAT\n"
             f"\u2022 SL: 50% at {SL_STAGE1_ATR_MULT}x ATR + 50% at {STOP_LOSS_ATR_MULT}x ATR\n"
-            f"\u2022 TP: 20% at {TP1_ATR_MULT}x ATR, 25% at {TP2_ATR_MULT}x ATR\n"
+            f"\u2022 TP: 20% at {TP1_ATR_MULT}x ATR, 25% at {TP2_ATR_MULT}x ATR (SL closes 95%, 5% rides)\n"
             f"\u2022 Trail: 30% at {TRAILING_ACTIVATE_ATR}x ATR, then 20% at 1x ATR, 5% rides\n"
             f"\u2022 WebSocket prices + polling every {POLL_INTERVAL_SECONDS}s\n"
             f"\u2022 50 EMA (1h): {ema_50:.6g} | +DI: {plus_di:.2f} | -DI: {minus_di:.2f} | ADX: {adx:.2f}\n"
-            f"\u2022 RSI: {rsi:.2f} | MACD 1h: {macd_line_1h:.6g} / Signal 1h: {signal_line_1h:.6g}\n"
+            f"\u2022 RSI: {rsi:.2f} | MACD 1h: {macd_line_1h:.6g} / Signal 1h: {signal_line_1h:.6g} ({macd_state})\n"
             f"\u2022 Last Close: {last_close} | Current Price: {current_price}\n"
             f"\u2022 {symbol} state: {current_market_state}\n"
             f"\u2022 {trade_status}"
@@ -2407,9 +2484,9 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(
         f"Monitoring {symbol}!\n"
         f"\u2022 {qty_info}\n"
-        f"\u2022 Entry filters: ADX > {ADX_THRESHOLD} + 50 EMA (1h) + RSI + MACD Line/Signal (1h)\n"
-        f"\u2022 Exit: Price crosses 50 EMA (1h) + MACD crosses (1h) + ADX > {ADX_EXIT_THRESHOLD}\n"
-        f"\u2022 Reverse: ADX > {ADX_REVERSAL_THRESHOLD} + EMA/MACD/RSI, else FLAT\n"
+        f"\u2022 Entry filters: ADX > {ADX_THRESHOLD} + 50 EMA (1h) + RSI + MACD crossover (1h)\n"
+        f"\u2022 Exit: MACD crosses opposite direction (1h) -> close instantly\n"
+        f"\u2022 Reverse: ADX > {ADX_THRESHOLD} + EMA/MACD crossover/RSI, else FLAT\n"
         f"\u2022 SL: 50% at {SL_STAGE1_ATR_MULT}x ATR + 50% at {STOP_LOSS_ATR_MULT}x ATR (server-side)\n"
         f"\u2022 TP: 20% at {TP1_ATR_MULT}x ATR, 25% at {TP2_ATR_MULT}x ATR\n"
         f"\u2022 Trail: 30% at {TRAILING_ACTIVATE_ATR}x ATR ({TRAILING_STOP_ATR}x ATR dist), then 20% ({TRAILING_STOP_ATR_STAGE2}x ATR dist), 5% rides\n"
@@ -2460,7 +2537,8 @@ async def remove_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                         symbol_stage2_active, symbol_stage2_taken, symbol_trail2_order_id,
                         symbol_trail2_qty, symbol_trail2_price, symbol_peak_stage2,
                         symbol_sl1_order_id, symbol_sl1_qty, symbol_sl1_taken, symbol_original_qty,
-                        symbol_tp1_taken, symbol_tp2_taken, symbol_post_exit_flat]:
+                        symbol_tp1_taken, symbol_tp2_taken, symbol_post_exit_flat,
+                        symbol_prev_macd_above_signal]:
         if symbol in state_dict:
             del state_dict[symbol]
 
@@ -2478,7 +2556,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("\u26d4 Unauthorized. This bot is private.")
         return
     await update.message.reply_text(
-        "Bot ready! (v16 - TP Levels + Tiered SL + Multi-Stage Trail + Reversal Rules)\n\n"
+        "Bot ready! (v17 - MACD Crossover Entry/Exit + Tiered SL + TP + Multi-Stage Trail)\n\n"
         "Commands:\n"
         "1. /start - Display this message\n"
         "2. /add_symbol <symbol> - Start monitoring with auto-sizing (20% balance)\n"
@@ -2488,27 +2566,28 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"\u2022 1. ADX > {ADX_THRESHOLD}\n"
         "\u2022 2. Long: Price > 50 EMA (1h) | Short: Price < 50 EMA (1h)\n"
         f"\u2022 3. RSI NOT extreme (not > {RSI_OVERBOUGHT} for longs, not < {RSI_OVERSOLD} for shorts)\n"
-        "\u2022 4. Long: MACD Line > Signal Line (1h) | Short: MACD Line < Signal Line (1h)\n\n"
+        "\u2022 4. Wait for MACD crossover: Long = MACD crosses ABOVE Signal (1h) | Short = MACD crosses BELOW Signal (1h)\n"
+        "\u2022 A perfect entry is more important than rush!\n\n"
         "Stop-Loss (Tiered):\n"
         f"\u2022 Tier 1: 50% closed INSTANTLY at {SL_STAGE1_ATR_MULT}x ATR loss\n"
         f"\u2022 Tier 2: Remaining 50% closed at {STOP_LOSS_ATR_MULT}x ATR loss (server-side, always active)\n\n"
         "Take-Profit Levels:\n"
         f"\u2022 TP1: At {TP1_ATR_MULT}x ATR profit \u2192 Close {TP1_CLOSE_PCT*100:.0f}%, move SL to {TP1_SL_MOVE_ATR}x ATR profit\n"
-        f"\u2022 TP2: At {TP2_ATR_MULT}x ATR profit \u2192 Close {TP2_CLOSE_PCT*100:.0f}%, move SL to {TP2_SL_MOVE_ATR}x ATR profit\n\n"
+        f"\u2022 TP2: At {TP2_ATR_MULT}x ATR profit \u2192 Close {TP2_CLOSE_PCT*100:.0f}%, move SL to {TP2_SL_MOVE_ATR}x ATR profit\n"
+        "\u2022 SL after TP closes 95% of remaining, leaves 5% for Exit Rules\n\n"
         "Trailing Stop (Multi-Stage):\n"
         f"\u2022 At {TRAILING_ACTIVATE_ATR}x ATR profit: Stage 1 trail activates on {TRAILING_CLOSE_PCT*100:.0f}%\n"
         f"\u2022 Stage 1 trail: {TRAILING_STOP_ATR}x ATR distance. Bybit closes {TRAILING_CLOSE_PCT*100:.0f}% INSTANTLY when hit\n"
         f"\u2022 Stage 2 trail: After 30% closed, {TRAILING_STAGE2_QTY_PCT*100:.0f}% gets trail ({TRAILING_STOP_ATR_STAGE2}x ATR distance)\n"
         "\u2022 Stage 2 trail will never be placed below entry price (long) or above entry price (short)\n"
-        "\u2022 Remaining 5% protected by server-side SL + Exit Rules\n\n"
+        "\u2022 Remaining 5% protected by Exit Rules ONLY\n\n"
         "Exit Rules:\n"
-        "\u2022 Long exits: Price < 50 EMA (1h) AND MACD Line < Signal Line (1h)\n"
-        "\u2022 Short exits: Price > 50 EMA (1h) AND MACD Line > Signal Line (1h)\n"
-        f"\u2022 ADX > {ADX_EXIT_THRESHOLD}\n\n"
+        "\u2022 Long: MACD crosses BELOW Signal (1h) -> close instantly\n"
+        "\u2022 Short: MACD crosses ABOVE Signal (1h) -> close instantly\n\n"
         "Reversal Rules:\n"
-        f"\u2022 ADX > {ADX_REVERSAL_THRESHOLD}\n"
-        "\u2022 Long reversal: Price > 50 EMA (1h) + MACD > Signal (1h)\n"
-        "\u2022 Short reversal: Price < 50 EMA (1h) + MACD < Signal (1h)\n"
+        f"\u2022 ADX > {ADX_THRESHOLD}\n"
+        "\u2022 Long: Price > 50 EMA (1h) + wait for MACD to cross ABOVE Signal (1h)\n"
+        "\u2022 Short: Price < 50 EMA (1h) + wait for MACD to cross BELOW Signal (1h)\n"
         f"\u2022 RSI NOT extreme (not > {RSI_OVERBOUGHT} for longs, not < {RSI_OVERSOLD} for shorts)\n"
         "\u2022 If conditions not met, bot goes FLAT\n\n"
         "Infrastructure:\n"
