@@ -396,7 +396,7 @@ def _compute_indicators_sync(symbol: str, interval: str = "30", limit: int = 50)
     df = pd.DataFrame(
         klines,
         columns=["timestamp", "open", "high", "low", "close", "volume", "turnover"],
-    ).iloc[::-1].reset_index(drop=True)
+    ).iloc[::-1].reset_index(drop=True).copy()
     df["high"] = pd.to_numeric(df["high"], errors="coerce")
     df["low"] = pd.to_numeric(df["low"], errors="coerce")
     df["close"] = pd.to_numeric(df["close"], errors="coerce")
@@ -490,7 +490,7 @@ def _compute_1h_ema_macd_sync(symbol: str) -> dict:
     df = pd.DataFrame(
         klines,
         columns=["timestamp", "open", "high", "low", "close", "volume", "turnover"],
-    ).iloc[::-1].reset_index(drop=True)
+    ).iloc[::-1].reset_index(drop=True).copy()
     df["close"] = pd.to_numeric(df["close"], errors="coerce")
 
     if df["close"].isna().any():
@@ -2698,11 +2698,11 @@ async def main():
     base_url = os.environ.get("RENDER_EXTERNAL_HOSTNAME", "psychology-trading-bot.onrender.com")
     webhook_url = f"https://{base_url}/webhook"
 
-    await application.bot.set_webhook(url=webhook_url, drop_pending_updates=True)
-    print(f"Webhook set to: {webhook_url}")
-
     await application.initialize()
     await application.start()
+
+    await application.bot.set_webhook(url=webhook_url, drop_pending_updates=True)
+    print(f"Webhook set to: {webhook_url}")
 
     async def health(request):
         return web.Response(text="OK")
