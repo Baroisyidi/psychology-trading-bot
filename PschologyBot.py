@@ -317,7 +317,8 @@ symbol_monitor_running: dict[str, bool] = {}
 # ────────────────────────────────────────────────
 #  Constants
 # ────────────────────────────────────────────────
-ADX_THRESHOLD = 20           # Only trade when ADX > 20 (trending)
+ADX_THRESHOLD = 25           # Only trade when ADX > 25 (strong trending)
+VOLUME_RATIO_THRESHOLD = 1.5 # Only enter when volume >= 1.5x 20-period average
 STOP_LOSS_ATR_MULT = 1.0     # Tier 2: remaining 50% closed at 1.0x ATR loss (server-side)
 SL_STAGE1_ATR_MULT = 0.5    # Tier 1: 50% closed INSTANTLY at 0.5x ATR loss
 SL_STAGE1_CLOSE_PCT = 0.50  # Close 50% of position at first SL level
@@ -337,6 +338,7 @@ TRAILING_STAGE2_QTY_PCT = 0.20  # Close 20% of original position on Stage 2 trai
 # Remaining 5% protected by Exit Rules ONLY (no server-side SL on final 5%)
 POLL_INTERVAL_SECONDS = 10   # Poll every 10 seconds (faster for risk management)
 MACD_CONFIRM_SECONDS = 300   # Wait 5 minutes (300s) after MACD crossover before acting
+FAST_DI_PERIOD = 7           # Fast DI period with EMA smoothing
 RSI_OVERBOUGHT = 70          # Block long entries when RSI > 70
 RSI_OVERSOLD = 30            # Block short entries when RSI < 30
 
@@ -385,19 +387,19 @@ async def get_current_price(symbol: str) -> Optional[float]:
         return None
 
 
-def _compute_indicators_sync(symbol: str, interval: str = "30", limit: int = 50) -> dict:
+def _compute_indicators_sync(symbol: str, interval: str = "30", limit: int = 100) -> dict:
     """
-    Synchronous helper: fetches klines from Bybit AND computes ATR, ADX, RSI
-    in ONE thread call so neither the API call nor the pandas math blocks the
-    asyncio event loop.
+    Synchronous helper: fetches klines from Bybit AND computes ATR, ADX, RSI,
+    Fast DI (period 7, EMA smoothed), and volume ratio in ONE thread call so
+    neither the API call nor the pandas math blocks the asyncio event loop.
 
-    Only computes indicators actually used by the trading strategy:
-      - ATR (14)  → stop-loss / take-profit / trailing distances
-      - ADX (14)  → trend strength filter (> 20)
-      - RSI (14)  → overbought/oversold filter
-      - last_close → price vs 50 EMA comparison
-    DI crossover, +DI/-DI values, volume, and timestamps are NOT used by
-    the strategy and have been removed to cut computation time.
+    Indicators computed:
+      - ATR (14)        → stop-loss / take-profit / trailing distances
+      - ADX (14)        → trend strength filter (> 25)
+      - RSI (14)        → overbought/oversold filter
+      - Fast +DI/-DI (7, EMA smoothed) → directional confirmation filter
+      - Volume ratio    → current volume vs 20-period average (filter: >= 1.5x)
+      - last_close      → price vs EMA comparison
     """
     resp = bybit_session.get_kline(
         category="linear",
@@ -416,6 +418,7 @@ def _compute_indicators_sync(symbol: str, interval: str = "30", limit: int = 50)
     df["high"] = pd.to_numeric(df["high"], errors="coerce")
     df["low"] = pd.to_numeric(df["low"], errors="coerce")
     df["close"] = pd.to_numeric(df["close"], errors="coerce")
+    df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
 
     if df["close"].isna().any():
         raise ValueError("Invalid prices")
@@ -430,7 +433,7 @@ def _compute_indicators_sync(symbol: str, interval: str = "30", limit: int = 50)
     df["atr"] = df["tr"].ewm(alpha=1/14, min_periods=14).mean()
     atr = float(df["atr"].iloc[-1])
 
-    # 2. ADX (14) — only need DX internally, not +DI/-DI values
+    # 2. ADX (14) — standard ADX with Wilder's smoothing
     df["up_move"] = df["high"] - df["high"].shift(1)
     df["down_move"] = df["low"].shift(1) - df["low"]
     plus_dm = df["up_move"].where((df["up_move"] > df["down_move"]) & (df["up_move"] > 0), 0.0)
@@ -441,7 +444,18 @@ def _compute_indicators_sync(symbol: str, interval: str = "30", limit: int = 50)
     dx = ((plus_di - minus_di).abs() / di_sum) * 100
     adx = float(dx.ewm(alpha=1/14, min_periods=14).mean().iloc[-1])
 
-    # 3. RSI (14-period, Wilder's smoothing)
+    # 3. Fast DI (period 7, EMA smoothed) — directional confirmation
+    #    Uses EMA (span=7) instead of Wilder's smoothing for faster response
+    fast_plus_dm = df["up_move"].where((df["up_move"] > df["down_move"]) & (df["up_move"] > 0), 0.0)
+    fast_minus_dm = df["down_move"].where((df["down_move"] > df["up_move"]) & (df["down_move"] > 0), 0.0)
+    fast_atr = df["tr"].ewm(span=7, adjust=False).mean()
+    fast_atr_safe = fast_atr.replace(0, float('nan'))
+    fast_plus_di = (fast_plus_dm.ewm(span=7, adjust=False).mean() / fast_atr_safe) * 100
+    fast_minus_di = (fast_minus_dm.ewm(span=7, adjust=False).mean() / fast_atr_safe) * 100
+    fast_plus_di_val = float(fast_plus_di.iloc[-1]) if not pd.isna(fast_plus_di.iloc[-1]) else 0.0
+    fast_minus_di_val = float(fast_minus_di.iloc[-1]) if not pd.isna(fast_minus_di.iloc[-1]) else 0.0
+
+    # 4. RSI (14-period, Wilder's smoothing)
     delta = df["close"].diff()
     gain = delta.where(delta > 0, 0.0)
     loss = (-delta.where(delta < 0, 0.0))
@@ -451,6 +465,12 @@ def _compute_indicators_sync(symbol: str, interval: str = "30", limit: int = 50)
     rsi_series = 100 - (100 / (1 + rs))
     rsi = float(rsi_series.iloc[-1]) if not pd.isna(rsi_series.iloc[-1]) else 50.0
 
+    # 5. Volume filter: current candle volume vs 20-period average
+    avg_volume_20 = df["volume"].rolling(window=20).mean()
+    current_volume = float(df["volume"].iloc[-1]) if not pd.isna(df["volume"].iloc[-1]) else 0.0
+    avg_vol_val = float(avg_volume_20.iloc[-1]) if not pd.isna(avg_volume_20.iloc[-1]) else 1.0
+    volume_ratio = current_volume / avg_vol_val if avg_vol_val > 0 else 0.0
+
     # Last closed candle price (used for all trading decisions)
     last_close = float(df["close"].iloc[-2])
 
@@ -458,6 +478,9 @@ def _compute_indicators_sync(symbol: str, interval: str = "30", limit: int = 50)
         "atr": atr,
         "adx": adx,
         "rsi": rsi,
+        "fast_plus_di": fast_plus_di_val,
+        "fast_minus_di": fast_minus_di_val,
+        "volume_ratio": volume_ratio,
         "last_close": last_close,
     }
 
@@ -550,6 +573,53 @@ async def get_1h_ema_macd(symbol: str) -> Optional[dict]:
         return None
 
 
+
+
+def _compute_4h_ema_sync(symbol: str) -> dict:
+    """
+    Synchronous helper: fetches 4-hour klines AND computes EMA 50 in ONE thread call.
+    Used for higher-timeframe trend confirmation — only enter trades aligned with 4h trend.
+    """
+    resp = bybit_session.get_kline(
+        category="linear",
+        symbol=symbol,
+        interval="240",  # 240 minutes = 4 hours
+        limit=200,  # 200 4-hour candles (~33 days, plenty for EMA 50)
+    )
+    klines = resp["result"]["list"]
+    if not klines:
+        raise ValueError("No 4-hour klines returned")
+
+    df = pd.DataFrame(
+        klines,
+        columns=["timestamp", "open", "high", "low", "close", "volume", "turnover"],
+    ).iloc[::-1].reset_index(drop=True).copy()
+    df["close"] = pd.to_numeric(df["close"], errors="coerce")
+
+    if df["close"].isna().any():
+        raise ValueError("Invalid 4-hour prices")
+
+    # 50 EMA (4-hour chart) for trend confirmation
+    df["ema_50"] = df["close"].ewm(span=50, adjust=False).mean()
+    ema_50_4h = float(df["ema_50"].iloc[-1])
+    last_close_4h = float(df["close"].iloc[-1])
+
+    return {
+        "ema_50_4h": ema_50_4h,
+        "last_close_4h": last_close_4h,
+    }
+
+
+async def get_4h_ema(symbol: str) -> Optional[dict]:
+    """
+    Fetch 4-hour klines and compute 50 EMA for higher-timeframe trend confirmation.
+    API call + pandas computation run entirely in a background thread.
+    """
+    try:
+        return await _api_call(_compute_4h_ema_sync, symbol)
+    except Exception as exc:
+        print(f"Error in get_4h_ema for {symbol}: {exc}")
+        return None
 
 
 async def get_open_position_side(symbol: str) -> Optional[str]:
@@ -1259,10 +1329,11 @@ async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str)
 
     # Fetch all market data in PARALLEL to minimize cycle time and free the
     # event loop / API semaphore for Telegram command handlers.
-    current_open_trade_side, indicators, ema_macd_1h = await asyncio.gather(
+    current_open_trade_side, indicators, ema_macd_1h, ema_4h = await asyncio.gather(
         get_open_position_side(symbol),
         get_all_indicators(symbol),
         get_1h_ema_macd(symbol),
+        get_4h_ema(symbol),
     )
     symbol_open_trade_side[symbol] = current_open_trade_side
 
@@ -1275,6 +1346,9 @@ async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str)
     atr = indicators["atr"]
     adx = indicators["adx"]
     rsi = indicators["rsi"]
+    fast_plus_di = indicators["fast_plus_di"]
+    fast_minus_di = indicators["fast_minus_di"]
+    volume_ratio = indicators["volume_ratio"]
 
     if ema_macd_1h is None:
         print(f"Skipping monitoring for {symbol}: Could not fetch 1h EMA/MACD")
@@ -1284,6 +1358,13 @@ async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str)
     signal_line_1h = ema_macd_1h["signal_line_1h"]
     macd_line_1h_prev = ema_macd_1h["macd_line_1h_prev"]
     signal_line_1h_prev = ema_macd_1h["signal_line_1h_prev"]
+
+    # 4h EMA 50 for higher-timeframe trend confirmation
+    ema_50_4h = None
+    if ema_4h is not None:
+        ema_50_4h = ema_4h["ema_50_4h"]
+    else:
+        print(f"[WARN] {symbol}: Could not fetch 4h EMA — will skip 4h trend filter this cycle")
 
     chat_id = context.job.chat_id if context.job else CHAT_ID
 
@@ -2269,48 +2350,82 @@ async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str)
     # ──────────────────────────────────────────────
     # 3. TRADE ENTRY (no open position, with 5-minute MACD confirmation)
     #    ALL filters must pass:
-    #      1. ADX > 20
+    #      1. ADX > 25 (strong trend)
     #      2. Long: Price > 50 EMA (1h) | Short: Price < 50 EMA (1h)
     #      3. RSI NOT extreme (not > 70 for longs, not < 30 for shorts)
     #      4. MACD crossover + 5-min confirmation on correct side
+    #      5. Fast DI (7, EMA): +DI > -DI for Long, -DI > +DI for Short
+    #      6. 4h EMA 50 trend confirmation: Price > 4h EMA for Long, < for Short
+    #      7. Volume filter: volume >= 1.5x 20-period average
     #    A perfect entry is more important than rush!
     # ──────────────────────────────────────────────
     if current_open_trade_side is None:
 
+        # ── Helper: check if all new entry filters pass for a direction ──
+        def _check_new_filters(direction: str) -> Tuple[bool, str]:
+            """Check Fast DI, 4h EMA, and volume filters. Returns (passed, reason_if_blocked)."""
+            if direction == "long":
+                if fast_plus_di <= fast_minus_di:
+                    return False, f"Fast DI: +DI ({fast_plus_di:.2f}) <= -DI ({fast_minus_di:.2f}) — no bullish momentum"
+                if ema_50_4h is not None and last_close <= ema_50_4h:
+                    return False, f"4h trend: Price ({last_close}) <= 4h EMA 50 ({ema_50_4h:.6g}) — bearish HTF"
+                if volume_ratio < VOLUME_RATIO_THRESHOLD:
+                    return False, f"Volume: {volume_ratio:.2f}x avg < {VOLUME_RATIO_THRESHOLD}x — low conviction"
+            elif direction == "short":
+                if fast_minus_di <= fast_plus_di:
+                    return False, f"Fast DI: -DI ({fast_minus_di:.2f}) <= +DI ({fast_plus_di:.2f}) — no bearish momentum"
+                if ema_50_4h is not None and last_close >= ema_50_4h:
+                    return False, f"4h trend: Price ({last_close}) >= 4h EMA 50 ({ema_50_4h:.6g}) — bullish HTF"
+                if volume_ratio < VOLUME_RATIO_THRESHOLD:
+                    return False, f"Volume: {volume_ratio:.2f}x avg < {VOLUME_RATIO_THRESHOLD}x — low conviction"
+            return True, ""
+
         # ── Detect fresh crossover → start 5-min confirmation timer ──
         if macd_bullish_cross and last_close > ema_50 and adx >= ADX_THRESHOLD:
             if rsi <= RSI_OVERBOUGHT:
-                symbol_entry_cross_time[symbol] = time.time()
-                symbol_entry_cross_dir[symbol] = "bullish"
-                print(f"[5m-CONFIRM] {symbol}: Bullish MACD cross detected (Long entry), starting 5-min confirmation")
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        f"\u23f3 {symbol}: MACD crossed ABOVE Signal (1h)\n"
-                        f"MACD: {macd_line_1h:.6g} > Signal: {signal_line_1h:.6g}\n"
-                        f"ADX: {adx:.2f} | RSI: {rsi:.2f} | Price > 50 EMA\n"
-                        f"Waiting 5-min confirmation before entering Long..."
+                new_filters_ok, new_filter_reason = _check_new_filters("long")
+                if new_filters_ok:
+                    symbol_entry_cross_time[symbol] = time.time()
+                    symbol_entry_cross_dir[symbol] = "bullish"
+                    print(f"[5m-CONFIRM] {symbol}: Bullish MACD cross detected (Long entry), starting 5-min confirmation")
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"\u23f3 {symbol}: MACD crossed ABOVE Signal (1h)\n"
+                            f"MACD: {macd_line_1h:.6g} > Signal: {signal_line_1h:.6g}\n"
+                            f"ADX: {adx:.2f} | RSI: {rsi:.2f} | Price > 50 EMA\n"
+                            f"Fast DI: +DI={fast_plus_di:.2f} > -DI={fast_minus_di:.2f}\n"
+                            f"4h EMA 50: {ema_50_4h:.6g if ema_50_4h else 'N/A'} | Vol: {volume_ratio:.2f}x avg\n"
+                            f"Waiting 5-min confirmation before entering Long..."
+                        )
                     )
-                )
-                save_state()
+                    save_state()
+                else:
+                    print(f"[FILTER] {symbol}: Long entry blocked -- {new_filter_reason}")
             else:
                 print(f"[FILTER] {symbol}: Long entry blocked -- RSI overbought ({rsi:.2f} > {RSI_OVERBOUGHT})")
 
         elif macd_bearish_cross and last_close < ema_50 and adx >= ADX_THRESHOLD:
             if rsi >= RSI_OVERSOLD:
-                symbol_entry_cross_time[symbol] = time.time()
-                symbol_entry_cross_dir[symbol] = "bearish"
-                print(f"[5m-CONFIRM] {symbol}: Bearish MACD cross detected (Short entry), starting 5-min confirmation")
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        f"\u23f3 {symbol}: MACD crossed BELOW Signal (1h)\n"
-                        f"MACD: {macd_line_1h:.6g} < Signal: {signal_line_1h:.6g}\n"
-                        f"ADX: {adx:.2f} | RSI: {rsi:.2f} | Price < 50 EMA\n"
-                        f"Waiting 5-min confirmation before entering Short..."
+                new_filters_ok, new_filter_reason = _check_new_filters("short")
+                if new_filters_ok:
+                    symbol_entry_cross_time[symbol] = time.time()
+                    symbol_entry_cross_dir[symbol] = "bearish"
+                    print(f"[5m-CONFIRM] {symbol}: Bearish MACD cross detected (Short entry), starting 5-min confirmation")
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"\u23f3 {symbol}: MACD crossed BELOW Signal (1h)\n"
+                            f"MACD: {macd_line_1h:.6g} < Signal: {signal_line_1h:.6g}\n"
+                            f"ADX: {adx:.2f} | RSI: {rsi:.2f} | Price < 50 EMA\n"
+                            f"Fast DI: -DI={fast_minus_di:.2f} > +DI={fast_plus_di:.2f}\n"
+                            f"4h EMA 50: {ema_50_4h:.6g if ema_50_4h else 'N/A'} | Vol: {volume_ratio:.2f}x avg\n"
+                            f"Waiting 5-min confirmation before entering Short..."
+                        )
                     )
-                )
-                save_state()
+                    save_state()
+                else:
+                    print(f"[FILTER] {symbol}: Short entry blocked -- {new_filter_reason}")
             else:
                 print(f"[FILTER] {symbol}: Short entry blocked -- RSI oversold ({rsi:.2f} < {RSI_OVERSOLD})")
 
@@ -2346,43 +2461,64 @@ async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str)
                     symbol_entry_cross_dir[symbol] = None
                     print(f"[5m-CONFIRM] {symbol}: Long entry cancelled — RSI overbought ({rsi:.2f})")
                     save_state()
-                elif elapsed >= MACD_CONFIRM_SECONDS:
-                    # CONFIRMED! Execute Long entry
+                elif fast_plus_di <= fast_minus_di:
                     symbol_entry_cross_time[symbol] = None
                     symbol_entry_cross_dir[symbol] = None
-                    new_trend = "upward"
-                    side = "Buy"
-                    side_text = "Long (Buy)"
-                    is_post_exit = symbol_post_exit_flat.get(symbol, False)
-                    entry_type = "REVERSAL" if is_post_exit else "ENTRY"
-                    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    msg = (
-                        f"{ts} \u2014 {symbol} {entry_type} SIGNAL: <b>UPWARD</b>\n"
-                        f"Last Close: {last_close} | 50 EMA 1h: {ema_50:.6g}\n"
-                        f"ADX: {adx:.2f} | RSI: {rsi:.2f}\n"
-                        f"MACD 1h: {macd_line_1h:.6g} / Signal 1h: {signal_line_1h:.6g}\n"
-                        f"MACD confirmed ABOVE Signal for 5 minutes (perfect entry)\n"
-                        f"Direction: {side_text}"
-                    )
-                    await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
-
-                    result = await place_trade(symbol, side=side)
-                    if result and "error" not in result:
-                        order_id = result.get("orderId", "\u2014")
-                        await asyncio.sleep(1)
-                        real_entry = await get_position_entry_price(symbol)
-                        fill_price = real_entry if real_entry else last_close
-                        _set_entry_risk_state(symbol, fill_price, atr)
-                        sl_price = fill_price - (STOP_LOSS_ATR_MULT * atr)
-                        await set_server_stop_loss(symbol, side, sl_price)
-                        await context.bot.send_message(chat_id=chat_id, text=f"\u2705 {side_text} order(s) placed for {symbol}\nLast Order ID: <code>{order_id}</code>\nFill Price: {fill_price:.6g}\nServer-side SL: {sl_price:.6g}", parse_mode="HTML")
-                    elif result and "error" in result:
-                        await context.bot.send_message(chat_id=chat_id, text=f"\u274c Failed to place {side_text} for {symbol}: {result['error']}")
-
-                    symbol_trends[symbol] = new_trend
-                    symbol_open_trade_side[symbol] = await get_open_position_side(symbol)
-                    symbol_post_exit_flat[symbol] = False
+                    print(f"[5m-CONFIRM] {symbol}: Long entry cancelled — Fast DI flipped bearish (+DI={fast_plus_di:.2f} <= -DI={fast_minus_di:.2f})")
                     save_state()
+                elif elapsed >= MACD_CONFIRM_SECONDS:
+                    # Re-check volume filter at execution time (must still be high conviction)
+                    vol_ok = volume_ratio >= VOLUME_RATIO_THRESHOLD
+                    ema4h_ok = ema_50_4h is None or last_close > ema_50_4h
+                    if not vol_ok:
+                        symbol_entry_cross_time[symbol] = None
+                        symbol_entry_cross_dir[symbol] = None
+                        print(f"[5m-CONFIRM] {symbol}: Long entry cancelled at exec — volume too low ({volume_ratio:.2f}x < {VOLUME_RATIO_THRESHOLD}x)")
+                        save_state()
+                    elif not ema4h_ok:
+                        symbol_entry_cross_time[symbol] = None
+                        symbol_entry_cross_dir[symbol] = None
+                        print(f"[5m-CONFIRM] {symbol}: Long entry cancelled at exec — price below 4h EMA 50")
+                        save_state()
+                    else:
+                        # CONFIRMED! Execute Long entry
+                        symbol_entry_cross_time[symbol] = None
+                        symbol_entry_cross_dir[symbol] = None
+                        new_trend = "upward"
+                        side = "Buy"
+                        side_text = "Long (Buy)"
+                        is_post_exit = symbol_post_exit_flat.get(symbol, False)
+                        entry_type = "REVERSAL" if is_post_exit else "ENTRY"
+                        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        msg = (
+                            f"{ts} \u2014 {symbol} {entry_type} SIGNAL: <b>UPWARD</b>\n"
+                            f"Last Close: {last_close} | 50 EMA 1h: {ema_50:.6g}\n"
+                            f"ADX: {adx:.2f} | RSI: {rsi:.2f}\n"
+                            f"Fast DI: +DI={fast_plus_di:.2f} > -DI={fast_minus_di:.2f}\n"
+                            f"4h EMA 50: {ema_50_4h:.6g if ema_50_4h else 'N/A'} | Vol: {volume_ratio:.2f}x avg\n"
+                            f"MACD 1h: {macd_line_1h:.6g} / Signal 1h: {signal_line_1h:.6g}\n"
+                            f"MACD confirmed ABOVE Signal for 5 minutes (perfect entry)\n"
+                            f"Direction: {side_text}"
+                        )
+                        await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
+
+                        result = await place_trade(symbol, side=side)
+                        if result and "error" not in result:
+                            order_id = result.get("orderId", "\u2014")
+                            await asyncio.sleep(1)
+                            real_entry = await get_position_entry_price(symbol)
+                            fill_price = real_entry if real_entry else last_close
+                            _set_entry_risk_state(symbol, fill_price, atr)
+                            sl_price = fill_price - (STOP_LOSS_ATR_MULT * atr)
+                            await set_server_stop_loss(symbol, side, sl_price)
+                            await context.bot.send_message(chat_id=chat_id, text=f"\u2705 {side_text} order(s) placed for {symbol}\nLast Order ID: <code>{order_id}</code>\nFill Price: {fill_price:.6g}\nServer-side SL: {sl_price:.6g}", parse_mode="HTML")
+                        elif result and "error" in result:
+                            await context.bot.send_message(chat_id=chat_id, text=f"\u274c Failed to place {side_text} for {symbol}: {result['error']}")
+
+                        symbol_trends[symbol] = new_trend
+                        symbol_open_trade_side[symbol] = await get_open_position_side(symbol)
+                        symbol_post_exit_flat[symbol] = False
+                        save_state()
 
             # ── Bearish entry confirmation ──
             elif entry_cross_dir == "bearish":
@@ -2402,43 +2538,64 @@ async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str)
                     symbol_entry_cross_dir[symbol] = None
                     print(f"[5m-CONFIRM] {symbol}: Short entry cancelled — RSI oversold ({rsi:.2f})")
                     save_state()
-                elif elapsed >= MACD_CONFIRM_SECONDS:
-                    # CONFIRMED! Execute Short entry
+                elif fast_minus_di <= fast_plus_di:
                     symbol_entry_cross_time[symbol] = None
                     symbol_entry_cross_dir[symbol] = None
-                    new_trend = "downward"
-                    side = "Sell"
-                    side_text = "Short (Sell)"
-                    is_post_exit = symbol_post_exit_flat.get(symbol, False)
-                    entry_type = "REVERSAL" if is_post_exit else "ENTRY"
-                    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    msg = (
-                        f"{ts} \u2014 {symbol} {entry_type} SIGNAL: <b>DOWNWARD</b>\n"
-                        f"Last Close: {last_close} | 50 EMA 1h: {ema_50:.6g}\n"
-                        f"ADX: {adx:.2f} | RSI: {rsi:.2f}\n"
-                        f"MACD 1h: {macd_line_1h:.6g} / Signal 1h: {signal_line_1h:.6g}\n"
-                        f"MACD confirmed BELOW Signal for 5 minutes (perfect entry)\n"
-                        f"Direction: {side_text}"
-                    )
-                    await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
-
-                    result = await place_trade(symbol, side=side)
-                    if result and "error" not in result:
-                        order_id = result.get("orderId", "\u2014")
-                        await asyncio.sleep(1)
-                        real_entry = await get_position_entry_price(symbol)
-                        fill_price = real_entry if real_entry else last_close
-                        _set_entry_risk_state(symbol, fill_price, atr)
-                        sl_price = fill_price + (STOP_LOSS_ATR_MULT * atr)
-                        await set_server_stop_loss(symbol, side, sl_price)
-                        await context.bot.send_message(chat_id=chat_id, text=f"\u2705 {side_text} order(s) placed for {symbol}\nLast Order ID: <code>{order_id}</code>\nFill Price: {fill_price:.6g}\nServer-side SL: {sl_price:.6g}", parse_mode="HTML")
-                    elif result and "error" in result:
-                        await context.bot.send_message(chat_id=chat_id, text=f"\u274c Failed to place {side_text} for {symbol}: {result['error']}")
-
-                    symbol_trends[symbol] = new_trend
-                    symbol_open_trade_side[symbol] = await get_open_position_side(symbol)
-                    symbol_post_exit_flat[symbol] = False
+                    print(f"[5m-CONFIRM] {symbol}: Short entry cancelled — Fast DI flipped bullish (-DI={fast_minus_di:.2f} <= +DI={fast_plus_di:.2f})")
                     save_state()
+                elif elapsed >= MACD_CONFIRM_SECONDS:
+                    # Re-check volume filter at execution time (must still be high conviction)
+                    vol_ok = volume_ratio >= VOLUME_RATIO_THRESHOLD
+                    ema4h_ok = ema_50_4h is None or last_close < ema_50_4h
+                    if not vol_ok:
+                        symbol_entry_cross_time[symbol] = None
+                        symbol_entry_cross_dir[symbol] = None
+                        print(f"[5m-CONFIRM] {symbol}: Short entry cancelled at exec — volume too low ({volume_ratio:.2f}x < {VOLUME_RATIO_THRESHOLD}x)")
+                        save_state()
+                    elif not ema4h_ok:
+                        symbol_entry_cross_time[symbol] = None
+                        symbol_entry_cross_dir[symbol] = None
+                        print(f"[5m-CONFIRM] {symbol}: Short entry cancelled at exec — price above 4h EMA 50")
+                        save_state()
+                    else:
+                        # CONFIRMED! Execute Short entry
+                        symbol_entry_cross_time[symbol] = None
+                        symbol_entry_cross_dir[symbol] = None
+                        new_trend = "downward"
+                        side = "Sell"
+                        side_text = "Short (Sell)"
+                        is_post_exit = symbol_post_exit_flat.get(symbol, False)
+                        entry_type = "REVERSAL" if is_post_exit else "ENTRY"
+                        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        msg = (
+                            f"{ts} \u2014 {symbol} {entry_type} SIGNAL: <b>DOWNWARD</b>\n"
+                            f"Last Close: {last_close} | 50 EMA 1h: {ema_50:.6g}\n"
+                            f"ADX: {adx:.2f} | RSI: {rsi:.2f}\n"
+                            f"Fast DI: -DI={fast_minus_di:.2f} > +DI={fast_plus_di:.2f}\n"
+                            f"4h EMA 50: {ema_50_4h:.6g if ema_50_4h else 'N/A'} | Vol: {volume_ratio:.2f}x avg\n"
+                            f"MACD 1h: {macd_line_1h:.6g} / Signal 1h: {signal_line_1h:.6g}\n"
+                            f"MACD confirmed BELOW Signal for 5 minutes (perfect entry)\n"
+                            f"Direction: {side_text}"
+                        )
+                        await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML")
+
+                        result = await place_trade(symbol, side=side)
+                        if result and "error" not in result:
+                            order_id = result.get("orderId", "\u2014")
+                            await asyncio.sleep(1)
+                            real_entry = await get_position_entry_price(symbol)
+                            fill_price = real_entry if real_entry else last_close
+                            _set_entry_risk_state(symbol, fill_price, atr)
+                            sl_price = fill_price + (STOP_LOSS_ATR_MULT * atr)
+                            await set_server_stop_loss(symbol, side, sl_price)
+                            await context.bot.send_message(chat_id=chat_id, text=f"\u2705 {side_text} order(s) placed for {symbol}\nLast Order ID: <code>{order_id}</code>\nFill Price: {fill_price:.6g}\nServer-side SL: {sl_price:.6g}", parse_mode="HTML")
+                        elif result and "error" in result:
+                            await context.bot.send_message(chat_id=chat_id, text=f"\u274c Failed to place {side_text} for {symbol}: {result['error']}")
+
+                        symbol_trends[symbol] = new_trend
+                        symbol_open_trade_side[symbol] = await get_open_position_side(symbol)
+                        symbol_post_exit_flat[symbol] = False
+                        save_state()
 
     # ──────────────────────────────────────────────
     # 4. 30-Minute Status Report
@@ -2537,14 +2694,16 @@ async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str)
 
         report_msg = (
             f"Still monitoring {symbol}\n"
-            f"\u2022 Entry: ADX>{ADX_THRESHOLD} + 50 EMA 1h + RSI + MACD crossover + 5-min confirm (1h)\n"
+            f"\u2022 Entry: ADX>{ADX_THRESHOLD} + 50 EMA 1h + Fast DI(7) + 4h EMA 50 + Vol>{VOLUME_RATIO_THRESHOLD}x + RSI + MACD cross + 5-min confirm\n"
             f"\u2022 Exit: MACD crosses opposite (1h) + 5-min confirm -> close\n"
-            f"\u2022 Reverse: ADX > {ADX_THRESHOLD} + EMA/MACD crossover + 5-min confirm/RSI, else FLAT\n"
+            f"\u2022 Reverse: ADX > {ADX_THRESHOLD} + all filters + MACD crossover + 5-min confirm, else FLAT\n"
             f"\u2022 SL: 50% at {SL_STAGE1_ATR_MULT}x ATR + 50% at {STOP_LOSS_ATR_MULT}x ATR\n"
             f"\u2022 TP: 20% at {TP1_ATR_MULT}x ATR, 25% at {TP2_ATR_MULT}x ATR (SL closes 95%, 5% rides)\n"
             f"\u2022 Trail: 30% at {TRAILING_ACTIVATE_ATR}x ATR, then 20% at 1x ATR, 5% rides\n"
             f"\u2022 WebSocket prices + polling every {POLL_INTERVAL_SECONDS}s\n"
             f"\u2022 50 EMA (1h): {ema_50:.6g} | ADX: {adx:.2f}\n"
+            f"\u2022 Fast DI(7): +DI={fast_plus_di:.2f} | -DI={fast_minus_di:.2f}\n"
+            f"\u2022 4h EMA 50: {ema_50_4h:.6g if ema_50_4h else 'N/A'} | Vol: {volume_ratio:.2f}x avg\n"
             f"\u2022 RSI: {rsi:.2f} | MACD 1h: {macd_line_1h:.6g} / Signal 1h: {signal_line_1h:.6g} ({macd_state})\n"
             f"\u2022 Last Close: {last_close} | Current Price: {current_price}\n"
             f"\u2022 {symbol} state: {current_market_state}\n"
@@ -2601,26 +2760,36 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     chat_id = update.effective_chat.id
 
     # Handle instant trade for manual quantity
-    # NOTE: Instant trade still requires current alignment (ADX + EMA + MACD position + RSI)
+    # NOTE: Instant trade still requires current alignment (ADX + EMA + MACD position + RSI
+    #       + Fast DI + 4h EMA 50 + Volume filter)
     # but does NOT wait 5 minutes — the 5-min confirmation applies to monitoring entries only.
     # If MACD is already on the correct side, the trade is placed immediately.
     if manual_qty:
         await update.message.reply_text(f"\U0001f680 INSTANT TRADE for {symbol} with quantity {manual_qty}...")
 
-        indicators = await get_all_indicators(symbol)
-        ema_macd_1h = await get_1h_ema_macd(symbol)
+        indicators, ema_macd_1h, ema_4h = await asyncio.gather(
+            get_all_indicators(symbol),
+            get_1h_ema_macd(symbol),
+            get_4h_ema(symbol),
+        )
         if indicators and indicators["current_price"] and ema_macd_1h:
             last_close = indicators["last_close"]
             adx = indicators["adx"]
             atr = indicators["atr"]
             rsi = indicators["rsi"]
+            fast_plus_di = indicators["fast_plus_di"]
+            fast_minus_di = indicators["fast_minus_di"]
+            volume_ratio = indicators["volume_ratio"]
 
             # 1-hour EMA 50 and MACD for entry filter
             ema_50 = ema_macd_1h["ema_50_1h"]
             macd_line_1h = ema_macd_1h["macd_line_1h"]
             signal_line_1h = ema_macd_1h["signal_line_1h"]
 
-            # 4-layer entry filter for instant trade
+            # 4h EMA 50 for higher-timeframe trend confirmation
+            ema_50_4h = ema_4h["ema_50_4h"] if ema_4h else None
+
+            # 7-layer entry filter for instant trade
             entry_blocked = False
             block_reason = ""
 
@@ -2629,13 +2798,18 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 entry_blocked = True
                 block_reason = f"ADX ({adx:.2f}) < {ADX_THRESHOLD} — market is sideways"
 
+            # Filter 2: Volume filter
+            if not entry_blocked and volume_ratio < VOLUME_RATIO_THRESHOLD:
+                entry_blocked = True
+                block_reason = f"Volume ({volume_ratio:.2f}x avg) < {VOLUME_RATIO_THRESHOLD}x — low conviction"
+
             if entry_blocked:
                 await update.message.reply_text(
                     f"\u26a0\ufe0f Instant trade blocked for {symbol}: {block_reason}\n"
                     f"Monitoring will wait for MACD crossover + 5-min confirmation."
                 )
             else:
-                # Require EMA 50 (1h) + RSI + MACD position (1h) filters
+                # Require EMA 50 (1h) + RSI + MACD position (1h) + Fast DI + 4h EMA filters
                 side = None
                 if last_close > ema_50:
                     if rsi > RSI_OVERBOUGHT:
@@ -2644,6 +2818,12 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                     elif macd_line_1h <= signal_line_1h:
                         entry_blocked = True
                         block_reason = f"MACD Line 1h ({macd_line_1h:.6g}) <= Signal Line 1h ({signal_line_1h:.6g})"
+                    elif fast_plus_di <= fast_minus_di:
+                        entry_blocked = True
+                        block_reason = f"Fast DI: +DI ({fast_plus_di:.2f}) <= -DI ({fast_minus_di:.2f}) — no bullish momentum"
+                    elif ema_50_4h is not None and last_close <= ema_50_4h:
+                        entry_blocked = True
+                        block_reason = f"4h trend: Price ({last_close}) <= 4h EMA 50 ({ema_50_4h:.6g}) — bearish HTF"
                     else:
                         side = "Buy"
                 elif last_close < ema_50:
@@ -2653,6 +2833,12 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                     elif macd_line_1h >= signal_line_1h:
                         entry_blocked = True
                         block_reason = f"MACD Line 1h ({macd_line_1h:.6g}) >= Signal Line 1h ({signal_line_1h:.6g})"
+                    elif fast_minus_di <= fast_plus_di:
+                        entry_blocked = True
+                        block_reason = f"Fast DI: -DI ({fast_minus_di:.2f}) <= +DI ({fast_plus_di:.2f}) — no bearish momentum"
+                    elif ema_50_4h is not None and last_close >= ema_50_4h:
+                        entry_blocked = True
+                        block_reason = f"4h trend: Price ({last_close}) >= 4h EMA 50 ({ema_50_4h:.6g}) — bullish HTF"
                     else:
                         side = "Sell"
 
@@ -2666,7 +2852,9 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                         f"\u26a0\ufe0f No aligned signal for {symbol}.\n"
                         f"Last Close: {last_close} | 50 EMA 1h: {ema_50:.6g}\n"
                         f"MACD 1h: {macd_line_1h:.6g} / Signal 1h: {signal_line_1h:.6g} | ADX: {adx:.2f}\n"
-                        f"Need: Price > 50 EMA + MACD > Signal (1h) for Long, or Price < 50 EMA + MACD < Signal (1h) for Short.\n"
+                        f"Fast DI: +DI={fast_plus_di:.2f} | -DI={fast_minus_di:.2f} | Vol: {volume_ratio:.2f}x\n"
+                        f"4h EMA 50: {ema_50_4h:.6g if ema_50_4h else 'N/A'}\n"
+                        f"Need: All filters aligned for Long or Short.\n"
                         f"Monitoring will wait for MACD crossover + 5-min confirmation."
                     )
                 else:
@@ -2674,8 +2862,9 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
                     await update.message.reply_text(
                         f"\U0001f4ca {symbol}: Last Close={last_close} | 50 EMA 1h={ema_50:.6g}\n"
-                            f"ADX: {adx:.2f}\n"
-                            f"MACD 1h: {macd_line_1h:.6g} / Signal 1h: {signal_line_1h:.6g}\n"
+                        f"ADX: {adx:.2f} | Fast DI: +DI={fast_plus_di:.2f} / -DI={fast_minus_di:.2f}\n"
+                        f"4h EMA 50: {ema_50_4h:.6g if ema_50_4h else 'N/A'} | Vol: {volume_ratio:.2f}x avg\n"
+                        f"MACD 1h: {macd_line_1h:.6g} / Signal 1h: {signal_line_1h:.6g}\n"
                         f"Direction: {side_text}"
                     )
 
@@ -2706,16 +2895,16 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                     elif result and "error" in result:
                         await update.message.reply_text(f"\u274c Failed to place instant {side_text} for {symbol}: {result['error']}")
         else:
-            await update.message.reply_text(f"\u26a0\ufe0f Could not fetch indicators for {symbol}. Monitoring will take over.\n(Requires both 30m indicators and 1h EMA/MACD data)")
+            await update.message.reply_text(f"\u26a0\ufe0f Could not fetch indicators for {symbol}. Monitoring will take over.\n(Requires 30m indicators, 1h EMA/MACD, and 4h EMA data)")
 
     qty_info = f"Manual Quantity: {manual_qty} (Instant Trade Attempted)" if manual_qty else "Auto-sizing: 20% of available USDT balance"
 
     await update.message.reply_text(
         f"Monitoring {symbol}!\n"
         f"\u2022 {qty_info}\n"
-        f"\u2022 Entry: ADX > {ADX_THRESHOLD} + 50 EMA (1h) + RSI + MACD crossover + 5-min confirm (1h)\n"
+        f"\u2022 Entry: ADX>{ADX_THRESHOLD} + 50 EMA(1h) + Fast DI(7) + 4h EMA 50 + Vol>{VOLUME_RATIO_THRESHOLD}x + RSI + MACD cross + 5-min confirm\n"
         f"\u2022 Exit: MACD crosses opposite (1h) + 5-min confirm -> close\n"
-        f"\u2022 Reverse: ADX > {ADX_THRESHOLD} + EMA/MACD crossover + 5-min confirm/RSI, else FLAT\n"
+        f"\u2022 Reverse: ADX>{ADX_THRESHOLD} + all filters + MACD crossover + 5-min confirm, else FLAT\n"
         f"\u2022 SL: 50% at {SL_STAGE1_ATR_MULT}x ATR + 50% at {STOP_LOSS_ATR_MULT}x ATR (server-side)\n"
         f"\u2022 TP: 20% at {TP1_ATR_MULT}x ATR, 25% at {TP2_ATR_MULT}x ATR\n"
         f"\u2022 Trail: 30% at {TRAILING_ACTIVATE_ATR}x ATR ({TRAILING_STOP_ATR}x ATR dist), then 20% ({TRAILING_STOP_ATR_STAGE2}x ATR dist), 5% rides\n"
@@ -2788,17 +2977,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("\u26d4 Unauthorized. This bot is private.")
         return
     await update.message.reply_text(
-        "Bot ready! (v20 - 5-Min MACD Confirmation + Tiered SL + TP + Multi-Stage Trail)\n\n"
+        "Bot ready! (v21 - Enhanced Entry Filters: Fast DI + 4h EMA + Volume)\n\n"
         "Commands:\n"
         "1. /start - Display this message\n"
         "2. /add_symbol <symbol> - Start monitoring with auto-sizing (20% balance)\n"
         "3. /add_symbol <symbol> <quantity> - INSTANT TRADE + Manual quantity monitoring\n"
         "4. /remove_symbol <symbol> - Stop monitoring a symbol\n\n"
         "Entry Filters (ALL must pass):\n"
-        f"\u2022 1. ADX > {ADX_THRESHOLD}\n"
+        f"\u2022 1. ADX > {ADX_THRESHOLD} (strong trend only)\n"
         "\u2022 2. Long: Price > 50 EMA (1h) | Short: Price < 50 EMA (1h)\n"
-        f"\u2022 3. RSI NOT extreme (not > {RSI_OVERBOUGHT} for longs, not < {RSI_OVERSOLD} for shorts)\n"
-        "\u2022 4. Wait for MACD crossover + 5-min confirmation:\n"
+        f"\u2022 3. Fast DI (period {FAST_DI_PERIOD}, EMA smoothed):\n"
+        "\u2022    Long: +DI > -DI | Short: -DI > +DI\n"
+        "\u2022 4. 4h EMA 50 trend confirmation:\n"
+        "\u2022    Long: Price > 4h EMA 50 | Short: Price < 4h EMA 50\n"
+        f"\u2022 5. Volume filter: current volume >= {VOLUME_RATIO_THRESHOLD}x 20-period average\n"
+        f"\u2022 6. RSI NOT extreme (not > {RSI_OVERBOUGHT} for longs, not < {RSI_OVERSOLD} for shorts)\n"
+        "\u2022 7. Wait for MACD crossover + 5-min confirmation:\n"
         "\u2022    Long = MACD crosses ABOVE Signal (1h), then stays above for 5 min\n"
         "\u2022    Short = MACD crosses BELOW Signal (1h), then stays below for 5 min\n"
         "\u2022 A perfect entry is more important than rush!\n\n"
@@ -2819,9 +3013,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "\u2022 Long: MACD crosses BELOW Signal (1h) + stays below for 5 min -> close\n"
         "\u2022 Short: MACD crosses ABOVE Signal (1h) + stays above for 5 min -> close\n\n"
         "Reversal Rules:\n"
-        f"\u2022 ADX > {ADX_THRESHOLD}\n"
-        "\u2022 Long: Price > 50 EMA (1h) + MACD cross ABOVE Signal (1h) + 5-min confirmation\n"
-        "\u2022 Short: Price < 50 EMA (1h) + MACD cross BELOW Signal (1h) + 5-min confirmation\n"
+        f"\u2022 ADX > {ADX_THRESHOLD} + all entry filters must pass\n"
+        "\u2022 Long: Price > 50 EMA(1h) + Fast DI bullish + 4h EMA aligned + Volume OK + MACD cross + 5-min confirm\n"
+        "\u2022 Short: Price < 50 EMA(1h) + Fast DI bearish + 4h EMA aligned + Volume OK + MACD cross + 5-min confirm\n"
         f"\u2022 RSI NOT extreme (not > {RSI_OVERBOUGHT} for longs, not < {RSI_OVERSOLD} for shorts)\n"
         "\u2022 If conditions not met, bot goes FLAT\n\n"
         "Infrastructure:\n"
