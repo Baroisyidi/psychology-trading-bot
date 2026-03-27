@@ -188,6 +188,8 @@ def _save_state_sync():
             "symbol_entry_cross_dir": dict(symbol_entry_cross_dir),
             "symbol_entry_di_cross_time": dict(symbol_entry_di_cross_time),
             "symbol_entry_di_cross_dir": dict(symbol_entry_di_cross_dir),
+            "symbol_exit_cross_time": dict(symbol_exit_cross_time),
+            "symbol_exit_cross_dir": dict(symbol_exit_cross_dir),
         }
         with open(STATE_FILE, "w") as f:
             json.dump(state, f, indent=2, default=str)
@@ -254,6 +256,8 @@ def load_state():
         symbol_entry_cross_dir.update({k: v for k, v in state.get("symbol_entry_cross_dir", {}).items()})
         symbol_entry_di_cross_time.update({k: v for k, v in state.get("symbol_entry_di_cross_time", {}).items()})
         symbol_entry_di_cross_dir.update({k: v for k, v in state.get("symbol_entry_di_cross_dir", {}).items()})
+        symbol_exit_cross_time.update({k: v for k, v in state.get("symbol_exit_cross_time", {}).items()})
+        symbol_exit_cross_dir.update({k: v for k, v in state.get("symbol_exit_cross_dir", {}).items()})
 
         print(f"[STATE] Loaded state from {STATE_FILE} — {len(monitored_symbols)} symbols restored")
         return True
@@ -274,14 +278,14 @@ symbol_entry_price: dict[str, Optional[float]] = {}
 symbol_entry_atr: dict[str, Optional[float]] = {}
 symbol_peak_price: dict[str, Optional[float]] = {}
 symbol_trailing_active: dict[str, bool] = {}
-symbol_partial_taken: dict[str, bool] = {}  # Track if 30% Stage 1 trail has been closed
+symbol_partial_taken: dict[str, bool] = {}  # Track if 45% Stage 1 trail has been closed
 symbol_server_sl_set: dict[str, bool] = {}  # Track if server-side stop-loss is active
 symbol_server_ts_set: dict[str, bool] = {}  # Track if server-side trailing stop is active
-symbol_trail_order_id: dict[str, Optional[str]] = {}  # Conditional order ID for 30% trailing SL
-symbol_trail_qty: dict[str, Optional[float]] = {}     # 30% qty under trailing stop order
+symbol_trail_order_id: dict[str, Optional[str]] = {}  # Conditional order ID for 45% trailing SL
+symbol_trail_qty: dict[str, Optional[float]] = {}     # 45% qty under trailing stop order
 symbol_trail_price: dict[str, Optional[float]] = {}   # Current trailing stop trigger price
 
-# Stage 2 trailing stop (20% of original position, after 30% closed)
+# Stage 2 trailing stop (30% of original position, after 45% closed)
 symbol_stage2_active: dict[str, bool] = {}             # Is stage 2 trailing active?
 symbol_stage2_taken: dict[str, bool] = {}              # Has stage 2 trail been filled?
 symbol_trail2_order_id: dict[str, Optional[str]] = {}  # Conditional order ID for stage 2 trail
@@ -290,14 +294,14 @@ symbol_trail2_price: dict[str, Optional[float]] = {}   # Stage 2 trail trigger p
 symbol_peak_stage2: dict[str, Optional[float]] = {}    # Peak price tracking for stage 2
 
 # Tiered stop-loss tracking
-symbol_sl1_order_id: dict[str, Optional[str]] = {}     # Conditional order for 50% at 0.5x ATR
+symbol_sl1_order_id: dict[str, Optional[str]] = {}     # Conditional order for 50% at 1.0x ATR
 symbol_sl1_qty: dict[str, Optional[float]] = {}        # Qty for the 50% SL order
-symbol_sl1_taken: dict[str, bool] = {}                 # Has 50% SL at 0.5x ATR been taken?
+symbol_sl1_taken: dict[str, bool] = {}                 # Has 50% SL at 1.0x ATR been taken?
 symbol_original_qty: dict[str, Optional[float]] = {}   # Original position qty at entry
 
 # Take-Profit tracking
-symbol_tp1_taken: dict[str, bool] = {}                 # Has TP1 (20% at 2.0x ATR) been taken?
-symbol_tp2_taken: dict[str, bool] = {}                 # Has TP2 (25% at 4.5x ATR) been taken?
+symbol_tp1_taken: dict[str, bool] = {}                 # Has TP1 (10% at 2.0x ATR) been taken?
+symbol_tp2_taken: dict[str, bool] = {}                 # Has TP2 (10% at 3.0x ATR) been taken?
 
 # Post-exit FLAT state (awaiting MACD crossover for reversal)
 symbol_post_exit_flat: dict[str, bool] = {}            # True when FLAT after exit, awaiting reversal conditions
@@ -308,13 +312,17 @@ symbol_prev_macd_above_signal: dict[str, Optional[bool]] = {}  # Was MACD > Sign
 # DI crossover tracking (previous state for detecting fresh DI crosses)
 symbol_prev_plus_di_above_minus_di: dict[str, Optional[bool]] = {}  # Was +DI > -DI on previous check?
 
-# 3-minute MACD cross confirmation tracking (Path B: DI already aligned, wait for MACD cross)
+# 5-minute MACD cross confirmation tracking (Path B: DI already aligned, wait for MACD cross)
 symbol_entry_cross_time: dict[str, Optional[float]] = {}   # Timestamp when MACD crossover was first detected
 symbol_entry_cross_dir: dict[str, Optional[str]] = {}      # Direction: "bullish" or "bearish"
 
-# 3-minute DI cross confirmation tracking (Path A: MACD already aligned, wait for DI cross)
+# 5-minute DI cross confirmation tracking (Path A: MACD already aligned, wait for DI cross)
 symbol_entry_di_cross_time: dict[str, Optional[float]] = {}   # Timestamp when DI crossover was first detected
 symbol_entry_di_cross_dir: dict[str, Optional[str]] = {}      # Direction: "bullish" or "bearish"
+
+# 3-minute exit DI cross confirmation tracking (Exit Path 2: MACD already aligned, DI crosses)
+symbol_exit_cross_time: dict[str, Optional[float]] = {}   # Timestamp when exit DI crossover was first detected
+symbol_exit_cross_dir: dict[str, Optional[str]] = {}      # Direction: "long_exit" or "short_exit"
 
 # Per-symbol monitor execution guard (prevents overlapping monitor runs)
 symbol_monitor_running: dict[str, bool] = {}
@@ -324,25 +332,26 @@ symbol_monitor_running: dict[str, bool] = {}
 #  Constants
 # ────────────────────────────────────────────────
 ADX_THRESHOLD = 20           # Only trade when ADX > 20 (trending)
-STOP_LOSS_ATR_MULT = 1.0     # Tier 2: remaining 50% closed at 1.0x ATR loss (server-side)
-SL_STAGE1_ATR_MULT = 0.5    # Tier 1: 50% closed INSTANTLY at 0.5x ATR loss
+STOP_LOSS_ATR_MULT = 1.5     # Tier 2: remaining 50% closed at 1.5x ATR loss (server-side)
+SL_STAGE1_ATR_MULT = 1.0    # Tier 1: 50% closed INSTANTLY at 1.0x ATR loss
 SL_STAGE1_CLOSE_PCT = 0.50  # Close 50% of position at first SL level
-TP1_ATR_MULT = 2.0           # TP1: close 20% at 2.0x ATR profit
-TP1_CLOSE_PCT = 0.20         # Close 20% of original position at TP1
+TP1_ATR_MULT = 2.0           # TP1: close 10% at 2.0x ATR profit
+TP1_CLOSE_PCT = 0.10         # Close 10% of original position at TP1
 TP1_SL_MOVE_ATR = 0.5        # After TP1: move SL to lock in 0.5x ATR profit
 TP1_SL_CLOSE_PCT = 0.95      # TP1 SL closes 95% of remaining, leaves 5% for Exit Rules
-TP2_ATR_MULT = 4.5           # TP2: close 25% at 4.5x ATR profit
-TP2_CLOSE_PCT = 0.25         # Close 25% of original position at TP2
+TP2_ATR_MULT = 3.0           # TP2: close 10% at 3.0x ATR profit
+TP2_CLOSE_PCT = 0.10         # Close 10% of original position at TP2
 TP2_SL_MOVE_ATR = 1.0        # After TP2: move SL to lock in 1.0x ATR profit
 TP2_SL_CLOSE_PCT = 0.95      # TP2 SL closes 95% of remaining, leaves 5% for Exit Rules
 TRAILING_ACTIVATE_ATR = 1.5  # Activate Stage 1 trailing stop after 1.5x ATR profit
 TRAILING_STOP_ATR = 1.0      # Stage 1 trailing stop distance: 1x ATR from peak
 TRAILING_STOP_ATR_STAGE2 = 1.0  # Stage 2 trailing stop distance: 1x ATR from peak
-TRAILING_CLOSE_PCT = 0.30    # Close 30% of original position on Stage 1 trail
-TRAILING_STAGE2_QTY_PCT = 0.20  # Close 20% of original position on Stage 2 trail
+TRAILING_CLOSE_PCT = 0.45    # Close 45% of original position on Stage 1 trail
+TRAILING_STAGE2_QTY_PCT = 0.30  # Close 30% of original position on Stage 2 trail
 # Remaining 5% protected by Exit Rules ONLY (no server-side SL on final 5%)
 POLL_INTERVAL_SECONDS = 10   # Poll every 10 seconds (faster for risk management)
-MACD_CONFIRM_SECONDS = 180   # Wait 3 minutes (180s) after crossover before acting
+MACD_CONFIRM_SECONDS = 300   # Wait 5 minutes (300s) after crossover before acting
+EXIT_CONFIRM_SECONDS = 180   # Wait 3 minutes (180s) for exit path 2 (DI cross) confirmation
 FAST_DI_PERIOD = 12          # Fast DI period with EMA smoothing (1h chart)
 RSI_OVERBOUGHT = 70          # Block long entries when RSI > 70
 RSI_OVERSOLD = 30            # Block short entries when RSI < 30
@@ -860,6 +869,9 @@ def _clear_risk_state(symbol: str) -> None:
     symbol_entry_cross_dir[symbol] = None
     symbol_entry_di_cross_time[symbol] = None
     symbol_entry_di_cross_dir[symbol] = None
+    # Exit confirmation tracking
+    symbol_exit_cross_time[symbol] = None
+    symbol_exit_cross_dir[symbol] = None
     save_state()
 
 
@@ -1397,16 +1409,16 @@ async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str)
     # ──────────────────────────────────────────────
     # 1. RISK MANAGEMENT: Tiered SL + TP Levels + Multi-stage Trailing
     #    STOP-LOSS (price goes against us):
-    #      - Tier 1: 50% closed INSTANTLY at 0.5x ATR loss
-    #      - Tier 2: Remaining 50% at 1.0x ATR loss (server-side, always active)
+    #      - Tier 1: 50% closed INSTANTLY at 1.0x ATR loss
+    #      - Tier 2: Remaining 50% at 1.5x ATR loss (server-side, always active)
     #    TAKE-PROFIT (price goes in our favor):
-    #      - TP1: At 2.0x ATR profit -> close 20%, move SL to 0.5x ATR profit
+    #      - TP1: At 2.0x ATR profit -> close 10%, move SL to 0.5x ATR profit
     #        (SL after TP1 closes only 95% of remaining, leaves 5% for Exit Rules)
-    #      - TP2: At 4.5x ATR profit -> close 25%, move SL to 1.0x ATR profit
+    #      - TP2: At 3.0x ATR profit -> close 10%, move SL to 1.0x ATR profit
     #        (SL after TP2 closes only 95% of remaining, leaves 5% for Exit Rules)
     #    TRAILING STOP:
-    #      - Stage 1: At 1.5x ATR profit, trail on 30% (1.0x ATR distance)
-    #      - Stage 2: After 30% closed, trail on 20% (1.0x ATR distance, never below/above entry)
+    #      - Stage 1: At 1.5x ATR profit, trail on 45% (1.0x ATR distance)
+    #      - Stage 2: After 45% closed, trail on 30% (1.0x ATR distance, never below/above entry)
     #      - Remaining 5% protected by Exit Rules ONLY
     #    Uses current_price (real-time) for all risk checks
     # ──────────────────────────────────────────────
@@ -1584,7 +1596,7 @@ async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str)
         if current_open_trade_side == "Buy":
             unrealized_profit_atr = (current_price - entry_price) / entry_atr if entry_atr else 0
 
-            # ── Stage 1 Trail: At 1.5x ATR profit, trail on 30% ──
+            # ── Stage 1 Trail: At 1.5x ATR profit, trail on 45% ──
             if not trailing_active and unrealized_profit_atr >= TRAILING_ACTIVATE_ATR and original_qty:
                 symbol_trailing_active[symbol] = True
                 trailing_active = True
@@ -1600,7 +1612,7 @@ async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str)
                         text=(
                             f"\U0001f4c8 STAGE 1 TRAIL ACTIVATED for {symbol} (Long)\n"
                             f"Profit reached {TRAILING_ACTIVATE_ATR}x ATR\n"
-                            f"Peak: {peak:.6g} | Trail on 30% at {trail_stop_price:.6g} ({TRAILING_STOP_ATR}x ATR dist)\n"
+                            f"Peak: {peak:.6g} | Trail on 45% at {trail_stop_price:.6g} ({TRAILING_STOP_ATR}x ATR dist)\n"
                             f"Bybit executes INSTANTLY when hit."
                         )
                     )
@@ -1610,7 +1622,7 @@ async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str)
                         text=f"\u26a0\ufe0f {symbol}: Stage 1 trail failed to place. Will retry."
                     )
 
-            # ── TP1: At 2.0x ATR profit -> close 20%, move SL to 0.5x ATR profit ──
+            # ── TP1: At 2.0x ATR profit -> close 10%, move SL to 0.5x ATR profit ──
             # (SL after TP1 closes only 95% of remaining, leaves 5% for Exit Rules)
             if not tp1_taken and unrealized_profit_atr >= TP1_ATR_MULT and original_qty:
                 tp1_qty = original_qty * TP1_CLOSE_PCT
@@ -1639,15 +1651,15 @@ async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str)
                         chat_id=chat_id,
                         text=(
                             f"\U0001f3af TP1 HIT for {symbol} (Long)\n"
-                            f"Closed 20% at {TP1_ATR_MULT}x ATR profit\n"
+                            f"Closed 10% at {TP1_ATR_MULT}x ATR profit\n"
                             f"Entry: {entry_price:.6g} | Current: {current_price:.6g}\n"
                             f"SL moved to {new_sl:.6g} (locking in {TP1_SL_MOVE_ATR}x ATR profit)\n"
                             f"SL will close 95% if triggered, leaving 5% for Exit Rules\n"
-                            f"Remaining: 80% of original position"
+                            f"Remaining: 90% of original position"
                         )
                     )
 
-            # ── TP2: At 4.5x ATR profit -> close 25%, move SL to 1.0x ATR profit ──
+            # ── TP2: At 3.0x ATR profit -> close 10%, move SL to 1.0x ATR profit ──
             if tp1_taken and not tp2_taken and unrealized_profit_atr >= TP2_ATR_MULT and original_qty:
                 tp2_qty = original_qty * TP2_CLOSE_PCT
                 closed = await close_position_by_qty(symbol, "Buy", tp2_qty)
@@ -1670,11 +1682,11 @@ async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str)
                         chat_id=chat_id,
                         text=(
                             f"\U0001f3af TP2 HIT for {symbol} (Long)\n"
-                            f"Closed 25% at {TP2_ATR_MULT}x ATR profit\n"
+                            f"Closed 10% at {TP2_ATR_MULT}x ATR profit\n"
                             f"Entry: {entry_price:.6g} | Current: {current_price:.6g}\n"
                             f"SL moved to {new_sl:.6g} (locking in {TP2_SL_MOVE_ATR}x ATR profit)\n"
                             f"SL will close 95% if triggered, leaving 5% for Exit Rules\n"
-                            f"Remaining: 55% (30% trail + 20% stage2 + 5% exit rules)"
+                            f"Remaining: 80% (45% trail + 30% stage2 + 5% exit rules)"
                         )
                     )
 
@@ -1725,7 +1737,7 @@ async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str)
 
                     order_id = symbol_trail_order_id.get(symbol)
                     if order_id and current_qty < trail_qty:
-                        # 30% closed by trail — activate Stage 2 on 20% of original
+                        # 45% closed by trail — activate Stage 2 on 30% of original
                         symbol_partial_taken[symbol] = True
                         partial_taken = True
                         trail_price_display = symbol_trail_price.get(symbol, 0)
@@ -1737,14 +1749,14 @@ async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str)
                         await context.bot.send_message(
                             chat_id=chat_id,
                             text=(
-                                f"\U0001f3c1 STAGE 1 TRAIL closed 30% for {symbol} (Long)\n"
+                                f"\U0001f3c1 STAGE 1 TRAIL closed 45% for {symbol} (Long)\n"
                                 f"Trail price hit: {trail_price_display:.6g}\n"
-                                f"Now placing Stage 2 trail on 20% ({TRAILING_STOP_ATR_STAGE2}x ATR distance).\n"
+                                f"Now placing Stage 2 trail on 30% ({TRAILING_STOP_ATR_STAGE2}x ATR distance).\n"
                                 f"Remaining 5% will ride until Exit Rules close it."
                             )
                         )
 
-                        # Activate Stage 2: trail on 20% of original
+                        # Activate Stage 2: trail on 30% of original
                         stage2_qty = original_qty * TRAILING_STAGE2_QTY_PCT if original_qty else current_qty * 0.5
                         symbol_peak_stage2[symbol] = current_price
                         stage2_trail_price = current_price - (TRAILING_STOP_ATR_STAGE2 * entry_atr)
@@ -1765,7 +1777,7 @@ async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str)
                                 chat_id=chat_id,
                                 text=(
                                     f"\U0001f4c8 STAGE 2 TRAIL placed for {symbol} (Long)\n"
-                                    f"Trail on 20% at {stage2_trail_price:.6g} ({TRAILING_STOP_ATR_STAGE2}x ATR dist)\n"
+                                    f"Trail on 30% at {stage2_trail_price:.6g} ({TRAILING_STOP_ATR_STAGE2}x ATR dist)\n"
                                     f"Never below entry. Bybit executes INSTANTLY when hit.\n"
                                     f"Remaining 5% continues until Exit Rules."
                                 )
@@ -1834,7 +1846,7 @@ async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str)
                         await context.bot.send_message(
                             chat_id=chat_id,
                             text=(
-                                f"\U0001f3c1 STAGE 2 TRAIL closed 20% for {symbol} (Long)\n"
+                                f"\U0001f3c1 STAGE 2 TRAIL closed 30% for {symbol} (Long)\n"
                                 f"Trail price hit: {trail_price_display:.6g}\n"
                                 f"Remaining 5% continues trading.\n"
                                 f"No trailing stop on final 5% -- exits on Exit Rules only."
@@ -1864,7 +1876,7 @@ async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str)
         elif current_open_trade_side == "Sell":
             unrealized_profit_atr = (entry_price - current_price) / entry_atr if entry_atr else 0
 
-            # ── Stage 1 Trail: At 1.5x ATR profit, trail on 30% ──
+            # ── Stage 1 Trail: At 1.5x ATR profit, trail on 45% ──
             if not trailing_active and unrealized_profit_atr >= TRAILING_ACTIVATE_ATR and original_qty:
                 symbol_trailing_active[symbol] = True
                 trailing_active = True
@@ -1880,7 +1892,7 @@ async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str)
                         text=(
                             f"\U0001f4c8 STAGE 1 TRAIL ACTIVATED for {symbol} (Short)\n"
                             f"Profit reached {TRAILING_ACTIVATE_ATR}x ATR\n"
-                            f"Trough: {peak:.6g} | Trail on 30% at {trail_stop_price:.6g} ({TRAILING_STOP_ATR}x ATR dist)\n"
+                            f"Trough: {peak:.6g} | Trail on 45% at {trail_stop_price:.6g} ({TRAILING_STOP_ATR}x ATR dist)\n"
                             f"Bybit executes INSTANTLY when hit."
                         )
                     )
@@ -1890,7 +1902,7 @@ async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str)
                         text=f"\u26a0\ufe0f {symbol}: Stage 1 trail failed to place. Will retry."
                     )
 
-            # ── TP1: At 2.0x ATR profit -> close 20%, move SL to 0.5x ATR profit ──
+            # ── TP1: At 2.0x ATR profit -> close 10%, move SL to 0.5x ATR profit ──
             if not tp1_taken and unrealized_profit_atr >= TP1_ATR_MULT and original_qty:
                 tp1_qty = original_qty * TP1_CLOSE_PCT
                 closed = await close_position_by_qty(symbol, "Sell", tp1_qty)
@@ -1916,15 +1928,15 @@ async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str)
                         chat_id=chat_id,
                         text=(
                             f"\U0001f3af TP1 HIT for {symbol} (Short)\n"
-                            f"Closed 20% at {TP1_ATR_MULT}x ATR profit\n"
+                            f"Closed 10% at {TP1_ATR_MULT}x ATR profit\n"
                             f"Entry: {entry_price:.6g} | Current: {current_price:.6g}\n"
                             f"SL moved to {new_sl:.6g} (locking in {TP1_SL_MOVE_ATR}x ATR profit)\n"
                             f"SL will close 95% if triggered, leaving 5% for Exit Rules\n"
-                            f"Remaining: 80% of original position"
+                            f"Remaining: 90% of original position"
                         )
                     )
 
-            # ── TP2: At 4.5x ATR profit -> close 25%, move SL to 1.0x ATR profit ──
+            # ── TP2: At 3.0x ATR profit -> close 10%, move SL to 1.0x ATR profit ──
             if tp1_taken and not tp2_taken and unrealized_profit_atr >= TP2_ATR_MULT and original_qty:
                 tp2_qty = original_qty * TP2_CLOSE_PCT
                 closed = await close_position_by_qty(symbol, "Sell", tp2_qty)
@@ -1946,11 +1958,11 @@ async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str)
                         chat_id=chat_id,
                         text=(
                             f"\U0001f3af TP2 HIT for {symbol} (Short)\n"
-                            f"Closed 25% at {TP2_ATR_MULT}x ATR profit\n"
+                            f"Closed 10% at {TP2_ATR_MULT}x ATR profit\n"
                             f"Entry: {entry_price:.6g} | Current: {current_price:.6g}\n"
                             f"SL moved to {new_sl:.6g} (locking in {TP2_SL_MOVE_ATR}x ATR profit)\n"
                             f"SL will close 95% if triggered, leaving 5% for Exit Rules\n"
-                            f"Remaining: 55% (30% trail + 20% stage2 + 5% exit rules)"
+                            f"Remaining: 80% (45% trail + 30% stage2 + 5% exit rules)"
                         )
                     )
 
@@ -2012,9 +2024,9 @@ async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str)
                         await context.bot.send_message(
                             chat_id=chat_id,
                             text=(
-                                f"\U0001f3c1 STAGE 1 TRAIL closed 30% for {symbol} (Short)\n"
+                                f"\U0001f3c1 STAGE 1 TRAIL closed 45% for {symbol} (Short)\n"
                                 f"Trail price hit: {trail_price_display:.6g}\n"
-                                f"Now placing Stage 2 trail on 20% ({TRAILING_STOP_ATR_STAGE2}x ATR distance).\n"
+                                f"Now placing Stage 2 trail on 30% ({TRAILING_STOP_ATR_STAGE2}x ATR distance).\n"
                                 f"Remaining 5% will ride until Exit Rules close it."
                             )
                         )
@@ -2039,7 +2051,7 @@ async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str)
                                 chat_id=chat_id,
                                 text=(
                                     f"\U0001f4c8 STAGE 2 TRAIL placed for {symbol} (Short)\n"
-                                    f"Trail on 20% at {stage2_trail_price:.6g} ({TRAILING_STOP_ATR_STAGE2}x ATR dist)\n"
+                                    f"Trail on 30% at {stage2_trail_price:.6g} ({TRAILING_STOP_ATR_STAGE2}x ATR dist)\n"
                                     f"Never above entry. Bybit executes INSTANTLY when hit.\n"
                                     f"Remaining 5% continues until Exit Rules."
                                 )
@@ -2108,7 +2120,7 @@ async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str)
                         await context.bot.send_message(
                             chat_id=chat_id,
                             text=(
-                                f"\U0001f3c1 STAGE 2 TRAIL closed 20% for {symbol} (Short)\n"
+                                f"\U0001f3c1 STAGE 2 TRAIL closed 30% for {symbol} (Short)\n"
                                 f"Trail price hit: {trail_price_display:.6g}\n"
                                 f"Remaining 5% continues trading.\n"
                                 f"No trailing stop on final 5% -- exits on Exit Rules only."
@@ -2136,45 +2148,126 @@ async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str)
                         print(f"[STAGE2-RETRY] {symbol}: Stage 2 trail placed (retry) at {stage2_trail_price:.6g}")
 
     # ──────────────────────────────────────────────
-    # 2. EXIT RULES (IMMEDIATE — no confirmation timer)
-    #    Long exit: (MACD crosses BELOW Signal AND -DI > +DI)
-    #              OR (MACD is BELOW Signal AND -DI crosses above +DI)
-    #    Short exit: (MACD crosses ABOVE Signal AND +DI > -DI)
-    #               OR (MACD is ABOVE Signal AND +DI crosses above -DI)
-    #    Closes remaining position (the 5% protected by Exit Rules)
+    # 2. EXIT RULES
+    #    Path 1 (IMMEDIATE — no timer):
+    #      Long: MACD crosses BELOW Signal + -DI > +DI
+    #      Short: MACD crosses ABOVE Signal + +DI > -DI
+    #    Path 2 (3-min confirmation):
+    #      Long: MACD BELOW Signal + -DI crosses above +DI + 3-min confirm
+    #      Short: MACD ABOVE Signal + +DI crosses above -DI + 3-min confirm
+    #    After exit: ALWAYS go FLAT, reversal requires 5-min entry confirmation
     # ──────────────────────────────────────────────
     if current_open_trade_side is not None:
 
         exit_triggered = False
+        exit_reason = ""
 
+        # ── EXIT PATH 1: IMMEDIATE (MACD cross + DI already aligned) ──
         if current_open_trade_side == "Buy":
-            # Long exit condition 1: MACD crosses BELOW Signal AND -DI is already above +DI
+            # Long exit: MACD crosses BELOW Signal AND -DI is already above +DI
             if macd_bearish_cross and not di_currently_plus_above:
                 exit_triggered = True
                 exit_reason = (
                     f"MACD crossed BELOW Signal (1h) AND -DI ({fast_minus_di:.2f}) > +DI ({fast_plus_di:.2f})"
                 )
-            # Long exit condition 2: MACD is already BELOW Signal AND -DI crosses above +DI
-            elif not macd_currently_above and di_bearish_cross:
-                exit_triggered = True
-                exit_reason = (
-                    f"MACD BELOW Signal ({macd_line_1h:.6g} < {signal_line_1h:.6g}) AND -DI crossed above +DI"
-                )
 
         elif current_open_trade_side == "Sell":
-            # Short exit condition 1: MACD crosses ABOVE Signal AND +DI is already above -DI
+            # Short exit: MACD crosses ABOVE Signal AND +DI is already above -DI
             if macd_bullish_cross and di_currently_plus_above:
                 exit_triggered = True
                 exit_reason = (
                     f"MACD crossed ABOVE Signal (1h) AND +DI ({fast_plus_di:.2f}) > -DI ({fast_minus_di:.2f})"
                 )
-            # Short exit condition 2: MACD is already ABOVE Signal AND +DI crosses above -DI
-            elif macd_currently_above and di_bullish_cross:
-                exit_triggered = True
-                exit_reason = (
-                    f"MACD ABOVE Signal ({macd_line_1h:.6g} > {signal_line_1h:.6g}) AND +DI crossed above -DI"
-                )
 
+        # ── EXIT PATH 2: DI cross while MACD already aligned → start 3-min confirm ──
+        if not exit_triggered and current_open_trade_side == "Buy":
+            if not macd_currently_above and di_bearish_cross:
+                # Start 3-min exit confirmation for long exit path 2
+                if symbol_exit_cross_time.get(symbol) is None or symbol_exit_cross_dir.get(symbol) != "long_exit":
+                    symbol_exit_cross_time[symbol] = time.time()
+                    symbol_exit_cross_dir[symbol] = "long_exit"
+                    print(f"[EXIT-CONFIRM] {symbol}: Long Exit Path 2 — MACD below Signal, -DI crossed above +DI, starting 3-min confirm")
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"\u23f3 {symbol}: EXIT Path 2 Detected (Long)\n"
+                            f"MACD ({macd_line_1h:.6g}) BELOW Signal ({signal_line_1h:.6g})\n"
+                            f"-DI ({fast_minus_di:.2f}) just crossed ABOVE +DI ({fast_plus_di:.2f})\n"
+                            f"Waiting 3-min confirmation before exiting Long..."
+                        )
+                    )
+                    save_state()
+
+        if not exit_triggered and current_open_trade_side == "Sell":
+            if macd_currently_above and di_bullish_cross:
+                # Start 3-min exit confirmation for short exit path 2
+                if symbol_exit_cross_time.get(symbol) is None or symbol_exit_cross_dir.get(symbol) != "short_exit":
+                    symbol_exit_cross_time[symbol] = time.time()
+                    symbol_exit_cross_dir[symbol] = "short_exit"
+                    print(f"[EXIT-CONFIRM] {symbol}: Short Exit Path 2 — MACD above Signal, +DI crossed above -DI, starting 3-min confirm")
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"\u23f3 {symbol}: EXIT Path 2 Detected (Short)\n"
+                            f"MACD ({macd_line_1h:.6g}) ABOVE Signal ({signal_line_1h:.6g})\n"
+                            f"+DI ({fast_plus_di:.2f}) just crossed ABOVE -DI ({fast_minus_di:.2f})\n"
+                            f"Waiting 3-min confirmation before exiting Short..."
+                        )
+                    )
+                    save_state()
+
+        # ── Check pending Exit Path 2 confirmation ──
+        exit_cross_time = symbol_exit_cross_time.get(symbol)
+        exit_cross_dir = symbol_exit_cross_dir.get(symbol)
+
+        if not exit_triggered and exit_cross_time is not None and exit_cross_dir is not None:
+            exit_elapsed = time.time() - exit_cross_time
+
+            if exit_cross_dir == "long_exit":
+                # Cancel if conditions reversed
+                if di_currently_plus_above:
+                    symbol_exit_cross_time[symbol] = None
+                    symbol_exit_cross_dir[symbol] = None
+                    print(f"[EXIT-CONFIRM] {symbol}: Long Exit Path 2 cancelled — +DI went back above -DI")
+                    await context.bot.send_message(chat_id=chat_id, text=f"\u21a9\ufe0f {symbol}: +DI went back above -DI. Exit Path 2 cancelled.")
+                    save_state()
+                elif macd_currently_above:
+                    symbol_exit_cross_time[symbol] = None
+                    symbol_exit_cross_dir[symbol] = None
+                    print(f"[EXIT-CONFIRM] {symbol}: Long Exit Path 2 cancelled — MACD rose above Signal")
+                    save_state()
+                elif exit_elapsed >= EXIT_CONFIRM_SECONDS:
+                    # CONFIRMED! Execute exit
+                    symbol_exit_cross_time[symbol] = None
+                    symbol_exit_cross_dir[symbol] = None
+                    exit_triggered = True
+                    exit_reason = (
+                        f"MACD BELOW Signal ({macd_line_1h:.6g} < {signal_line_1h:.6g}) AND -DI above +DI confirmed for 3 min"
+                    )
+
+            elif exit_cross_dir == "short_exit":
+                # Cancel if conditions reversed
+                if not di_currently_plus_above:
+                    symbol_exit_cross_time[symbol] = None
+                    symbol_exit_cross_dir[symbol] = None
+                    print(f"[EXIT-CONFIRM] {symbol}: Short Exit Path 2 cancelled — -DI went back above +DI")
+                    await context.bot.send_message(chat_id=chat_id, text=f"\u21a9\ufe0f {symbol}: -DI went back above +DI. Exit Path 2 cancelled.")
+                    save_state()
+                elif not macd_currently_above:
+                    symbol_exit_cross_time[symbol] = None
+                    symbol_exit_cross_dir[symbol] = None
+                    print(f"[EXIT-CONFIRM] {symbol}: Short Exit Path 2 cancelled — MACD dropped below Signal")
+                    save_state()
+                elif exit_elapsed >= EXIT_CONFIRM_SECONDS:
+                    # CONFIRMED! Execute exit
+                    symbol_exit_cross_time[symbol] = None
+                    symbol_exit_cross_dir[symbol] = None
+                    exit_triggered = True
+                    exit_reason = (
+                        f"MACD ABOVE Signal ({macd_line_1h:.6g} > {signal_line_1h:.6g}) AND +DI above -DI confirmed for 3 min"
+                    )
+
+        # ── Execute exit and go FLAT (no immediate reversal) ──
         if exit_triggered:
             closing_side = current_open_trade_side
             side_label = "Long" if closing_side == "Buy" else "Short"
@@ -2187,111 +2280,40 @@ async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str)
                 )
             )
             await cancel_server_stops(symbol)
-            closed_qty = await close_position(symbol, side_to_close=closing_side)
+            await close_position(symbol, side_to_close=closing_side)
             _clear_risk_state(symbol)
-            manual_override = None
-            if symbol in symbol_manual_quantities and symbol_manual_quantities[symbol] is not None:
-                manual_override = closed_qty
 
-            # ── REVERSAL CHECK ──
-            # Use same two-path entry filters. If conditions not met -> go FLAT
-            reversal_side = None
-            reversal_trend = None
-            reversal_label = None
-
-            # Check reversal to Short (after closing Long)
-            if closing_side == "Buy":
-                # Reversal requires: ADX > 20, RSI not oversold, and one of two paths:
-                #   Path A: MACD already BELOW Signal + DI bearish cross (just happened or confirmed)
-                #   Path B: -DI already > +DI + MACD bearish cross (just happened)
-                # Since exit just fired, we know at least one MACD+DI condition is true
-                if adx > ADX_THRESHOLD and rsi > RSI_OVERSOLD:
-                    # The exit conditions already confirm MACD below + -DI above, so reversal is valid
-                    reversal_side = "Sell"
-                    reversal_trend = "downward"
-                    reversal_label = "Short"
-
-            # Check reversal to Long (after closing Short)
-            elif closing_side == "Sell":
-                if adx > ADX_THRESHOLD and rsi < RSI_OVERBOUGHT:
-                    # The exit conditions already confirm MACD above + +DI above, so reversal is valid
-                    reversal_side = "Buy"
-                    reversal_trend = "upward"
-                    reversal_label = "Long"
-
-            if reversal_side is not None:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        f"\U0001f504 REVERSE to {reversal_label} for {symbol}\n"
-                        f"ADX: {adx:.2f} > {ADX_THRESHOLD}\n"
-                        f"MACD 1h: {macd_line_1h:.6g} / Signal 1h: {signal_line_1h:.6g}\n"
-                        f"Fast DI(12): +DI={fast_plus_di:.2f} | -DI={fast_minus_di:.2f}\n"
-                        f"RSI: {rsi:.2f}\n"
-                        f"Opening {reversal_label}..."
-                    )
+            # ALWAYS go FLAT after exit — reversal requires full 5-min entry confirmation
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"\U0001f7e1 GOING FLAT for {symbol}\n"
+                    f"Position closed. Will wait for MACD+DI crossover + 5-min confirmation + ADX > {ADX_THRESHOLD} + RSI filter before re-entering."
                 )
-                result = await place_trade(symbol, side=reversal_side, manual_qty_override=manual_override)
-                if result and "error" not in result:
-                    order_id = result.get("orderId", "\u2014")
-                    await asyncio.sleep(1)
-                    real_entry = await get_position_entry_price(symbol)
-                    fill_price = real_entry if real_entry else last_close
-                    _set_entry_risk_state(symbol, fill_price, atr)
-                    if reversal_side == "Sell":
-                        sl_price = fill_price + (STOP_LOSS_ATR_MULT * atr)
-                    else:
-                        sl_price = fill_price - (STOP_LOSS_ATR_MULT * atr)
-                    await set_server_stop_loss(symbol, reversal_side, sl_price)
-                    await context.bot.send_message(chat_id=chat_id, text=f"\u2705 {reversal_label} order(s) placed for {symbol}\nLast Order ID: <code>{order_id}</code>\nFill Price: {fill_price:.6g}\nServer-side SL: {sl_price:.6g}", parse_mode="HTML")
-                    symbol_trends[symbol] = reversal_trend
-                    symbol_open_trade_side[symbol] = reversal_side
-                    symbol_post_exit_flat[symbol] = False
-                    save_state()
-                elif result and "error" in result:
-                    await context.bot.send_message(chat_id=chat_id, text=f"\u274c Failed to place {reversal_label} for {symbol}: {result['error']}")
-                    symbol_open_trade_side[symbol] = None
-                    symbol_post_exit_flat[symbol] = True
-                    save_state()
-            else:
-                # Reversal conditions not met -> go FLAT
-                reason = []
-                if adx <= ADX_THRESHOLD:
-                    reason.append(f"ADX ({adx:.2f}) <= {ADX_THRESHOLD}")
-                if closing_side == "Buy" and rsi <= RSI_OVERSOLD:
-                    reason.append(f"RSI oversold ({rsi:.2f})")
-                if closing_side == "Sell" and rsi >= RSI_OVERBOUGHT:
-                    reason.append(f"RSI overbought ({rsi:.2f})")
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        f"\U0001f7e1 GOING FLAT for {symbol}\n"
-                        f"Reversal conditions not met: {', '.join(reason) if reason else 'waiting for entry signal'}\n"
-                        f"Will wait for MACD+DI crossover + 3-min confirmation + ADX > {ADX_THRESHOLD} + RSI filter before re-entering."
-                    )
-                )
-                symbol_open_trade_side[symbol] = None
-                symbol_post_exit_flat[symbol] = True
-                save_state()
+            )
+            symbol_trends[symbol] = None
+            symbol_open_trade_side[symbol] = None
+            symbol_post_exit_flat[symbol] = True
+            save_state()
             return
 
     # ──────────────────────────────────────────────
-    # 3. TRADE ENTRY (no open position, two-path system with 3-min confirmation)
+    # 3. TRADE ENTRY (no open position, two-path system with 5-min confirmation)
     #    ALL filters must pass:
     #      1. ADX > 20 (trending)
     #      2. RSI NOT extreme (not > 70 for longs, not < 30 for shorts)
     #      3. Two entry paths (either can trigger):
-    #         Path A: MACD already aligned -> wait for DI cross + 3-min confirmation
-    #           Long: MACD above Signal -> +DI crosses above -DI -> stays 3 min
-    #           Short: MACD below Signal -> -DI crosses above +DI -> stays 3 min
-    #         Path B: DI already aligned -> wait for MACD cross + 3-min confirmation
-    #           Long: +DI above -DI -> MACD crosses above Signal -> stays 3 min
-    #           Short: -DI above +DI -> MACD crosses below Signal -> stays 3 min
+    #         Path A: MACD already aligned -> wait for DI cross + 5-min confirmation
+    #           Long: MACD above Signal -> +DI crosses above -DI -> stays 5 min
+    #           Short: MACD below Signal -> -DI crosses above +DI -> stays 5 min
+    #         Path B: DI already aligned -> wait for MACD cross + 5-min confirmation
+    #           Long: +DI above -DI -> MACD crosses above Signal -> stays 5 min
+    #           Short: -DI above +DI -> MACD crosses below Signal -> stays 5 min
     #    A perfect entry is more important than rush!
     # ──────────────────────────────────────────────
     if current_open_trade_side is None:
 
-        # ═══ PATH A: MACD already aligned, wait for DI cross + 3-min confirmation ═══
+        # ═══ PATH A: MACD already aligned, wait for DI cross + 5-min confirmation ═══
 
         # Detect fresh DI cross when MACD is already aligned
         # Long: MACD above Signal + +DI just crossed above -DI
@@ -2299,7 +2321,7 @@ async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str)
             if symbol_entry_di_cross_time.get(symbol) is None or symbol_entry_di_cross_dir.get(symbol) != "bullish":
                 symbol_entry_di_cross_time[symbol] = time.time()
                 symbol_entry_di_cross_dir[symbol] = "bullish"
-                print(f"[3m-CONFIRM] {symbol}: Path A Long — MACD above Signal, +DI crossed above -DI, starting 3-min DI confirmation")
+                print(f"[5m-CONFIRM] {symbol}: Path A Long — MACD above Signal, +DI crossed above -DI, starting 5-min DI confirmation")
                 await context.bot.send_message(
                     chat_id=chat_id,
                     text=(
@@ -2307,7 +2329,7 @@ async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str)
                         f"MACD ({macd_line_1h:.6g}) already ABOVE Signal ({signal_line_1h:.6g})\n"
                         f"+DI ({fast_plus_di:.2f}) just crossed ABOVE -DI ({fast_minus_di:.2f})\n"
                         f"ADX: {adx:.2f} | RSI: {rsi:.2f}\n"
-                        f"Waiting 3-min DI confirmation before entering Long..."
+                        f"Waiting 5-min DI confirmation before entering Long..."
                     )
                 )
                 save_state()
@@ -2317,7 +2339,7 @@ async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str)
             if symbol_entry_di_cross_time.get(symbol) is None or symbol_entry_di_cross_dir.get(symbol) != "bearish":
                 symbol_entry_di_cross_time[symbol] = time.time()
                 symbol_entry_di_cross_dir[symbol] = "bearish"
-                print(f"[3m-CONFIRM] {symbol}: Path A Short — MACD below Signal, -DI crossed above +DI, starting 3-min DI confirmation")
+                print(f"[5m-CONFIRM] {symbol}: Path A Short — MACD below Signal, -DI crossed above +DI, starting 5-min DI confirmation")
                 await context.bot.send_message(
                     chat_id=chat_id,
                     text=(
@@ -2325,7 +2347,7 @@ async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str)
                         f"MACD ({macd_line_1h:.6g}) already BELOW Signal ({signal_line_1h:.6g})\n"
                         f"-DI ({fast_minus_di:.2f}) just crossed ABOVE +DI ({fast_plus_di:.2f})\n"
                         f"ADX: {adx:.2f} | RSI: {rsi:.2f}\n"
-                        f"Waiting 3-min DI confirmation before entering Short..."
+                        f"Waiting 5-min DI confirmation before entering Short..."
                     )
                 )
                 save_state()
@@ -2456,7 +2478,7 @@ async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str)
                     save_state()
                     return
 
-        # ═══ PATH B: DI already aligned, wait for MACD cross + 3-min confirmation ═══
+        # ═══ PATH B: DI already aligned, wait for MACD cross + 5-min confirmation ═══
 
         # Detect fresh MACD cross when DI is already aligned
         # Long: +DI above -DI + MACD just crossed above Signal
@@ -2464,7 +2486,7 @@ async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str)
             if symbol_entry_cross_time.get(symbol) is None or symbol_entry_cross_dir.get(symbol) != "bullish":
                 symbol_entry_cross_time[symbol] = time.time()
                 symbol_entry_cross_dir[symbol] = "bullish"
-                print(f"[3m-CONFIRM] {symbol}: Path B Long — +DI above -DI, MACD crossed above Signal, starting 3-min MACD confirmation")
+                print(f"[5m-CONFIRM] {symbol}: Path B Long — +DI above -DI, MACD crossed above Signal, starting 5-min MACD confirmation")
                 await context.bot.send_message(
                     chat_id=chat_id,
                     text=(
@@ -2472,7 +2494,7 @@ async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str)
                         f"+DI ({fast_plus_di:.2f}) already ABOVE -DI ({fast_minus_di:.2f})\n"
                         f"MACD ({macd_line_1h:.6g}) just crossed ABOVE Signal ({signal_line_1h:.6g})\n"
                         f"ADX: {adx:.2f} | RSI: {rsi:.2f}\n"
-                        f"Waiting 3-min MACD confirmation before entering Long..."
+                        f"Waiting 5-min MACD confirmation before entering Long..."
                     )
                 )
                 save_state()
@@ -2482,7 +2504,7 @@ async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str)
             if symbol_entry_cross_time.get(symbol) is None or symbol_entry_cross_dir.get(symbol) != "bearish":
                 symbol_entry_cross_time[symbol] = time.time()
                 symbol_entry_cross_dir[symbol] = "bearish"
-                print(f"[3m-CONFIRM] {symbol}: Path B Short — -DI above +DI, MACD crossed below Signal, starting 3-min MACD confirmation")
+                print(f"[5m-CONFIRM] {symbol}: Path B Short — -DI above +DI, MACD crossed below Signal, starting 5-min MACD confirmation")
                 await context.bot.send_message(
                     chat_id=chat_id,
                     text=(
@@ -2490,7 +2512,7 @@ async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str)
                         f"-DI ({fast_minus_di:.2f}) already ABOVE +DI ({fast_plus_di:.2f})\n"
                         f"MACD ({macd_line_1h:.6g}) just crossed BELOW Signal ({signal_line_1h:.6g})\n"
                         f"ADX: {adx:.2f} | RSI: {rsi:.2f}\n"
-                        f"Waiting 3-min MACD confirmation before entering Short..."
+                        f"Waiting 5-min MACD confirmation before entering Short..."
                     )
                 )
                 save_state()
@@ -2667,17 +2689,17 @@ async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str)
             trail_price = symbol_trail_price.get(symbol)
             trail2_price = symbol_trail2_price.get(symbol)
             # TP status
-            tp_status = f"TP1 ({'HIT' if tp1_taken_flag else 'pending'} @ {TP1_ATR_MULT}x ATR/20%) | TP2 ({'HIT' if tp2_taken_flag else 'pending'} @ {TP2_ATR_MULT}x ATR/25%)"
+            tp_status = f"TP1 ({'HIT' if tp1_taken_flag else 'pending'} @ {TP1_ATR_MULT}x ATR/10%) | TP2 ({'HIT' if tp2_taken_flag else 'pending'} @ {TP2_ATR_MULT}x ATR/10%)"
             risk_info += f"\n\u2022 Take-Profit: {tp_status}"
             # Trailing status
             if stage2_taken_flag:
-                trailing_status = '30% + 20% CLOSED by trail. 5% riding until Exit Rules'
+                trailing_status = '45% + 30% CLOSED by trail. 5% riding until Exit Rules'
             elif stage2_active_flag and trail2_price:
-                trailing_status = f'Stage 2 ACTIVE - trail on 20% @ {trail2_price:.6g} (1x ATR)'
+                trailing_status = f'Stage 2 ACTIVE - trail on 30% @ {trail2_price:.6g} (1x ATR)'
             elif partial_taken_flag:
-                trailing_status = f'30% CLOSED by trail. Placing 20% trail...'
+                trailing_status = f'45% CLOSED by trail. Placing 30% trail...'
             elif trailing and trail_price:
-                trailing_status = f'Stage 1 ACTIVE - trail on 30% @ {trail_price:.6g} (1x ATR)'
+                trailing_status = f'Stage 1 ACTIVE - trail on 45% @ {trail_price:.6g} (1x ATR)'
             elif trailing:
                 trailing_status = 'Stage 1 ACTIVE (placing trail order...)'
             else:
@@ -2721,12 +2743,12 @@ async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str)
 
         report_msg = (
             f"Still monitoring {symbol}\n"
-            f"\u2022 Entry: ADX>{ADX_THRESHOLD} + RSI filter + two-path (MACD+DI cross) + 3-min confirm\n"
-            f"\u2022 Exit: MACD cross + DI alignment (immediate, no timer)\n"
-            f"\u2022 Reverse: ADX > {ADX_THRESHOLD} + RSI + MACD+DI aligned, else FLAT\n"
+            f"\u2022 Entry: ADX>{ADX_THRESHOLD} + RSI filter + two-path (MACD+DI cross) + 5-min confirm\n"
+            f"\u2022 Exit: Path 1 immediate (MACD cross+DI) | Path 2 (MACD+DI cross) 3-min confirm\n"
+            f"\u2022 After exit: ALWAYS go FLAT, re-entry requires 5-min confirmation\n"
             f"\u2022 SL: 50% at {SL_STAGE1_ATR_MULT}x ATR + 50% at {STOP_LOSS_ATR_MULT}x ATR\n"
-            f"\u2022 TP: 20% at {TP1_ATR_MULT}x ATR, 25% at {TP2_ATR_MULT}x ATR (SL closes 95%, 5% rides)\n"
-            f"\u2022 Trail: 30% at {TRAILING_ACTIVATE_ATR}x ATR, then 20% at 1x ATR, 5% rides\n"
+            f"\u2022 TP: {TP1_CLOSE_PCT*100:.0f}% at {TP1_ATR_MULT}x ATR, {TP2_CLOSE_PCT*100:.0f}% at {TP2_ATR_MULT}x ATR (SL closes 95%, 5% rides)\n"
+            f"\u2022 Trail: {TRAILING_CLOSE_PCT*100:.0f}% at {TRAILING_ACTIVATE_ATR}x ATR, then {TRAILING_STAGE2_QTY_PCT*100:.0f}% at {TRAILING_STOP_ATR_STAGE2}x ATR, 5% rides\n"
             f"\u2022 WebSocket prices + polling every {POLL_INTERVAL_SECONDS}s\n"
             f"\u2022 50 EMA (1h): {ema_50:.6g} | ADX: {adx:.2f}\n"
             f"\u2022 Fast DI(12, 1h): +DI={fast_plus_di:.2f} | -DI={fast_minus_di:.2f} ({di_state})\n"
@@ -2787,7 +2809,7 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     # Handle instant trade for manual quantity
     # NOTE: Instant trade requires current alignment (ADX + MACD + DI + RSI)
-    # but does NOT wait 3 minutes — the 3-min confirmation applies to monitoring entries only.
+    # but does NOT wait 5 minutes — the 5-min confirmation applies to monitoring entries only.
     # If both MACD and DI are already aligned, the trade is placed immediately.
     if manual_qty:
         await update.message.reply_text(f"\U0001f680 INSTANT TRADE for {symbol} with quantity {manual_qty}...")
@@ -2821,7 +2843,7 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             if entry_blocked:
                 await update.message.reply_text(
                     f"\u26a0\ufe0f Instant trade blocked for {symbol}: {block_reason}\n"
-                    f"Monitoring will wait for MACD+DI crossover + 3-min confirmation."
+                    f"Monitoring will wait for MACD+DI crossover + 5-min confirmation."
                 )
             else:
                 # Require MACD + DI alignment + RSI filter
@@ -2847,7 +2869,7 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 if entry_blocked:
                     await update.message.reply_text(
                         f"\u26a0\ufe0f Instant trade blocked for {symbol}: {block_reason}\n"
-                        f"Monitoring will wait for MACD+DI crossover + 3-min confirmation."
+                        f"Monitoring will wait for MACD+DI crossover + 5-min confirmation."
                     )
                 elif side is None:
                     await update.message.reply_text(
@@ -2856,7 +2878,7 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                         f"MACD 1h: {macd_line_1h:.6g} / Signal 1h: {signal_line_1h:.6g}\n"
                         f"Fast DI(12, 1h): +DI={fast_plus_di:.2f} | -DI={fast_minus_di:.2f}\n"
                         f"Need: MACD + DI both aligned for Long or Short.\n"
-                        f"Monitoring will wait for MACD+DI crossover + 3-min confirmation."
+                        f"Monitoring will wait for MACD+DI crossover + 5-min confirmation."
                     )
                 else:
                     side_text = "Long (Buy)" if side == "Buy" else "Short (Sell)"
@@ -2902,12 +2924,12 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(
         f"Monitoring {symbol}!\n"
         f"\u2022 {qty_info}\n"
-        f"\u2022 Entry: ADX>{ADX_THRESHOLD} + RSI filter + two-path (MACD+DI cross) + 3-min confirm\n"
-        f"\u2022 Exit: MACD cross + DI alignment (immediate, no timer)\n"
-        f"\u2022 Reverse: ADX>{ADX_THRESHOLD} + RSI + MACD+DI aligned, else FLAT\n"
+        f"\u2022 Entry: ADX>{ADX_THRESHOLD} + RSI filter + two-path (MACD+DI cross) + 5-min confirm\n"
+        f"\u2022 Exit: Path 1 immediate (MACD cross+DI) | Path 2 (MACD+DI cross) 3-min confirm\n"
+        f"\u2022 After exit: ALWAYS go FLAT, re-entry requires 5-min confirmation\n"
         f"\u2022 SL: 50% at {SL_STAGE1_ATR_MULT}x ATR + 50% at {STOP_LOSS_ATR_MULT}x ATR (server-side)\n"
-        f"\u2022 TP: 20% at {TP1_ATR_MULT}x ATR, 25% at {TP2_ATR_MULT}x ATR\n"
-        f"\u2022 Trail: 30% at {TRAILING_ACTIVATE_ATR}x ATR ({TRAILING_STOP_ATR}x ATR dist), then 20% ({TRAILING_STOP_ATR_STAGE2}x ATR dist), 5% rides\n"
+        f"\u2022 TP: {TP1_CLOSE_PCT*100:.0f}% at {TP1_ATR_MULT}x ATR, {TP2_CLOSE_PCT*100:.0f}% at {TP2_ATR_MULT}x ATR\n"
+        f"\u2022 Trail: {TRAILING_CLOSE_PCT*100:.0f}% at {TRAILING_ACTIVATE_ATR}x ATR ({TRAILING_STOP_ATR}x ATR dist), then {TRAILING_STAGE2_QTY_PCT*100:.0f}% ({TRAILING_STOP_ATR_STAGE2}x ATR dist), 5% rides\n"
         f"\u2022 WebSocket real-time price feeds + polling every {POLL_INTERVAL_SECONDS}s\n"
         f"\u2022 State persistence: crash recovery via {STATE_FILE}\n"
         f"\u2022 Status report every 30 minutes"
@@ -2979,7 +3001,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("\u26d4 Unauthorized. This bot is private.")
         return
     await update.message.reply_text(
-        "Bot ready! (v22 - Two-Path Entry: MACD+DI Cross with 3-min Confirm)\n\n"
+        "Bot ready! (v23 - Two-Path Entry+Exit with 5-min/3-min Confirm)\n\n"
         "Commands:\n"
         "1. /start - Display this message\n"
         "2. /add_symbol <symbol> - Start monitoring with auto-sizing (20% balance)\n"
@@ -2990,8 +3012,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"\u2022 2. Fast DI (period {FAST_DI_PERIOD}, EMA smoothed, 1h chart)\n"
         f"\u2022 3. RSI NOT extreme (not > {RSI_OVERBOUGHT} for longs, not < {RSI_OVERSOLD} for shorts)\n"
         "\u2022 4. Two entry paths (either can trigger):\n"
-        "\u2022    Path A: MACD already aligned \u2192 wait for DI cross + 3-min confirm\n"
-        "\u2022    Path B: DI already aligned \u2192 wait for MACD cross + 3-min confirm\n"
+        "\u2022    Path A: MACD already aligned \u2192 wait for DI cross + 5-min confirm\n"
+        "\u2022    Path B: DI already aligned \u2192 wait for MACD cross + 5-min confirm\n"
         "\u2022 A perfect entry is more important than rush!\n\n"
         "Stop-Loss (Tiered):\n"
         f"\u2022 Tier 1: 50% closed INSTANTLY at {SL_STAGE1_ATR_MULT}x ATR loss\n"
@@ -3003,16 +3025,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Trailing Stop (Multi-Stage):\n"
         f"\u2022 At {TRAILING_ACTIVATE_ATR}x ATR profit: Stage 1 trail activates on {TRAILING_CLOSE_PCT*100:.0f}%\n"
         f"\u2022 Stage 1 trail: {TRAILING_STOP_ATR}x ATR distance. Bybit closes {TRAILING_CLOSE_PCT*100:.0f}% INSTANTLY when hit\n"
-        f"\u2022 Stage 2 trail: After 30% closed, {TRAILING_STAGE2_QTY_PCT*100:.0f}% gets trail ({TRAILING_STOP_ATR_STAGE2}x ATR distance)\n"
+        f"\u2022 Stage 2 trail: After {TRAILING_CLOSE_PCT*100:.0f}% closed, {TRAILING_STAGE2_QTY_PCT*100:.0f}% gets trail ({TRAILING_STOP_ATR_STAGE2}x ATR distance)\n"
         "\u2022 Stage 2 trail will never be placed below entry price (long) or above entry price (short)\n"
         "\u2022 Remaining 5% protected by Exit Rules ONLY\n\n"
-        "Exit Rules (IMMEDIATE — no timer):\n"
-        "\u2022 Long: MACD crosses BELOW Signal + -DI > +DI, OR MACD BELOW Signal + -DI crosses above +DI\n"
-        "\u2022 Short: MACD crosses ABOVE Signal + +DI > -DI, OR MACD ABOVE Signal + +DI crosses above -DI\n\n"
+        "Exit Rules:\n"
+        "\u2022 Path 1 (IMMEDIATE): MACD crosses + DI aligned \u2192 instant exit\n"
+        "\u2022 Path 2 (3-min confirm): MACD aligned + DI crosses \u2192 wait 3 min\n\n"
         "Reversal Rules:\n"
-        f"\u2022 ADX > {ADX_THRESHOLD} + same entry filters must pass\n"
+        f"\u2022 After exit: ALWAYS go FLAT\n"
+        f"\u2022 Re-entry requires ADX > {ADX_THRESHOLD} + entry filters + 5-min confirm\n"
         f"\u2022 RSI NOT extreme (not > {RSI_OVERBOUGHT} for longs, not < {RSI_OVERSOLD} for shorts)\n"
-        "\u2022 If conditions not met, bot goes FLAT\n\n"
+        "\u2022 If conditions not met, bot stays FLAT\n\n"
         "Infrastructure:\n"
         "\u2022 WebSocket real-time price feeds (REST fallback)\n"
         f"\u2022 State persistence: {STATE_FILE} (crash recovery)\n"
