@@ -320,7 +320,7 @@ symbol_entry_cross_dir: dict[str, Optional[str]] = {}      # Direction: "bullish
 symbol_entry_di_cross_time: dict[str, Optional[float]] = {}   # Timestamp when DI crossover was first detected
 symbol_entry_di_cross_dir: dict[str, Optional[str]] = {}      # Direction: "bullish" or "bearish"
 
-# 3-minute exit DI cross confirmation tracking (Exit Path 2: MACD already aligned, DI crosses)
+# 3-minute exit confirmation tracking (both Exit Path 1 and Path 2)
 symbol_exit_cross_time: dict[str, Optional[float]] = {}   # Timestamp when exit DI crossover was first detected
 symbol_exit_cross_dir: dict[str, Optional[str]] = {}      # Direction: "long_exit" or "short_exit"
 
@@ -2149,9 +2149,9 @@ async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str)
 
     # ──────────────────────────────────────────────
     # 2. EXIT RULES
-    #    Path 1 (IMMEDIATE — no timer):
-    #      Long: MACD crosses BELOW Signal + -DI > +DI
-    #      Short: MACD crosses ABOVE Signal + +DI > -DI
+    #    Path 1 (3-min confirmation):
+    #      Long: MACD crosses BELOW Signal + -DI > +DI → wait 3 min
+    #      Short: MACD crosses ABOVE Signal + +DI > -DI → wait 3 min
     #    Path 2 (3-min confirmation):
     #      Long: MACD BELOW Signal + -DI crosses above +DI + 3-min confirm
     #      Short: MACD ABOVE Signal + +DI crosses above -DI + 3-min confirm
@@ -2162,22 +2162,42 @@ async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str)
         exit_triggered = False
         exit_reason = ""
 
-        # ── EXIT PATH 1: IMMEDIATE (MACD cross + DI already aligned) ──
+        # ── EXIT PATH 1: MACD cross + DI already aligned → start 3-min confirm ──
         if current_open_trade_side == "Buy":
             # Long exit: MACD crosses BELOW Signal AND -DI is already above +DI
             if macd_bearish_cross and not di_currently_plus_above:
-                exit_triggered = True
-                exit_reason = (
-                    f"MACD crossed BELOW Signal (1h) AND -DI ({fast_minus_di:.2f}) > +DI ({fast_plus_di:.2f})"
-                )
+                if symbol_exit_cross_time.get(symbol) is None or symbol_exit_cross_dir.get(symbol) != "long_exit":
+                    symbol_exit_cross_time[symbol] = time.time()
+                    symbol_exit_cross_dir[symbol] = "long_exit"
+                    print(f"[EXIT-CONFIRM] {symbol}: Long Exit Path 1 — MACD crossed below Signal, -DI > +DI, starting 3-min confirm")
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"\u23f3 {symbol}: EXIT Path 1 Detected (Long)\n"
+                            f"MACD crossed BELOW Signal ({macd_line_1h:.6g} < {signal_line_1h:.6g})\n"
+                            f"-DI ({fast_minus_di:.2f}) > +DI ({fast_plus_di:.2f})\n"
+                            f"Waiting 3-min confirmation before exiting Long..."
+                        )
+                    )
+                    save_state()
 
         elif current_open_trade_side == "Sell":
             # Short exit: MACD crosses ABOVE Signal AND +DI is already above -DI
             if macd_bullish_cross and di_currently_plus_above:
-                exit_triggered = True
-                exit_reason = (
-                    f"MACD crossed ABOVE Signal (1h) AND +DI ({fast_plus_di:.2f}) > -DI ({fast_minus_di:.2f})"
-                )
+                if symbol_exit_cross_time.get(symbol) is None or symbol_exit_cross_dir.get(symbol) != "short_exit":
+                    symbol_exit_cross_time[symbol] = time.time()
+                    symbol_exit_cross_dir[symbol] = "short_exit"
+                    print(f"[EXIT-CONFIRM] {symbol}: Short Exit Path 1 — MACD crossed above Signal, +DI > -DI, starting 3-min confirm")
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"\u23f3 {symbol}: EXIT Path 1 Detected (Short)\n"
+                            f"MACD crossed ABOVE Signal ({macd_line_1h:.6g} > {signal_line_1h:.6g})\n"
+                            f"+DI ({fast_plus_di:.2f}) > -DI ({fast_minus_di:.2f})\n"
+                            f"Waiting 3-min confirmation before exiting Short..."
+                        )
+                    )
+                    save_state()
 
         # ── EXIT PATH 2: DI cross while MACD already aligned → start 3-min confirm ──
         if not exit_triggered and current_open_trade_side == "Buy":
@@ -2216,7 +2236,7 @@ async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str)
                     )
                     save_state()
 
-        # ── Check pending Exit Path 2 confirmation ──
+        # ── Check pending Exit confirmation (both Path 1 and Path 2) ──
         exit_cross_time = symbol_exit_cross_time.get(symbol)
         exit_cross_dir = symbol_exit_cross_dir.get(symbol)
 
@@ -2744,7 +2764,7 @@ async def _monitor_symbol_inner(context: ContextTypes.DEFAULT_TYPE, symbol: str)
         report_msg = (
             f"Still monitoring {symbol}\n"
             f"\u2022 Entry: ADX>{ADX_THRESHOLD} + RSI filter + two-path (MACD+DI cross) + 5-min confirm\n"
-            f"\u2022 Exit: Path 1 immediate (MACD cross+DI) | Path 2 (MACD+DI cross) 3-min confirm\n"
+            f"\u2022 Exit: Path 1 (MACD cross+DI) 3-min confirm | Path 2 (MACD+DI cross) 3-min confirm\n"
             f"\u2022 After exit: ALWAYS go FLAT, re-entry requires 5-min confirmation\n"
             f"\u2022 SL: 50% at {SL_STAGE1_ATR_MULT}x ATR + 50% at {STOP_LOSS_ATR_MULT}x ATR\n"
             f"\u2022 TP: {TP1_CLOSE_PCT*100:.0f}% at {TP1_ATR_MULT}x ATR, {TP2_CLOSE_PCT*100:.0f}% at {TP2_ATR_MULT}x ATR (SL closes 95%, 5% rides)\n"
@@ -2925,7 +2945,7 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"Monitoring {symbol}!\n"
         f"\u2022 {qty_info}\n"
         f"\u2022 Entry: ADX>{ADX_THRESHOLD} + RSI filter + two-path (MACD+DI cross) + 5-min confirm\n"
-        f"\u2022 Exit: Path 1 immediate (MACD cross+DI) | Path 2 (MACD+DI cross) 3-min confirm\n"
+        f"\u2022 Exit: Path 1 (MACD cross+DI) 3-min confirm | Path 2 (MACD+DI cross) 3-min confirm\n"
         f"\u2022 After exit: ALWAYS go FLAT, re-entry requires 5-min confirmation\n"
         f"\u2022 SL: 50% at {SL_STAGE1_ATR_MULT}x ATR + 50% at {STOP_LOSS_ATR_MULT}x ATR (server-side)\n"
         f"\u2022 TP: {TP1_CLOSE_PCT*100:.0f}% at {TP1_ATR_MULT}x ATR, {TP2_CLOSE_PCT*100:.0f}% at {TP2_ATR_MULT}x ATR\n"
@@ -3001,7 +3021,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("\u26d4 Unauthorized. This bot is private.")
         return
     await update.message.reply_text(
-        "Bot ready! (v23 - Two-Path Entry+Exit with 5-min/3-min Confirm)\n\n"
+        "Bot ready! (v24 - Two-Path Entry+Exit with 5-min/3-min Confirm)\n\n"
         "Commands:\n"
         "1. /start - Display this message\n"
         "2. /add_symbol <symbol> - Start monitoring with auto-sizing (20% balance)\n"
@@ -3029,7 +3049,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "\u2022 Stage 2 trail will never be placed below entry price (long) or above entry price (short)\n"
         "\u2022 Remaining 5% protected by Exit Rules ONLY\n\n"
         "Exit Rules:\n"
-        "\u2022 Path 1 (IMMEDIATE): MACD crosses + DI aligned \u2192 instant exit\n"
+        "\u2022 Path 1 (3-min confirm): MACD crosses + DI aligned \u2192 wait 3 min\n"
         "\u2022 Path 2 (3-min confirm): MACD aligned + DI crosses \u2192 wait 3 min\n\n"
         "Reversal Rules:\n"
         f"\u2022 After exit: ALWAYS go FLAT\n"
