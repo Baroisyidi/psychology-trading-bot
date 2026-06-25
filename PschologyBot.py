@@ -77,11 +77,14 @@ logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  BYBIT CLIENT
+#  Bybit Demo Trading uses a dedicated endpoint: api-demo.bybit.com
+#  This is different from both live (api.bybit.com) and testnet (api-testnet.bybit.com)
 # ─────────────────────────────────────────────────────────────────────────────
 bybit = HTTP(
-    testnet=BYBIT_TESTNET,
+    testnet=False,                        # always False — demo has its own endpoint below
     api_key=BYBIT_KEY,
     api_secret=BYBIT_SECRET,
+    demo=True,                            # routes all calls to api-demo.bybit.com
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
