@@ -94,11 +94,13 @@ logger = logging.getLogger(__name__)
 #  BYBIT CLIENT — Demo Trading endpoint
 # ─────────────────────────────────────────────────────────────────────────────
 bybit_session = HTTP(
-    demo=True,
+    testnet=False,
     api_key=BYBIT_KEY,
     api_secret=BYBIT_SECRET,
     recv_window=5000,
 )
+# pybit 5.6.2 has no demo= param — override endpoint directly
+bybit_session.endpoint = "https://api-demo.bybit.com"
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  WEBSOCKET — Real-time price feeds
