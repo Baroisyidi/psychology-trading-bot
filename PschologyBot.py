@@ -1153,8 +1153,10 @@ async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             d   = ind["debug"]
             e   = "🟢" if direction == "LONG" else "🔴"
             status = "🚀 ENTRY SIGNAL!" if ind["should_enter"] else "⏳ Waiting"
-            p_str  = "\n   ".join([f"✅ {p}" for p in ind["passed"]]) or "none"
-            f_str  = "\n   ".join([f"❌ {p}" for p in ind["failed"]]) or "none"
+            # Escape filter names so Telegram HTML parser doesn't choke on < > symbols
+            def esc(s): return s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+            p_str  = "\n   ".join([f"✅ {esc(p)}" for p in ind["passed"]]) or "none"
+            f_str  = "\n   ".join([f"❌ {esc(p)}" for p in ind["failed"]]) or "none"
             emas   = d.get("emas_daily", {})
 
             await update.message.reply_text(
