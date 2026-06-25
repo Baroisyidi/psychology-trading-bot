@@ -21,6 +21,7 @@ import pandas_ta as ta
 import numpy as np
 from dotenv import load_dotenv
 from pybit.unified_trading import HTTP
+from aiohttp import web
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -1161,32 +1162,85 @@ async def cmd_balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  STARTUP
+#  STARTUP — Webhook + aiohttp web server (Render Web Service compatible)
 # ─────────────────────────────────────────────────────────────────────────────
-def main() -> None:
+async def main() -> None:
     logger.info("Starting PsychologyBot v1...")
 
+    # ── Build Telegram application ──────────────────────────────────────────
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     # Register command handlers
-    app.add_handler(CommandHandler("start",         cmd_start))
-    app.add_handler(CommandHandler("add_symbol",    cmd_add_symbol))
-    app.add_handler(CommandHandler("remove_symbol", cmd_remove_symbol))
-    app.add_handler(CommandHandler("status",        cmd_status))
-    app.add_handler(CommandHandler("pause",         cmd_pause))
-    app.add_handler(CommandHandler("resume",        cmd_resume))
-    app.add_handler(CommandHandler("balance",       cmd_balance))
+    app.add_handler(CommandHandler("start",          cmd_start))
+    app.add_handler(CommandHandler("add_symbol",     cmd_add_symbol))
+    app.add_handler(CommandHandler("remove_symbol",  cmd_remove_symbol))
+    app.add_handler(CommandHandler("status",         cmd_status))
+    app.add_handler(CommandHandler("pause",          cmd_pause))
+    app.add_handler(CommandHandler("resume",         cmd_resume))
+    app.add_handler(CommandHandler("balance",        cmd_balance))
 
-    async def post_init(application) -> None:
-        """Launch the monitor loop alongside the Telegram polling loop."""
-        asyncio.create_task(monitor_loop(application))
-        logger.info("Monitor loop task created.")
+    # ── Set webhook on Telegram ─────────────────────────────────────────────
+    # Render injects RENDER_EXTERNAL_HOSTNAME automatically
+    base_url = os.environ.get(
+        "RENDER_EXTERNAL_HOSTNAME",
+        "psychology-trading-bot.onrender.com"
+    )
+    webhook_url = f"https://{base_url}/webhook"
+    port = int(os.environ.get("PORT", 10000))
 
-    app.post_init = post_init
+    await app.bot.set_webhook(url=webhook_url, drop_pending_updates=True)
+    logger.info(f"Webhook set to: {webhook_url}")
 
-    logger.info("Bot polling started.")
-    app.run_polling(allowed_updates=["message"])
+    # ── Initialise and start the Telegram app ───────────────────────────────
+    await app.initialize()
+    await app.start()
+
+    # ── Launch the trading monitor loop as a background task ────────────────
+    asyncio.create_task(monitor_loop(app))
+    logger.info("Monitor loop task created.")
+
+    # ── aiohttp web server — binds the port Render requires ─────────────────
+    async def health_handler(request):
+        return web.Response(text="OK")
+
+    async def webhook_handler(request):
+        try:
+            data   = await request.json()
+            update = Update.de_json(data=data, bot=app.bot)
+            await app.update_queue.put(update)
+            return web.Response(text="OK", status=200)
+        except Exception as e:
+            logger.error(f"Webhook handler error: {e}")
+            return web.Response(text="Error", status=500)
+
+    aio_app = web.Application()
+    aio_app.router.add_get("/",         health_handler)
+    aio_app.router.add_get("/health",   health_handler)
+    aio_app.router.add_post("/webhook", webhook_handler)
+
+    runner = web.AppRunner(aio_app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info(f"Web server running on port {port}")
+    logger.info("Bot fully running. Waiting for Telegram updates via webhook.")
+
+    # ── Keep running forever ─────────────────────────────────────────────────
+    try:
+        await asyncio.Event().wait()
+    except asyncio.CancelledError:
+        pass
+    finally:
+        logger.info("Shutting down gracefully...")
+        await app.stop()
+        await app.shutdown()
+        await runner.cleanup()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user.")
+    except Exception as exc:
+        logger.error(f"Fatal startup error: {exc}", exc_info=True)
