@@ -77,15 +77,16 @@ logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  BYBIT CLIENT
-#  Bybit Demo Trading uses a dedicated endpoint: api-demo.bybit.com
-#  pybit 5.6.2 does not have a demo= param, so we pass the base URL directly.
+#  Bybit Demo Trading uses endpoint: https://api-demo.bybit.com
+#  pybit 5.6.2 builds URL from self.endpoint — we override it after init.
 # ─────────────────────────────────────────────────────────────────────────────
 bybit = HTTP(
     testnet=False,
     api_key=BYBIT_KEY,
     api_secret=BYBIT_SECRET,
-    base_url="https://api-demo.bybit.com",   # Bybit Demo Trading endpoint
 )
+# Override endpoint to point at Bybit Demo Trading (not live, not testnet)
+bybit.endpoint = "https://api-demo.bybit.com"
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  STATE MANAGEMENT
