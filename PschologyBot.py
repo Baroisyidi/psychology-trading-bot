@@ -197,21 +197,10 @@ def get_balance_usdt() -> float:
     try:
         resp = bybit.get_wallet_balance(accountType="UNIFIED", coin="USDT")
         coins = resp["result"]["list"][0]["coin"]
-        logger.info(f"[BALANCE] Raw coins response: {coins}")
         for c in coins:
             if c["coin"] == "USDT":
-                # Bybit Demo sometimes returns "" instead of "0" for unused fields
-                raw = c.get("availableToWithdraw") or c.get("walletBalance") or "0"
-                val = float(raw) if str(raw).strip() != "" else 0.0
-                logger.info(f"[BALANCE] USDT balance: {val}")
-                return val
-        # Coin list empty — Demo account not yet funded or wrong accountType
-        # Try CONTRACT as fallback (some Demo accounts use this)
-        resp2 = bybit.get_wallet_balance(accountType="CONTRACT", coin="USDT")
-        coins2 = resp2["result"]["list"][0]["coin"]
-        for c in coins2:
-            if c["coin"] == "USDT":
-                raw = c.get("availableToWithdraw") or c.get("walletBalance") or "0"
+                # Bybit Demo returns "" for availableToWithdraw — use walletBalance instead
+                raw = c.get("walletBalance") or c.get("availableToWithdraw") or "0"
                 return float(raw) if str(raw).strip() != "" else 0.0
         return 0.0
     except Exception as e:
@@ -994,9 +983,10 @@ async def monitor_loop(app) -> None:
 
             # ── Circuit breakers ────────────────────────────────────────────
             paused_by_circuit = False
-            if state["daily_loss"] <= -0.04 * get_balance_usdt():
+            _bal = get_balance_usdt()   # fetch once per cycle
+            if state["daily_loss"] <= -0.04 * _bal:
                 paused_by_circuit = True
-            if state["weekly_loss"] <= -0.06 * get_balance_usdt():
+            if state["weekly_loss"] <= -0.06 * _bal:
                 paused_by_circuit = True
             if state["consec_losses"] >= 3:
                 paused_by_circuit = True
