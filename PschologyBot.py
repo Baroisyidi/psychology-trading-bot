@@ -193,13 +193,26 @@ def get_klines(symbol: str, interval: str, limit: int = 300) -> Optional[pd.Data
 
 
 def get_balance_usdt() -> float:
-    """Return available USDT balance on Bybit (unified account)."""
+    """Return available USDT balance on Bybit Demo (unified account)."""
     try:
         resp = bybit.get_wallet_balance(accountType="UNIFIED", coin="USDT")
         coins = resp["result"]["list"][0]["coin"]
+        logger.info(f"[BALANCE] Raw coins response: {coins}")
         for c in coins:
             if c["coin"] == "USDT":
-                return float(c["availableToWithdraw"])
+                # Bybit Demo sometimes returns "" instead of "0" for unused fields
+                raw = c.get("availableToWithdraw") or c.get("walletBalance") or "0"
+                val = float(raw) if str(raw).strip() != "" else 0.0
+                logger.info(f"[BALANCE] USDT balance: {val}")
+                return val
+        # Coin list empty — Demo account not yet funded or wrong accountType
+        # Try CONTRACT as fallback (some Demo accounts use this)
+        resp2 = bybit.get_wallet_balance(accountType="CONTRACT", coin="USDT")
+        coins2 = resp2["result"]["list"][0]["coin"]
+        for c in coins2:
+            if c["coin"] == "USDT":
+                raw = c.get("availableToWithdraw") or c.get("walletBalance") or "0"
+                return float(raw) if str(raw).strip() != "" else 0.0
         return 0.0
     except Exception as e:
         logger.error(f"get_balance_usdt: {e}")
