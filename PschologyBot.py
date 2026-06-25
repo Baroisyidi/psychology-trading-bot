@@ -823,6 +823,52 @@ async def cmd_balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         f"💰 Balance: <code>{bal:.2f} USDT</code>", parse_mode="HTML")
 
+
+@owner_only
+async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Run indicator scan right now and report which filters pass/fail."""
+    state = load_state()
+    symbols = list(state["symbols"])
+    if not symbols:
+        await update.message.reply_text("No symbols monitored. Use /add_symbol first.")
+        return
+    await update.message.reply_text(f"Scanning {len(symbols)} symbol(s)...")
+
+    for symbol in symbols:
+        df_1d, df_4h, df_1h = await asyncio.gather(
+            get_klines(symbol, "D",   300),
+            get_klines(symbol, "240", 300),
+            get_klines(symbol, "60",  100),
+        )
+        if df_1d is None or df_4h is None or df_1h is None:
+            await update.message.reply_text(f"{symbol}: Failed to fetch candles.")
+            continue
+
+        for direction in ("LONG", "SHORT"):
+            ind = await asyncio.to_thread(
+                _compute_all_indicators, df_1d, df_4h, df_1h, direction)
+            d   = ind["debug"]
+            e   = "LONG" if direction == "LONG" else "SHORT"
+            status  = "ENTRY SIGNAL!" if ind["should_enter"] else "No entry yet"
+            p_str   = " | ".join([f"YES:{p}" for p in ind["passed"]])
+            f_str   = " | ".join([f"NO:{p}"  for p in ind["failed"]])
+            emas    = d.get("emas_daily", {})
+            macd_h  = d.get("macd", {}).get("hist", "?")
+            lines = [
+                f"{symbol} {e} — {status}",
+                f"Score: {ind['score']}/8",
+                f"Price: {d.get('price','?'):.2f}",
+                f"ADX: {d.get('adx','?')} | RSI: {d.get('rsi_4h','?')} | ST: {d.get('supertrend_4h','?')}",
+                f"EMA20D:{emas.get(20,'?'):.0f} EMA50D:{emas.get(50,'?'):.0f} EMA100D:{emas.get(100,'?'):.0f} EMA200D:{emas.get(200,'?'):.0f}",
+                f"Cloud top:{d.get('cloud_top','?'):.0f} bot:{d.get('cloud_bot','?'):.0f}",
+                f"EMA50(4H):{d.get('ema50_4h','?'):.0f} EMA100(4H):{d.get('ema100_4h','?'):.0f}",
+                f"MACD hist:{macd_h}",
+                f"PASSED: {p_str or 'none'}",
+                f"FAILED: {f_str or 'none'}",
+            ]
+            await update.message.reply_text("\n".join(lines))
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  STARTUP — Webhook + aiohttp (Render Web Service)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -845,6 +891,7 @@ async def main() -> None:
     app.add_handler(CommandHandler("pause",          cmd_pause))
     app.add_handler(CommandHandler("resume",         cmd_resume))
     app.add_handler(CommandHandler("balance",        cmd_balance))
+    app.add_handler(CommandHandler("scan",           cmd_scan))
 
     base_url    = os.environ.get("RENDER_EXTERNAL_HOSTNAME",
                                  "psychology-trading-bot.onrender.com")
