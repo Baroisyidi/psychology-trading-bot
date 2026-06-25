@@ -1,10 +1,14 @@
 """
-PsychologyBot v1
+PsychologyBot v2
 ─────────────────────────────────────────────────────────────────────────────
 Multi-symbol Bybit Demo trading bot controlled via Telegram.
-Strategy: Multi-timeframe confluence (Daily + 4H + 1H)
+Strategy : Multi-timeframe confluence (Daily + 4H + 1H)
 Leverage : 10x on all trades
 Position : 20% of account balance per symbol
+
+KEY FIX v2: All Bybit API calls and pandas calculations run in a background
+thread pool so they NEVER block the asyncio event loop. Telegram commands
+respond instantly even while the bot is scanning indicators.
 ─────────────────────────────────────────────────────────────────────────────
 """
 
@@ -13,6 +17,7 @@ import json
 import asyncio
 import logging
 import time
+import concurrent.futures
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -23,11 +28,14 @@ from dotenv import load_dotenv
 from pybit.unified_trading import HTTP
 from aiohttp import web
 from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-)
+from telegram.ext import Application, CommandHandler, ContextTypes
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  THREAD POOL — all blocking calls (Bybit REST + pandas) run here
+#  This is the core fix: keeps asyncio event loop free for Telegram commands
+# ─────────────────────────────────────────────────────────────────────────────
+_executor = concurrent.futures.ThreadPoolExecutor(max_workers=16)
+_api_semaphore: Optional[asyncio.Semaphore] = None   # init after event loop starts
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  CONFIGURATION
@@ -38,33 +46,25 @@ TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN")
 OWNER_ID         = int(os.getenv("CHAT_ID", "0"))
 BYBIT_KEY        = os.getenv("BYBIT_API_KEY")
 BYBIT_SECRET     = os.getenv("BYBIT_API_SECRET")
-BYBIT_TESTNET    = os.getenv("BYBIT_TESTNET", "True").lower() == "true"
-
 STATE_FILE       = os.getenv("STATE_FILE", "/opt/render/project/src/bot_state.json")
+
 LEVERAGE         = 10
-POSITION_PCT     = 0.20          # 20 % of balance per symbol
-MONITOR_INTERVAL = 10            # seconds between price/position checks
-CANDLE_1H_SEC    = 3600
-CANDLE_4H_SEC    = 14400
-CANDLE_1D_SEC    = 86400
+POSITION_PCT     = 0.20       # 20% of balance per symbol
+MONITOR_INTERVAL = 10         # seconds per monitoring cycle
 
-# Indicator parameters
-ADX_PERIOD       = 14
-RSI_PERIOD       = 14
-EMA_PERIODS      = [20, 50, 100, 200]
-MACD_FAST        = 12
-MACD_SLOW        = 26
-MACD_SIG         = 9
-ST_PERIOD        = 10            # Supertrend ATR period
-ST_MULTIPLIER    = 3.0           # Supertrend multiplier
-ICHI_CONV        = 9
-ICHI_BASE        = 26
-ICHI_SPAN        = 52
+# Indicator params
+ADX_PERIOD    = 14
+RSI_PERIOD    = 14
+EMA_PERIODS   = [20, 50, 100, 200]
+MACD_FAST, MACD_SLOW, MACD_SIG = 12, 26, 9
+ST_PERIOD     = 10
+ST_MULT       = 3.0
+ICHI_CONV     = 9
+ICHI_BASE     = 26
+ICHI_SPAN     = 52
 
-# Risk / SL
-SL_BUFFER_PCT    = 0.02          # 2 % breathing room on initial SL
-TRAIL_BUFFER_PCT = 0.003         # 0.3 % buffer on trailing SL
-DEAD_TRADE_DAYS  = 7             # close if TP1 not hit after 7 days
+SL_BUFFER     = 0.02    # 2% breathing room on SL
+DEAD_DAYS     = 7       # close dead trade after 7 days
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  LOGGING
@@ -76,72 +76,43 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  BYBIT CLIENT
-#  Bybit Demo Trading uses endpoint: https://api-demo.bybit.com
-#  pybit 5.6.2 builds URL from self.endpoint — we override it after init.
+#  BYBIT CLIENT — Demo Trading endpoint
 # ─────────────────────────────────────────────────────────────────────────────
-bybit = HTTP(
-    testnet=False,
-    api_key=BYBIT_KEY,
-    api_secret=BYBIT_SECRET,
-)
-# Override endpoint to point at Bybit Demo Trading (not live, not testnet)
-bybit.endpoint = "https://api-demo.bybit.com"
+bybit = HTTP(testnet=False, api_key=BYBIT_KEY, api_secret=BYBIT_SECRET)
+bybit.endpoint = "https://api-demo.bybit.com"   # Demo Trading URL
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  STATE MANAGEMENT
+#  STATE
 # ─────────────────────────────────────────────────────────────────────────────
-# Schema for each open position stored in state:
-# {
-#   "symbol":        str,
-#   "direction":     "LONG" | "SHORT",
-#   "entry_price":   float,
-#   "sl_price":      float,
-#   "tp1_price":     float,
-#   "tp2_price":     float,
-#   "original_qty":  float,
-#   "remaining_qty": float,
-#   "tp1_hit":       bool,
-#   "tp2_hit":       bool,
-#   "entry_time":    float (unix timestamp),
-#   "score":         int,
-#   "filters_passed": list[str],
-# }
-
 def _default_state() -> dict:
     return {
-        "symbols":    [],          # monitored symbols
-        "positions":  {},          # symbol -> position dict
-        "paused":     False,       # if True no new entries
-        "daily_loss": 0.0,         # realised loss today (negative)
-        "weekly_loss":0.0,
-        "consec_losses": 0,
-        "last_reset_day":  "",     # date string for daily reset
-        "last_reset_week": "",     # ISO week string
+        "symbols":        [],
+        "positions":      {},
+        "paused":         False,
+        "daily_loss":     0.0,
+        "weekly_loss":    0.0,
+        "consec_losses":  0,
+        "last_reset_day": "",
+        "last_reset_week":"",
     }
-
 
 def load_state() -> dict:
     try:
-        with open(STATE_FILE, "r") as f:
-            state = json.load(f)
-        # Back-fill missing keys from schema upgrades
-        default = _default_state()
-        for k, v in default.items():
-            state.setdefault(k, v)
-        return state
-    except (FileNotFoundError, json.JSONDecodeError):
+        with open(STATE_FILE) as f:
+            s = json.load(f)
+        for k, v in _default_state().items():
+            s.setdefault(k, v)
+        return s
+    except Exception:
         return _default_state()
-
 
 def save_state(state: dict) -> None:
     os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-#  OWNER-ONLY GUARD
+#  OWNER GUARD
 # ─────────────────────────────────────────────────────────────────────────────
 def owner_only(func):
     async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -152,632 +123,392 @@ def owner_only(func):
     wrapper.__name__ = func.__name__
     return wrapper
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-#  BYBIT HELPERS
+#  SYNCHRONOUS BYBIT HELPERS — called via asyncio.to_thread()
+#  NEVER call these directly from async code without to_thread()
 # ─────────────────────────────────────────────────────────────────────────────
-def get_klines(symbol: str, interval: str, limit: int = 300) -> Optional[pd.DataFrame]:
-    """
-    Fetch OHLCV candles from Bybit.
-    interval: "D" | "240" | "60"
-    Returns DataFrame with columns: open, high, low, close, volume (float)
-    sorted oldest → newest.
-    """
+def _sync_get_balance() -> float:
+    """Fetch USDT wallet balance (synchronous — run in thread)."""
     try:
-        resp = bybit.get_kline(
-            category="linear",
-            symbol=symbol,
-            interval=interval,
-            limit=limit,
-        )
-        raw = resp["result"]["list"]
-        if not raw:
-            return None
-        df = pd.DataFrame(raw, columns=[
-            "timestamp", "open", "high", "low", "close", "volume", "turnover"
-        ])
-        df = df.astype({
-            "timestamp": "int64",
-            "open": "float64",
-            "high": "float64",
-            "low":  "float64",
-            "close":"float64",
-            "volume":"float64",
-        })
-        df.sort_values("timestamp", inplace=True)
-        df.reset_index(drop=True, inplace=True)
-        return df
-    except Exception as e:
-        logger.error(f"get_klines({symbol},{interval}): {e}")
-        return None
-
-
-def get_balance_usdt() -> float:
-    """Return available USDT balance on Bybit Demo (unified account)."""
-    try:
-        resp = bybit.get_wallet_balance(accountType="UNIFIED", coin="USDT")
+        resp  = bybit.get_wallet_balance(accountType="UNIFIED", coin="USDT")
         coins = resp["result"]["list"][0]["coin"]
         for c in coins:
             if c["coin"] == "USDT":
-                # Bybit Demo returns "" for availableToWithdraw — use walletBalance instead
                 raw = c.get("walletBalance") or c.get("availableToWithdraw") or "0"
-                return float(raw) if str(raw).strip() != "" else 0.0
+                return float(raw) if str(raw).strip() else 0.0
         return 0.0
     except Exception as e:
-        logger.error(f"get_balance_usdt: {e}")
+        logger.error(f"_sync_get_balance: {e}")
         return 0.0
 
-
-def get_current_price(symbol: str) -> float:
+def _sync_get_price(symbol: str) -> float:
+    """Fetch latest price (synchronous — run in thread)."""
     try:
         resp = bybit.get_tickers(category="linear", symbol=symbol)
         return float(resp["result"]["list"][0]["lastPrice"])
     except Exception as e:
-        logger.error(f"get_current_price({symbol}): {e}")
+        logger.error(f"_sync_get_price({symbol}): {e}")
         return 0.0
 
-
-def set_leverage(symbol: str) -> None:
+def _sync_get_klines(symbol: str, interval: str, limit: int = 300) -> Optional[pd.DataFrame]:
+    """Fetch OHLCV candles (synchronous — run in thread)."""
     try:
-        bybit.set_leverage(
-            category="linear",
-            symbol=symbol,
-            buyLeverage=str(LEVERAGE),
-            sellLeverage=str(LEVERAGE),
-        )
+        resp = bybit.get_kline(category="linear", symbol=symbol,
+                               interval=interval, limit=limit)
+        raw = resp["result"]["list"]
+        if not raw:
+            return None
+        df = pd.DataFrame(raw, columns=[
+            "timestamp","open","high","low","close","volume","turnover"])
+        for col in ["open","high","low","close","volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df["timestamp"] = df["timestamp"].astype("int64")
+        df.sort_values("timestamp", inplace=True)
+        df.reset_index(drop=True, inplace=True)
+        return df
     except Exception as e:
-        logger.warning(f"set_leverage({symbol}): {e}")
-
-
-def place_market_order(symbol: str, side: str, qty: float) -> Optional[dict]:
-    """side: 'Buy' | 'Sell'"""
-    try:
-        resp = bybit.place_order(
-            category="linear",
-            symbol=symbol,
-            side=side,
-            orderType="Market",
-            qty=str(qty),
-            timeInForce="GoodTillCancel",
-            reduceOnly=False,
-        )
-        return resp["result"]
-    except Exception as e:
-        logger.error(f"place_market_order({symbol},{side},{qty}): {e}")
+        logger.error(f"_sync_get_klines({symbol},{interval}): {e}")
         return None
 
-
-def place_reduce_order(symbol: str, side: str, qty: float) -> Optional[dict]:
-    """Partial close (reduce-only)."""
-    try:
-        resp = bybit.place_order(
-            category="linear",
-            symbol=symbol,
-            side=side,
-            orderType="Market",
-            qty=str(qty),
-            timeInForce="GoodTillCancel",
-            reduceOnly=True,
-        )
-        return resp["result"]
-    except Exception as e:
-        logger.error(f"place_reduce_order({symbol},{side},{qty}): {e}")
-        return None
-
-
-def set_trading_stop(symbol: str, stop_loss: float, position_idx: int = 0) -> None:
-    try:
-        bybit.set_trading_stop(
-            category="linear",
-            symbol=symbol,
-            stopLoss=str(round(stop_loss, 6)),
-            positionIdx=position_idx,
-        )
-    except Exception as e:
-        logger.error(f"set_trading_stop({symbol},{stop_loss}): {e}")
-
-
-def close_full_position(symbol: str, direction: str) -> None:
-    """Market-close the entire position."""
-    close_side = "Sell" if direction == "LONG" else "Buy"
-    try:
-        resp = bybit.get_positions(category="linear", symbol=symbol)
-        positions = resp["result"]["list"]
-        for pos in positions:
-            size = float(pos.get("size", 0))
-            if size > 0:
-                place_reduce_order(symbol, close_side, size)
-                return
-    except Exception as e:
-        logger.error(f"close_full_position({symbol}): {e}")
-
-
-def get_min_qty(symbol: str) -> float:
-    """Fetch minimum order quantity for a symbol."""
+def _sync_get_min_qty(symbol: str) -> float:
     try:
         resp = bybit.get_instruments_info(category="linear", symbol=symbol)
-        lot = resp["result"]["list"][0]["lotSizeFilter"]
+        lot  = resp["result"]["list"][0]["lotSizeFilter"]
         return float(lot["minOrderQty"])
     except Exception:
         return 0.001
 
+def _sync_set_leverage(symbol: str) -> None:
+    try:
+        bybit.set_leverage(category="linear", symbol=symbol,
+                           buyLeverage=str(LEVERAGE), sellLeverage=str(LEVERAGE))
+    except Exception as e:
+        logger.warning(f"set_leverage({symbol}): {e}")
 
-def round_qty(qty: float, symbol: str) -> float:
-    min_q = get_min_qty(symbol)
-    # Round down to the step size
-    step = min_q
-    return max(min_q, round(qty // step * step, 8))
+def _sync_place_order(symbol: str, side: str, qty: float,
+                      reduce_only: bool = False) -> Optional[dict]:
+    try:
+        resp = bybit.place_order(
+            category="linear", symbol=symbol,
+            side=side, orderType="Market", qty=str(qty),
+            timeInForce="GoodTillCancel", reduceOnly=reduce_only,
+        )
+        return resp["result"]
+    except Exception as e:
+        logger.error(f"_sync_place_order({symbol},{side},{qty}): {e}")
+        return None
 
+def _sync_set_sl(symbol: str, sl_price: float) -> None:
+    try:
+        bybit.set_trading_stop(
+            category="linear", symbol=symbol,
+            stopLoss=str(round(sl_price, 6)), positionIdx=0,
+        )
+    except Exception as e:
+        logger.error(f"_sync_set_sl({symbol},{sl_price}): {e}")
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  INDICATOR CALCULATIONS
-# ─────────────────────────────────────────────────────────────────────────────
-def calc_ema(df: pd.DataFrame, period: int) -> pd.Series:
-    return df["close"].ewm(span=period, adjust=False).mean()
-
-
-def calc_adx(df: pd.DataFrame, period: int = ADX_PERIOD) -> float:
-    adx = ta.adx(df["high"], df["low"], df["close"], length=period)
-    col = f"ADX_{period}"
-    if adx is None or col not in adx.columns:
-        return 0.0
-    return float(adx[col].iloc[-1])
-
-
-def calc_rsi(df: pd.DataFrame, period: int = RSI_PERIOD) -> float:
-    rsi = ta.rsi(df["close"], length=period)
-    if rsi is None:
-        return 50.0
-    return float(rsi.iloc[-1])
-
-
-def calc_supertrend(df: pd.DataFrame) -> str:
-    """Returns 'BUY' (green/up) or 'SELL' (red/down)."""
-    st = ta.supertrend(
-        df["high"], df["low"], df["close"],
-        length=ST_PERIOD, multiplier=ST_MULTIPLIER
-    )
-    if st is None:
-        return "NONE"
-    dir_col = f"SUPERTd_{ST_PERIOD}_{ST_MULTIPLIER}"
-    if dir_col not in st.columns:
-        return "NONE"
-    val = int(st[dir_col].iloc[-1])
-    return "BUY" if val == 1 else "SELL"
-
-
-def calc_macd(df: pd.DataFrame):
-    """Returns (macd_line, signal_line, histogram) as floats for latest bar."""
-    macd = ta.macd(df["close"], fast=MACD_FAST, slow=MACD_SLOW, signal=MACD_SIG)
-    if macd is None:
-        return 0.0, 0.0, 0.0
-    m = float(macd[f"MACD_{MACD_FAST}_{MACD_SLOW}_{MACD_SIG}"].iloc[-1])
-    s = float(macd[f"MACDs_{MACD_FAST}_{MACD_SLOW}_{MACD_SIG}"].iloc[-1])
-    h = float(macd[f"MACDh_{MACD_FAST}_{MACD_SLOW}_{MACD_SIG}"].iloc[-1])
-    return m, s, h
-
-
-def calc_macd_crossed(df: pd.DataFrame, direction: str) -> bool:
-    """
-    True if MACD crossed bullish (for LONG) or bearish (for SHORT)
-    on the last completed candle, confirmed by histogram direction.
-    We look at the last 2 bars.
-    """
-    macd = ta.macd(df["close"], fast=MACD_FAST, slow=MACD_SLOW, signal=MACD_SIG)
-    if macd is None or len(macd) < 2:
-        return False
-    mcol = f"MACD_{MACD_FAST}_{MACD_SLOW}_{MACD_SIG}"
-    scol = f"MACDs_{MACD_FAST}_{MACD_SLOW}_{MACD_SIG}"
-    hcol = f"MACDh_{MACD_FAST}_{MACD_SLOW}_{MACD_SIG}"
-    m_prev = float(macd[mcol].iloc[-2])
-    s_prev = float(macd[scol].iloc[-2])
-    m_cur  = float(macd[mcol].iloc[-1])
-    s_cur  = float(macd[scol].iloc[-1])
-    h_cur  = float(macd[hcol].iloc[-1])
-    if direction == "LONG":
-        crossed = (m_prev < s_prev) and (m_cur >= s_cur)
-        return crossed and h_cur > 0
-    else:
-        crossed = (m_prev > s_prev) and (m_cur <= s_cur)
-        return crossed and h_cur < 0
-
-
-def calc_ichimoku_cloud(df: pd.DataFrame):
-    """
-    Returns (senkou_a, senkou_b) for the CURRENT bar
-    by shifting span_b forward 26 periods (standard Ichimoku).
-    We use the close-side cloud values.
-    """
-    conv  = (df["high"].rolling(ICHI_CONV).max() + df["low"].rolling(ICHI_CONV).min()) / 2
-    base  = (df["high"].rolling(ICHI_BASE).max() + df["low"].rolling(ICHI_BASE).min()) / 2
-    span_a = ((conv + base) / 2).shift(ICHI_BASE)
-    span_b = ((df["high"].rolling(ICHI_SPAN).max() + df["low"].rolling(ICHI_SPAN).min()) / 2).shift(ICHI_BASE)
-    sa = float(span_a.iloc[-1])
-    sb = float(span_b.iloc[-1])
-    return sa, sb
-
-
-def calc_emas(df: pd.DataFrame):
-    """Returns dict {period: latest_ema_value}."""
-    return {p: float(calc_ema(df, p).iloc[-1]) for p in EMA_PERIODS}
-
-
-def is_bullish_1h_candle(df_1h: pd.DataFrame) -> bool:
-    """
-    Bullish 1H candle:
-    - close > open (green)
-    - body size >= 0.3% of price
-    - close in upper 50% of candle range
-    """
-    c = df_1h.iloc[-1]
-    body  = c["close"] - c["open"]
-    rng   = c["high"] - c["low"]
-    if body <= 0:
-        return False
-    if rng == 0:
-        return False
-    body_pct = body / c["open"]
-    upper_half = c["close"] >= (c["high"] + c["low"]) / 2
-    return body_pct >= 0.003 and upper_half
-
-
-def is_bearish_1h_candle(df_1h: pd.DataFrame) -> bool:
-    """
-    Bearish 1H candle:
-    - close < open (red)
-    - body size >= 0.3% of price
-    - close in lower 50% of candle range
-    """
-    c = df_1h.iloc[-1]
-    body  = c["open"] - c["close"]
-    rng   = c["high"] - c["low"]
-    if body <= 0:
-        return False
-    if rng == 0:
-        return False
-    body_pct = body / c["open"]
-    lower_half = c["close"] <= (c["high"] + c["low"]) / 2
-    return body_pct >= 0.003 and lower_half
-
-
-def price_near_ema(price: float, ema_val: float, threshold: float = 0.01) -> bool:
-    """True if price is within threshold% of the EMA."""
-    return abs(price - ema_val) / ema_val <= threshold
-
+def _sync_close_position(symbol: str, direction: str) -> None:
+    try:
+        close_side = "Sell" if direction == "LONG" else "Buy"
+        resp = bybit.get_positions(category="linear", symbol=symbol)
+        for pos in resp["result"]["list"]:
+            size = float(pos.get("size", 0))
+            if size > 0:
+                _sync_place_order(symbol, close_side, size, reduce_only=True)
+                return
+    except Exception as e:
+        logger.error(f"_sync_close_position({symbol}): {e}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  SIGNAL SCORING ENGINE
+#  ASYNC WRAPPERS — these are safe to await from the event loop
 # ─────────────────────────────────────────────────────────────────────────────
-def evaluate_filters(symbol: str, direction: str) -> tuple[int, list[str], list[str], dict]:
+async def get_balance() -> float:
+    async with _api_semaphore:
+        return await asyncio.to_thread(_sync_get_balance)
+
+async def get_price(symbol: str) -> float:
+    async with _api_semaphore:
+        return await asyncio.to_thread(_sync_get_price, symbol)
+
+async def get_klines(symbol: str, interval: str,
+                     limit: int = 300) -> Optional[pd.DataFrame]:
+    async with _api_semaphore:
+        return await asyncio.to_thread(_sync_get_klines, symbol, interval, limit)
+
+async def set_leverage(symbol: str) -> None:
+    async with _api_semaphore:
+        await asyncio.to_thread(_sync_set_leverage, symbol)
+
+async def place_order(symbol: str, side: str, qty: float,
+                      reduce_only: bool = False) -> Optional[dict]:
+    async with _api_semaphore:
+        return await asyncio.to_thread(_sync_place_order, symbol, side, qty, reduce_only)
+
+async def set_sl(symbol: str, sl_price: float) -> None:
+    async with _api_semaphore:
+        await asyncio.to_thread(_sync_set_sl, symbol, sl_price)
+
+async def close_position(symbol: str, direction: str) -> None:
+    async with _api_semaphore:
+        await asyncio.to_thread(_sync_close_position, symbol, direction)
+
+async def get_min_qty(symbol: str) -> float:
+    async with _api_semaphore:
+        return await asyncio.to_thread(_sync_get_min_qty, symbol)
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  INDICATOR ENGINE — all heavy pandas work runs in thread via to_thread()
+# ─────────────────────────────────────────────────────────────────────────────
+def _compute_all_indicators(
+    df_1d: pd.DataFrame,
+    df_4h: pd.DataFrame,
+    df_1h: pd.DataFrame,
+    direction: str,
+) -> dict:
     """
-    Evaluates all 8 entry filters for the given direction.
-    Returns:
-        score          : total filters passed (int)
-        passed         : list of filter names that passed
-        failed         : list of filter names that failed
-        debug          : dict with raw indicator values
+    Pure synchronous function — heavy pandas math.
+    Called via asyncio.to_thread() so it never blocks the event loop.
+    Returns a dict with all filter results and raw values.
     """
-    passed = []
-    failed = []
-    debug  = {}
-
-    # ── Fetch candles ───────────────────────────────────────────────────────
-    df_1d  = get_klines(symbol, "D",   300)
-    df_4h  = get_klines(symbol, "240", 300)
-    df_1h  = get_klines(symbol, "60",  100)
-
-    if df_1d is None or df_4h is None or df_1h is None:
-        logger.warning(f"[{symbol}] Failed to fetch candles")
-        return 0, [], ["DATA_FETCH_FAILED"], {}
-
-    price = float(df_1d["close"].iloc[-1])
+    passed  = []
+    failed  = []
+    debug   = {}
+    price   = float(df_1d["close"].iloc[-1])
     debug["price"] = price
 
-    # ── Filter 1: ADX > 20 (use 4H for responsiveness) ─────────────────────
-    adx = calc_adx(df_4h)
+    # ── Helper: EMA ───────────────────────────────────────────────────────────
+    def ema(df: pd.DataFrame, p: int) -> pd.Series:
+        return df["close"].ewm(span=p, adjust=False).mean()
+
+    # ── Filter 1: ADX > 20 (4H) ──────────────────────────────────────────────
+    try:
+        adx_df = ta.adx(df_4h["high"], df_4h["low"], df_4h["close"],
+                        length=ADX_PERIOD)
+        adx = float(adx_df[f"ADX_{ADX_PERIOD}"].iloc[-1])
+    except Exception:
+        adx = 0.0
     debug["adx"] = round(adx, 2)
     if adx > 20:
         passed.append("ADX>20")
     else:
         failed.append("ADX>20")
 
-    # ── Filter 2: Ichimoku Cloud (Daily) ───────────────────────────────────
-    sa, sb = calc_ichimoku_cloud(df_1d)
-    cloud_top = max(sa, sb)
-    cloud_bot = min(sa, sb)
+    # ── Filter 2: Ichimoku Cloud (Daily) ─────────────────────────────────────
+    conv  = (df_1d["high"].rolling(ICHI_CONV).max()  + df_1d["low"].rolling(ICHI_CONV).min())  / 2
+    base  = (df_1d["high"].rolling(ICHI_BASE).max()  + df_1d["low"].rolling(ICHI_BASE).min())  / 2
+    spa   = ((conv + base) / 2).shift(ICHI_BASE)
+    spb   = ((df_1d["high"].rolling(ICHI_SPAN).max() + df_1d["low"].rolling(ICHI_SPAN).min()) / 2).shift(ICHI_BASE)
+    cloud_top = max(float(spa.iloc[-1]), float(spb.iloc[-1]))
+    cloud_bot = min(float(spa.iloc[-1]), float(spb.iloc[-1]))
     debug["cloud_top"] = round(cloud_top, 2)
     debug["cloud_bot"] = round(cloud_bot, 2)
     if direction == "LONG":
-        ichi_ok = price > cloud_top
-        label = "IchiAboveCloud"
+        ichi_ok = price > cloud_top; lbl = "IchiAboveCloud"
     else:
-        ichi_ok = price < cloud_bot
-        label = "IchiBelowCloud"
-    if ichi_ok:
-        passed.append(label)
-    else:
-        failed.append(label)
+        ichi_ok = price < cloud_bot; lbl = "IchiBelowCloud"
+    (passed if ichi_ok else failed).append(lbl)
 
-    # ── Filter 3: RSI not extreme (4H) ─────────────────────────────────────
-    rsi = calc_rsi(df_4h)
+    # ── Filter 3: RSI not extreme (4H) ───────────────────────────────────────
+    rsi_s = ta.rsi(df_4h["close"], length=RSI_PERIOD)
+    rsi   = float(rsi_s.iloc[-1]) if rsi_s is not None else 50.0
     debug["rsi_4h"] = round(rsi, 2)
     if direction == "LONG":
-        rsi_ok = rsi <= 70
-        label = "RSI<=70"
+        rsi_ok = rsi <= 70; lbl = "RSI<=70"
     else:
-        rsi_ok = rsi >= 30
-        label = "RSI>=30"
-    if rsi_ok:
-        passed.append(label)
-    else:
-        failed.append(label)
+        rsi_ok = rsi >= 30; lbl = "RSI>=30"
+    (passed if rsi_ok else failed).append(lbl)
 
-    # ── Filter 4: Supertrend (4H) ──────────────────────────────────────────
-    st = calc_supertrend(df_4h)
-    debug["supertrend_4h"] = st
+    # ── Filter 4: Supertrend (4H) ─────────────────────────────────────────────
+    try:
+        st = ta.supertrend(df_4h["high"], df_4h["low"], df_4h["close"],
+                           length=ST_PERIOD, multiplier=ST_MULT)
+        st_dir = int(st[f"SUPERTd_{ST_PERIOD}_{ST_MULT}"].iloc[-1])
+    except Exception:
+        st_dir = 0
+    debug["supertrend_4h"] = "BUY" if st_dir == 1 else "SELL"
     if direction == "LONG":
-        st_ok = st == "BUY"
-        label = "SupertrendBUY"
+        st_ok = st_dir == 1; lbl = "SupertrendBUY"
     else:
-        st_ok = st == "SELL"
-        label = "SupertrendSELL"
-    if st_ok:
-        passed.append(label)
-    else:
-        failed.append(label)
+        st_ok = st_dir == -1; lbl = "SupertrendSELL"
+    (passed if st_ok else failed).append(lbl)
 
-    # ── Filter 5 (MANDATORY): EMA alignment (Daily) ────────────────────────
-    emas = calc_emas(df_1d)
-    debug["emas_daily"] = {k: round(v, 2) for k, v in emas.items()}
-    e20, e50, e100, e200 = emas[20], emas[50], emas[100], emas[200]
+    # ── Filter 5 (MANDATORY): EMA alignment (Daily) ──────────────────────────
+    e20  = float(ema(df_1d, 20).iloc[-1])
+    e50  = float(ema(df_1d, 50).iloc[-1])
+    e100 = float(ema(df_1d, 100).iloc[-1])
+    e200 = float(ema(df_1d, 200).iloc[-1])
+    debug["emas_daily"] = {20: round(e20,2), 50: round(e50,2),
+                           100: round(e100,2), 200: round(e200,2)}
     if direction == "LONG":
         ema_ok = (e20 > e50 > e100 > e200) and (price > e50)
-        label = "EMA_Bullish_Stack"
+        lbl = "EMA_Bullish_Stack"
     else:
         ema_ok = (e20 < e50 < e100 < e200) and (price < e50)
-        label = "EMA_Bearish_Stack"
-    if ema_ok:
-        passed.append(label)
-    else:
-        failed.append(label)
+        lbl = "EMA_Bearish_Stack"
+    (passed if ema_ok else failed).append(lbl)
 
-    # ── Filter 6: MACD cross (Daily) ───────────────────────────────────────
-    macd_crossed = calc_macd_crossed(df_1d, direction)
-    # Also accept: MACD already in correct position (not just the cross moment)
-    m, s, h = calc_macd(df_1d)
-    debug["macd_line"] = round(m, 4)
-    debug["macd_signal"] = round(s, 4)
-    debug["macd_hist"] = round(h, 4)
+    # ── Filter 6: MACD (Daily) ────────────────────────────────────────────────
+    macd = ta.macd(df_1d["close"], fast=MACD_FAST, slow=MACD_SLOW, signal=MACD_SIG)
+    if macd is not None:
+        m   = float(macd[f"MACD_{MACD_FAST}_{MACD_SLOW}_{MACD_SIG}"].iloc[-1])
+        sig = float(macd[f"MACDs_{MACD_FAST}_{MACD_SLOW}_{MACD_SIG}"].iloc[-1])
+        h   = float(macd[f"MACDh_{MACD_FAST}_{MACD_SLOW}_{MACD_SIG}"].iloc[-1])
+    else:
+        m = sig = h = 0.0
+    debug["macd"] = {"line": round(m,4), "signal": round(sig,4), "hist": round(h,4)}
     if direction == "LONG":
-        macd_ok = (m > s) and (h > 0)
-        label = "MACD_Bullish"
+        macd_ok = (m > sig) and (h > 0); lbl = "MACD_Bullish"
     else:
-        macd_ok = (m < s) and (h < 0)
-        label = "MACD_Bearish"
-    if macd_ok:
-        passed.append(label)
-    else:
-        failed.append(label)
+        macd_ok = (m < sig) and (h < 0); lbl = "MACD_Bearish"
+    (passed if macd_ok else failed).append(lbl)
 
-    # ── Filter 7: Price near 4H EMA 50 or EMA 100 (pullback/rally) ─────────
-    emas_4h = calc_emas(df_4h)
-    e50_4h  = emas_4h[50]
-    e100_4h = emas_4h[100]
+    # ── Filter 7: Pullback to 4H EMA 50 or 100 ───────────────────────────────
+    e50_4h  = float(ema(df_4h, 50).iloc[-1])
+    e100_4h = float(ema(df_4h, 100).iloc[-1])
     debug["ema50_4h"]  = round(e50_4h, 2)
     debug["ema100_4h"] = round(e100_4h, 2)
-    near_50  = price_near_ema(price, e50_4h,  threshold=0.015)
-    near_100 = price_near_ema(price, e100_4h, threshold=0.015)
+    near_50  = abs(price - e50_4h)  / e50_4h  <= 0.015
+    near_100 = abs(price - e100_4h) / e100_4h <= 0.015
     pullback_ok = near_50 or near_100
-    if direction == "LONG":
-        label = "PullbackToEMA"
+    lbl = "PullbackToEMA" if direction == "LONG" else "RallyToEMA"
+    (passed if pullback_ok else failed).append(lbl)
+
+    # ── Filter 8 (MANDATORY): 1H candle ──────────────────────────────────────
+    c = df_1h.iloc[-1]
+    body = c["close"] - c["open"]
+    rng  = c["high"] - c["low"]
+    if rng == 0:
+        candle_ok = False
     else:
-        label = "RallyToEMA"
-    if pullback_ok:
-        passed.append(label)
-    else:
-        failed.append(label)
-
-    # ── Filter 8 (MANDATORY): 1H candle trigger ────────────────────────────
-    if direction == "LONG":
-        candle_ok = is_bullish_1h_candle(df_1h)
-        label = "Bullish1HCandle"
-    else:
-        candle_ok = is_bearish_1h_candle(df_1h)
-        label = "Bearish1HCandle"
-    if candle_ok:
-        passed.append(label)
-    else:
-        failed.append(label)
-
-    # ── Total score ─────────────────────────────────────────────────────────
-    score = len(passed)
-    return score, passed, failed, debug
-
-
-def check_entry_signal(symbol: str, direction: str) -> tuple[bool, int, list[str], list[str], dict]:
-    """
-    Returns (should_enter, score, passed, failed, debug).
-
-    Rules:
-    - Filter 5 (EMA_*_Stack) MUST be in passed
-    - Filter 8 (1H candle)   MUST be in passed
-    - At least 3 more from the remaining 6 must pass
-    - Total minimum = 5 (2 mandatory + 3 optional)
-    """
-    score, passed, failed, debug = evaluate_filters(symbol, direction)
-
-    mandatory_5_name = "EMA_Bullish_Stack" if direction == "LONG" else "EMA_Bearish_Stack"
-    mandatory_8_name = "Bullish1HCandle"   if direction == "LONG" else "Bearish1HCandle"
-
-    mandatory_5_ok = mandatory_5_name in passed
-    mandatory_8_ok = mandatory_8_name in passed
-
-    optional_names = {
-        "ADX>20", "IchiAboveCloud", "IchiBelowCloud",
-        "RSI<=70", "RSI>=30", "SupertrendBUY", "SupertrendSELL",
-        "MACD_Bullish", "MACD_Bearish", "PullbackToEMA", "RallyToEMA",
-    }
-    optional_passed = [p for p in passed if p in optional_names]
-
-    should_enter = (
-        mandatory_5_ok and
-        mandatory_8_ok and
-        len(optional_passed) >= 3
-    )
-    return should_enter, score, passed, failed, debug
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  STOP LOSS CALCULATOR
-# ─────────────────────────────────────────────────────────────────────────────
-def calc_initial_sl(entry: float, direction: str, symbol: str) -> float:
-    """
-    Tier 1 SL: Below EMA 100 on 4H (long) / Above EMA 100 on 4H (short).
-    With 1.5–2% breathing room.
-    """
-    df_4h = get_klines(symbol, "240", 200)
-    if df_4h is None:
+        body_pct   = abs(body) / c["open"]
+        close_pos  = (c["close"] - c["low"]) / rng  # 0=bottom, 1=top
         if direction == "LONG":
-            return entry * (1 - SL_BUFFER_PCT)
+            candle_ok = body > 0 and body_pct >= 0.003 and close_pos >= 0.5
+            lbl = "Bullish1HCandle"
         else:
-            return entry * (1 + SL_BUFFER_PCT)
+            candle_ok = body < 0 and body_pct >= 0.003 and close_pos <= 0.5
+            lbl = "Bearish1HCandle"
+    (passed if candle_ok else failed).append(lbl)
 
-    emas_4h = calc_emas(df_4h)
-    e100_4h = emas_4h[100]
+    # ── Check entry conditions ────────────────────────────────────────────────
+    m5_name = "EMA_Bullish_Stack" if direction == "LONG" else "EMA_Bearish_Stack"
+    m8_name = "Bullish1HCandle"   if direction == "LONG" else "Bearish1HCandle"
+    optional = [p for p in passed if p not in (m5_name, m8_name)]
+    should_enter = (m5_name in passed) and (m8_name in passed) and len(optional) >= 3
 
-    if direction == "LONG":
-        sl = min(e100_4h, entry * (1 - 0.015)) * (1 - SL_BUFFER_PCT)
-    else:
-        sl = max(e100_4h, entry * (1 + 0.015)) * (1 + SL_BUFFER_PCT)
-    return round(sl, 6)
+    return {
+        "should_enter": should_enter,
+        "score":        len(passed),
+        "passed":       passed,
+        "failed":       failed,
+        "debug":        debug,
+        "ema_daily":    {"e20": e20, "e50": e50, "e100": e100, "e200": e200},
+        "e50_4h":       e50_4h,
+        "e100_4h":      e100_4h,
+    }
 
+def _compute_ema_exit(df_1d: pd.DataFrame, direction: str) -> bool:
+    """Check EMA inversion on completed Daily candles (synchronous)."""
+    try:
+        df = df_1d.iloc[:-1]   # exclude forming candle
+        def ema(p): return float(df["close"].ewm(span=p, adjust=False).mean().iloc[-1])
+        e20, e50, e100, e200 = ema(20), ema(50), ema(100), ema(200)
+        if direction == "LONG":
+            return (e20 < e50) or (e50 < e100) or (e100 < e200)
+        else:
+            return (e20 > e50) or (e50 > e100) or (e100 > e200)
+    except Exception:
+        return False
 
-def calc_tp_levels(entry: float, sl: float, direction: str) -> tuple[float, float]:
-    """TP1 = 1:1.5 RR, TP2 = 1:3 RR."""
-    risk = abs(entry - sl)
-    if direction == "LONG":
-        tp1 = entry + risk * 1.5
-        tp2 = entry + risk * 3.0
-    else:
-        tp1 = entry - risk * 1.5
-        tp2 = entry - risk * 3.0
-    return round(tp1, 6), round(tp2, 6)
-
+def _compute_trailing_sl(df_4h: pd.DataFrame, direction: str, cur_sl: float) -> Optional[float]:
+    """Compute new trailing SL from last completed 4H candle (synchronous)."""
+    try:
+        last = df_4h.iloc[-2]
+        if direction == "LONG":
+            candidate = float(last["low"])
+            return round(candidate, 6) if candidate > cur_sl else None
+        else:
+            candidate = float(last["high"])
+            return round(candidate, 6) if candidate < cur_sl else None
+    except Exception:
+        return None
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  POSITION SIZING
 # ─────────────────────────────────────────────────────────────────────────────
-def calc_position_qty(symbol: str, entry_price: float) -> float:
-    """
-    Use 20% of account balance with 10x leverage.
-    qty = (balance * 0.20 * leverage) / entry_price
-    """
-    balance = get_balance_usdt()
-    notional = balance * POSITION_PCT * LEVERAGE
-    qty = notional / entry_price
-    return round_qty(qty, symbol)
+def _round_qty(qty: float, min_q: float) -> float:
+    return max(min_q, round(qty // min_q * min_q, 8))
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  EXIT RULE CHECK (EMA inversion on Daily)
-# ─────────────────────────────────────────────────────────────────────────────
-def check_ema_exit(symbol: str, direction: str) -> bool:
-    """
-    Exit LONG  when any EMA inverts downward  (e20 < e50 OR e50 < e100 OR e100 < e200) on Daily.
-    Exit SHORT when any EMA inverts upward    (e20 > e50 OR e50 > e100 OR e100 > e200) on Daily.
-    We require the inversion to be present on the LAST COMPLETED Daily candle
-    (not intraday) to reduce fakeouts.
-    """
-    df_1d = get_klines(symbol, "D", 50)
-    if df_1d is None or len(df_1d) < 2:
-        return False
-
-    # Use closed candles only (all except the last forming one)
-    df_closed = df_1d.iloc[:-1]
-
-    e20  = float(calc_ema(df_closed, 20).iloc[-1])
-    e50  = float(calc_ema(df_closed, 50).iloc[-1])
-    e100 = float(calc_ema(df_closed, 100).iloc[-1])
-    e200 = float(calc_ema(df_closed, 200).iloc[-1])
-
+def _calc_sl(entry: float, direction: str, e100_4h: float) -> float:
     if direction == "LONG":
-        # Any bearish inversion
-        return (e20 < e50) or (e50 < e100) or (e100 < e200)
+        base = min(e100_4h, entry * (1 - 0.015))
+        return round(base * (1 - SL_BUFFER), 6)
     else:
-        # Any bullish inversion
-        return (e20 > e50) or (e50 > e100) or (e100 > e200)
+        base = max(e100_4h, entry * (1 + 0.015))
+        return round(base * (1 + SL_BUFFER), 6)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  TRAILING STOP (Tier 3) — called at every 4H candle close
-# ─────────────────────────────────────────────────────────────────────────────
-def update_trailing_sl(pos: dict) -> Optional[float]:
-    """
-    For LONG:  if latest 4H candle low > current SL → new SL = candle low
-    For SHORT: if latest 4H candle high < current SL → new SL = candle high
-    Returns new SL if updated, else None.
-    """
-    symbol    = pos["symbol"]
-    direction = pos["direction"]
-    cur_sl    = pos["sl_price"]
-
-    df_4h = get_klines(symbol, "240", 10)
-    if df_4h is None or len(df_4h) < 2:
-        return None
-
-    # Use the last COMPLETED 4H candle (second-to-last row)
-    last_closed = df_4h.iloc[-2]
-
+def _calc_tps(entry: float, sl: float, direction: str):
+    risk = abs(entry - sl)
     if direction == "LONG":
-        new_sl_candidate = float(last_closed["low"])
-        if new_sl_candidate > cur_sl:
-            return round(new_sl_candidate, 6)
+        return round(entry + risk * 1.5, 6), round(entry + risk * 3.0, 6)
     else:
-        new_sl_candidate = float(last_closed["high"])
-        if new_sl_candidate < cur_sl:
-            return round(new_sl_candidate, 6)
-    return None
+        return round(entry - risk * 1.5, 6), round(entry - risk * 3.0, 6)
 
+def _estimate_pnl(pos: dict, price: float) -> float:
+    diff = (price - pos["entry_price"]) if pos["direction"] == "LONG" \
+           else (pos["entry_price"] - price)
+    return diff * pos["remaining_qty"] * LEVERAGE
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  TELEGRAM ALERT
+# ─────────────────────────────────────────────────────────────────────────────
+async def alert(app, text: str) -> None:
+    try:
+        await app.bot.send_message(chat_id=OWNER_ID, text=text, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"alert: {e}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  TRADE ENTRY
 # ─────────────────────────────────────────────────────────────────────────────
-async def open_trade(
-    symbol: str,
-    direction: str,
-    score: int,
-    passed: list[str],
-    state: dict,
-    app,
-) -> None:
-    """Full trade entry sequence."""
-    set_leverage(symbol)
+async def open_trade(symbol: str, direction: str, indicators: dict,
+                     state: dict, app) -> None:
+    await set_leverage(symbol)
 
-    entry_price = get_current_price(symbol)
-    if entry_price == 0:
-        await send_alert(app, f"⚠️ [{symbol}] Could not fetch price. Trade aborted.")
+    entry = await get_price(symbol)
+    if not entry:
+        await alert(app, f"⚠️ [{symbol}] Cannot fetch price. Skipping.")
         return
 
-    qty = calc_position_qty(symbol, entry_price)
+    balance = await get_balance()
+    if not balance:
+        await alert(app, f"⚠️ [{symbol}] Cannot fetch balance. Skipping.")
+        return
+
+    e100_4h = indicators["e100_4h"]
+    sl       = _calc_sl(entry, direction, e100_4h)
+    tp1, tp2 = _calc_tps(entry, sl, direction)
+
+    min_q   = await get_min_qty(symbol)
+    notional = balance * POSITION_PCT * LEVERAGE
+    qty      = _round_qty(notional / entry, min_q)
+
     if qty <= 0:
-        await send_alert(app, f"⚠️ [{symbol}] Position size too small. Check balance.")
+        await alert(app, f"⚠️ [{symbol}] Position size too small.")
         return
 
-    side = "Buy" if direction == "LONG" else "Sell"
-    result = place_market_order(symbol, side, qty)
+    side   = "Buy" if direction == "LONG" else "Sell"
+    result = await place_order(symbol, side, qty)
     if not result:
-        await send_alert(app, f"⚠️ [{symbol}] Order placement failed.")
+        await alert(app, f"⚠️ [{symbol}] Order failed.")
         return
 
-    sl  = calc_initial_sl(entry_price, direction, symbol)
-    tp1, tp2 = calc_tp_levels(entry_price, sl, direction)
-
-    set_trading_stop(symbol, sl)
+    await set_sl(symbol, sl)
 
     pos = {
         "symbol":         symbol,
         "direction":      direction,
-        "entry_price":    entry_price,
+        "entry_price":    entry,
         "sl_price":       sl,
         "tp1_price":      tp1,
         "tp2_price":      tp2,
@@ -786,233 +517,187 @@ async def open_trade(
         "tp1_hit":        False,
         "tp2_hit":        False,
         "entry_time":     time.time(),
-        "score":          score,
-        "filters_passed": passed,
+        "score":          indicators["score"],
+        "filters_passed": indicators["passed"],
     }
     state["positions"][symbol] = pos
     save_state(state)
 
-    emoji = "🟢" if direction == "LONG" else "🔴"
-    filters_str = " ".join([f"✅{p}" for p in passed])
+    emoji  = "🟢" if direction == "LONG" else "🔴"
+    f_str  = " ".join([f"✅{p}" for p in indicators["passed"]])
     msg = (
         f"{emoji} <b>TRADE OPENED — {symbol} {direction}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📌 Entry  : <code>{entry_price:.4f}</code>\n"
-        f"🛡 SL     : <code>{sl:.4f}</code>\n"
-        f"🎯 TP1    : <code>{tp1:.4f}</code>  (close 40%)\n"
-        f"🎯 TP2    : <code>{tp2:.4f}</code>  (close 40%)\n"
-        f"🌊 TP3    : Trailing (last 20%)\n"
-        f"📊 Score  : {score}/8\n"
-        f"✅ Filters: {filters_str}\n"
-        f"⚡ Qty    : {qty}  |  Leverage: {LEVERAGE}x"
+        f"📌 Entry : <code>{entry:.4f}</code>\n"
+        f"🛡 SL    : <code>{sl:.4f}</code>\n"
+        f"🎯 TP1   : <code>{tp1:.4f}</code>  (close 40%)\n"
+        f"🎯 TP2   : <code>{tp2:.4f}</code>  (close 40%)\n"
+        f"🌊 TP3   : Trailing last 20%\n"
+        f"📊 Score : {indicators['score']}/8\n"
+        f"✅ Filters: {f_str}\n"
+        f"⚡ Qty   : {qty}  |  Leverage: {LEVERAGE}x"
     )
-    await send_alert(app, msg)
-    logger.info(f"[{symbol}] Trade opened {direction} @ {entry_price}")
-
+    await alert(app, msg)
+    logger.info(f"[{symbol}] Trade opened {direction} @ {entry}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  TRADE MANAGEMENT — TP / SL / EXIT
+#  POSITION MANAGEMENT
 # ─────────────────────────────────────────────────────────────────────────────
 async def manage_position(pos: dict, state: dict, app) -> None:
     symbol    = pos["symbol"]
     direction = pos["direction"]
-    price     = get_current_price(symbol)
-    if price == 0:
+
+    # All heavy work in one thread call
+    price, df_1d, df_4h = await asyncio.gather(
+        asyncio.to_thread(_sync_get_price, symbol),
+        asyncio.to_thread(_sync_get_klines, symbol, "D", 100),
+        asyncio.to_thread(_sync_get_klines, symbol, "240", 50),
+    )
+
+    if not price or df_1d is None or df_4h is None:
         return
 
-    # ── Dead trade check ────────────────────────────────────────────────────
-    days_open = (time.time() - pos["entry_time"]) / 86400
-    if not pos["tp1_hit"] and days_open >= DEAD_TRADE_DAYS:
-        close_full_position(symbol, direction)
+    # ── Dead trade ───────────────────────────────────────────────────────────
+    if not pos["tp1_hit"] and (time.time() - pos["entry_time"]) / 86400 >= DEAD_DAYS:
+        await close_position(symbol, direction)
         pnl = _estimate_pnl(pos, price)
-        await send_alert(
-            app,
-            f"⏱ <b>DEAD TRADE CLOSED — {symbol}</b>\n"
-            f"Open {days_open:.1f} days without hitting TP1.\n"
-            f"Est. PnL: {pnl:+.2f} USDT"
-        )
-        _close_position_state(symbol, state, pnl)
+        await alert(app, f"⏱ <b>DEAD TRADE CLOSED — {symbol}</b>\nNo TP1 after {DEAD_DAYS} days.\nEst. PnL: {pnl:+.2f} USDT")
+        _remove_pos(symbol, state, pnl)
         return
 
-    # ── EMA inversion exit ──────────────────────────────────────────────────
-    if check_ema_exit(symbol, direction):
-        close_full_position(symbol, direction)
+    # ── EMA exit ─────────────────────────────────────────────────────────────
+    ema_exit = await asyncio.to_thread(_compute_ema_exit, df_1d, direction)
+    if ema_exit:
+        await close_position(symbol, direction)
         pnl = _estimate_pnl(pos, price)
-        await send_alert(
-            app,
-            f"📉 <b>EMA EXIT — {symbol} {direction}</b>\n"
-            f"EMA structure inverted on Daily.\n"
-            f"Closed at <code>{price:.4f}</code>\n"
-            f"Est. PnL: {pnl:+.2f} USDT"
-        )
-        _close_position_state(symbol, state, pnl)
+        await alert(app, f"📉 <b>EMA EXIT — {symbol} {direction}</b>\nEMA structure inverted on Daily.\nClosed @ <code>{price:.4f}</code>\nEst. PnL: {pnl:+.2f} USDT")
+        _remove_pos(symbol, state, pnl)
         return
 
-    # ── SL check ────────────────────────────────────────────────────────────
+    # ── SL hit ───────────────────────────────────────────────────────────────
     sl = pos["sl_price"]
     sl_hit = (direction == "LONG" and price <= sl) or \
              (direction == "SHORT" and price >= sl)
     if sl_hit:
-        close_full_position(symbol, direction)
+        await close_position(symbol, direction)
         pnl = _estimate_pnl(pos, price)
         state["consec_losses"] += 1
-        await send_alert(
-            app,
-            f"🛑 <b>STOP LOSS HIT — {symbol} {direction}</b>\n"
-            f"SL: <code>{sl:.4f}</code>  |  Price: <code>{price:.4f}</code>\n"
-            f"Est. PnL: {pnl:+.2f} USDT\n"
-            f"Consecutive losses: {state['consec_losses']}"
-        )
-        _close_position_state(symbol, state, pnl)
+        await alert(app, f"🛑 <b>STOP LOSS HIT — {symbol} {direction}</b>\nSL: <code>{sl:.4f}</code>  Price: <code>{price:.4f}</code>\nEst. PnL: {pnl:+.2f} USDT\nConsecutive losses: {state['consec_losses']}")
+        _remove_pos(symbol, state, pnl)
         return
 
-    # ── TP1 check ───────────────────────────────────────────────────────────
+    # ── TP1 ──────────────────────────────────────────────────────────────────
     if not pos["tp1_hit"]:
         tp1_hit = (direction == "LONG"  and price >= pos["tp1_price"]) or \
                   (direction == "SHORT" and price <= pos["tp1_price"])
         if tp1_hit:
-            close_qty = round_qty(pos["original_qty"] * 0.40, symbol)
-            place_reduce_order(symbol, "Sell" if direction == "LONG" else "Buy", close_qty)
+            close_qty = _round_qty(pos["original_qty"] * 0.40,
+                                   await get_min_qty(symbol))
+            await place_order(symbol, "Sell" if direction=="LONG" else "Buy",
+                              close_qty, reduce_only=True)
             pos["remaining_qty"] = round(pos["original_qty"] * 0.60, 8)
-            pos["tp1_hit"] = True
-            # Move SL to breakeven
-            pos["sl_price"] = pos["entry_price"]
-            set_trading_stop(symbol, pos["entry_price"])
-            state["consec_losses"] = 0   # reset on win
+            pos["tp1_hit"]  = True
+            pos["sl_price"] = pos["entry_price"]   # breakeven
+            await set_sl(symbol, pos["entry_price"])
+            state["consec_losses"] = 0
             save_state(state)
-            pnl_partial = _estimate_pnl_partial(pos, price, close_qty)
-            await send_alert(
-                app,
-                f"🎯 <b>TP1 HIT — {symbol} {direction}</b>\n"
-                f"Closed 40% at <code>{price:.4f}</code>\n"
-                f"Est. partial PnL: {pnl_partial:+.2f} USDT\n"
-                f"🔒 SL moved to breakeven: <code>{pos['entry_price']:.4f}</code>\n"
-                f"Remaining qty: {pos['remaining_qty']}"
-            )
+            pnl = abs(pos["tp1_price"] - pos["entry_price"]) * close_qty * LEVERAGE
+            await alert(app, f"🎯 <b>TP1 HIT — {symbol} {direction}</b>\nClosed 40% @ <code>{price:.4f}</code>\nEst. PnL: +{pnl:.2f} USDT\n🔒 SL → Breakeven <code>{pos['entry_price']:.4f}</code>")
             return
 
-    # ── TP2 check ───────────────────────────────────────────────────────────
+    # ── TP2 ──────────────────────────────────────────────────────────────────
     if pos["tp1_hit"] and not pos["tp2_hit"]:
         tp2_hit = (direction == "LONG"  and price >= pos["tp2_price"]) or \
                   (direction == "SHORT" and price <= pos["tp2_price"])
         if tp2_hit:
-            close_qty = round_qty(pos["original_qty"] * 0.40, symbol)
-            place_reduce_order(symbol, "Sell" if direction == "LONG" else "Buy", close_qty)
+            close_qty = _round_qty(pos["original_qty"] * 0.40,
+                                   await get_min_qty(symbol))
+            await place_order(symbol, "Sell" if direction=="LONG" else "Buy",
+                              close_qty, reduce_only=True)
             pos["remaining_qty"] = round(pos["original_qty"] * 0.20, 8)
             pos["tp2_hit"] = True
             save_state(state)
-            pnl_partial = _estimate_pnl_partial(pos, price, close_qty)
-            await send_alert(
-                app,
-                f"🎯 <b>TP2 HIT — {symbol} {direction}</b>\n"
-                f"Closed 40% at <code>{price:.4f}</code>\n"
-                f"Est. partial PnL: {pnl_partial:+.2f} USDT\n"
-                f"🌊 Trailing stop now active on last 20%\n"
-                f"Remaining qty: {pos['remaining_qty']}"
-            )
+            pnl = abs(pos["tp2_price"] - pos["entry_price"]) * close_qty * LEVERAGE
+            await alert(app, f"🎯 <b>TP2 HIT — {symbol} {direction}</b>\nClosed 40% @ <code>{price:.4f}</code>\nEst. PnL: +{pnl:.2f} USDT\n🌊 Trailing last 20%")
             return
 
-    # ── Trailing SL update (Tier 3, after TP2) ─────────────────────────────
+    # ── Trailing SL (after TP2) ───────────────────────────────────────────────
     if pos["tp2_hit"]:
-        new_sl = update_trailing_sl(pos)
-        if new_sl is not None:
+        new_sl = await asyncio.to_thread(
+            _compute_trailing_sl, df_4h, direction, pos["sl_price"])
+        if new_sl:
             pos["sl_price"] = new_sl
-            set_trading_stop(symbol, new_sl)
+            await set_sl(symbol, new_sl)
             save_state(state)
-            logger.info(f"[{symbol}] Trailing SL updated to {new_sl}")
+            logger.info(f"[{symbol}] Trailing SL → {new_sl}")
 
-
-def _estimate_pnl(pos: dict, current_price: float) -> float:
-    qty  = pos["remaining_qty"]
-    diff = (current_price - pos["entry_price"]) if pos["direction"] == "LONG" \
-           else (pos["entry_price"] - current_price)
-    return diff * qty * LEVERAGE
-
-
-def _estimate_pnl_partial(pos: dict, current_price: float, qty: float) -> float:
-    diff = (current_price - pos["entry_price"]) if pos["direction"] == "LONG" \
-           else (pos["entry_price"] - current_price)
-    return diff * qty * LEVERAGE
-
-
-def _close_position_state(symbol: str, state: dict, pnl: float) -> None:
+def _remove_pos(symbol: str, state: dict, pnl: float) -> None:
     state["daily_loss"]  = state.get("daily_loss", 0) + min(pnl, 0)
     state["weekly_loss"] = state.get("weekly_loss", 0) + min(pnl, 0)
-    if symbol in state["positions"]:
-        del state["positions"][symbol]
+    state["positions"].pop(symbol, None)
     save_state(state)
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-#  TELEGRAM HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
-async def send_alert(app, text: str) -> None:
-    try:
-        await app.bot.send_message(
-            chat_id=OWNER_ID,
-            text=text,
-            parse_mode="HTML",
-        )
-    except Exception as e:
-        logger.error(f"send_alert: {e}")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  MAIN MONITORING LOOP
+#  MAIN MONITOR LOOP
 # ─────────────────────────────────────────────────────────────────────────────
 async def monitor_loop(app) -> None:
-    """Runs forever. Checks prices every MONITOR_INTERVAL seconds."""
+    global _api_semaphore
+    _api_semaphore = asyncio.Semaphore(5)   # max 5 concurrent Bybit calls
     logger.info("Monitor loop started.")
-    last_4h_check: dict[str, float] = {}
-    last_1d_check: dict[str, float] = {}
 
     while True:
         try:
             state = load_state()
-            now   = time.time()
+            now   = datetime.now(timezone.utc)
 
-            # ── Reset daily/weekly counters ─────────────────────────────────
-            today    = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            iso_week = datetime.now(timezone.utc).strftime("%Y-W%W")
+            # Reset daily/weekly counters
+            today    = now.strftime("%Y-%m-%d")
+            iso_week = now.strftime("%Y-W%W")
             if state.get("last_reset_day") != today:
-                state["daily_loss"]      = 0.0
-                state["last_reset_day"]  = today
+                state["daily_loss"] = 0.0
+                state["last_reset_day"] = today
             if state.get("last_reset_week") != iso_week:
-                state["weekly_loss"]     = 0.0
+                state["weekly_loss"] = 0.0
                 state["last_reset_week"] = iso_week
 
-            # ── Circuit breakers ────────────────────────────────────────────
-            paused_by_circuit = False
-            _bal = get_balance_usdt()   # fetch once per cycle
-            if state["daily_loss"] <= -0.04 * _bal:
-                paused_by_circuit = True
-            if state["weekly_loss"] <= -0.06 * _bal:
-                paused_by_circuit = True
-            if state["consec_losses"] >= 3:
-                paused_by_circuit = True
+            # Circuit breakers — fetch balance ONCE
+            balance = await get_balance()
+            paused_circuit = (
+                state["daily_loss"]  <= -0.04 * balance or
+                state["weekly_loss"] <= -0.06 * balance or
+                state["consec_losses"] >= 3
+            )
 
-            # ── Manage open positions ───────────────────────────────────────
-            for symbol, pos in list(state["positions"].items()):
-                await manage_position(pos, state, app)
+            # Manage open positions concurrently
+            if state["positions"]:
+                await asyncio.gather(*[
+                    manage_position(pos, state, app)
+                    for pos in list(state["positions"].values())
+                ])
 
-            # ── Scan for new entries ────────────────────────────────────────
-            if not state["paused"] and not paused_by_circuit:
+            # Scan for new entries
+            if not state["paused"] and not paused_circuit:
                 for symbol in state["symbols"]:
                     if symbol in state["positions"]:
-                        continue  # already in a trade on this symbol
-
-                    # Try LONG
-                    ok, score, passed, failed, dbg = check_entry_signal(symbol, "LONG")
-                    if ok:
-                        logger.info(f"[{symbol}] LONG signal confirmed (score {score})")
-                        await open_trade(symbol, "LONG", score, passed, state, app)
                         continue
 
-                    # Try SHORT
-                    ok, score, passed, failed, dbg = check_entry_signal(symbol, "SHORT")
-                    if ok:
-                        logger.info(f"[{symbol}] SHORT signal confirmed (score {score})")
-                        await open_trade(symbol, "SHORT", score, passed, state, app)
+                    # Fetch all candles concurrently
+                    df_1d, df_4h, df_1h = await asyncio.gather(
+                        get_klines(symbol, "D",   300),
+                        get_klines(symbol, "240", 300),
+                        get_klines(symbol, "60",  100),
+                    )
+                    if df_1d is None or df_4h is None or df_1h is None:
+                        continue
+
+                    # Compute indicators in background thread
+                    for direction in ("LONG", "SHORT"):
+                        indicators = await asyncio.to_thread(
+                            _compute_all_indicators, df_1d, df_4h, df_1h, direction)
+                        if indicators["should_enter"]:
+                            logger.info(f"[{symbol}] {direction} signal (score {indicators['score']})")
+                            await open_trade(symbol, direction, indicators, state, app)
+                            break   # one trade per symbol per cycle
 
             save_state(state)
 
@@ -1021,119 +706,99 @@ async def monitor_loop(app) -> None:
 
         await asyncio.sleep(MONITOR_INTERVAL)
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 #  TELEGRAM COMMAND HANDLERS
 # ─────────────────────────────────────────────────────────────────────────────
 @owner_only
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    text = (
-        "🤖 <b>PsychologyBot v1 — Ready!</b>\n"
+    await update.message.reply_text(
+        "🤖 <b>PsychologyBot v2 — Ready!</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "<b>Commands:</b>\n"
-        "• /start              — Show this message\n"
-        "• /add_symbol &lt;SYMBOL&gt;  — Start monitoring a coin\n"
-        "• /remove_symbol &lt;SYMBOL&gt; — Stop monitoring a coin\n"
-        "• /status             — Show all positions &amp; scores\n"
-        "• /pause              — Pause new trade entries\n"
-        "• /resume             — Resume new trade entries\n"
-        "• /balance            — Show current USDT balance\n"
-        "\n"
+        "• /start               — Show this message\n"
+        "• /add_symbol &lt;SYMBOL&gt;   — Monitor a coin\n"
+        "• /remove_symbol &lt;SYMBOL&gt; — Stop monitoring\n"
+        "• /status              — Open positions &amp; scores\n"
+        "• /pause               — Pause new entries\n"
+        "• /resume              — Resume new entries\n"
+        "• /balance             — Show USDT balance\n\n"
         "<b>Strategy:</b>\n"
-        "• Timeframes : Daily + 4H + 1H\n"
-        "• Leverage   : 10x\n"
-        "• Position   : 20% balance per symbol\n"
-        "• Min score  : 5/8 (conditions 5 &amp; 8 mandatory)\n"
-        "• TP1 : 1:1.5 RR → 40% close\n"
-        "• TP2 : 1:3  RR → 40% close\n"
-        "• TP3 : Trailing last 20%\n"
-        "\n"
+        "• Daily + 4H + 1H timeframes\n"
+        "• 10x leverage  |  20% balance per trade\n"
+        "• Min 5/8 signals (EMA stack + 1H candle mandatory)\n"
+        "• TP1: 1:1.5 RR → 40%  |  TP2: 1:3 RR → 40%  |  TP3: Trailing\n\n"
         "<b>Examples:</b>\n"
         "<code>/add_symbol BTCUSDT</code>\n"
-        "<code>/add_symbol ETHUSDT</code>"
+        "<code>/add_symbol ETHUSDT</code>",
+        parse_mode="HTML",
     )
-    await update.message.reply_text(text, parse_mode="HTML")
-
 
 @owner_only
 async def cmd_add_symbol(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not ctx.args:
-        await update.message.reply_text("Usage: /add_symbol <SYMBOL>  e.g. /add_symbol BTCUSDT")
+        await update.message.reply_text("Usage: /add_symbol BTCUSDT")
         return
     symbol = ctx.args[0].upper()
     state  = load_state()
     if symbol in state["symbols"]:
-        await update.message.reply_text(f"⚠️ {symbol} is already being monitored.")
+        await update.message.reply_text(f"⚠️ {symbol} already monitored.")
         return
     state["symbols"].append(symbol)
     save_state(state)
     await update.message.reply_text(
-        f"✅ <b>{symbol}</b> added to watchlist.\n"
-        f"Bot will monitor every {MONITOR_INTERVAL}s and alert you when entry conditions are met.",
-        parse_mode="HTML",
-    )
-    logger.info(f"Added symbol: {symbol}")
-
+        f"✅ <b>{symbol}</b> added. Bot will scan every {MONITOR_INTERVAL}s.",
+        parse_mode="HTML")
 
 @owner_only
 async def cmd_remove_symbol(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not ctx.args:
-        await update.message.reply_text("Usage: /remove_symbol <SYMBOL>")
+        await update.message.reply_text("Usage: /remove_symbol BTCUSDT")
         return
     symbol = ctx.args[0].upper()
     state  = load_state()
     if symbol not in state["symbols"]:
-        await update.message.reply_text(f"⚠️ {symbol} is not in the watchlist.")
+        await update.message.reply_text(f"⚠️ {symbol} not in watchlist.")
         return
     state["symbols"].remove(symbol)
-    # Also warn if there's an open position
     if symbol in state["positions"]:
         await update.message.reply_text(
-            f"⚠️ <b>Warning:</b> {symbol} has an open position! "
-            f"It has been removed from monitoring but the position remains open on Bybit. "
-            f"Manage it manually.",
-            parse_mode="HTML",
-        )
+            f"⚠️ {symbol} has an open position — removed from monitoring "
+            f"but position still open on Bybit. Manage manually.")
     save_state(state)
-    await update.message.reply_text(f"✅ <b>{symbol}</b> removed from watchlist.", parse_mode="HTML")
-    logger.info(f"Removed symbol: {symbol}")
-
+    await update.message.reply_text(f"✅ <b>{symbol}</b> removed.", parse_mode="HTML")
 
 @owner_only
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     state   = load_state()
-    balance = get_balance_usdt()
+    balance = await get_balance()
     lines   = [
-        f"📊 <b>Bot Status</b>",
+        "📊 <b>Bot Status</b>",
         f"━━━━━━━━━━━━━━━━━━━━",
-        f"Balance : <code>{balance:.2f} USDT</code>",
-        f"Paused  : {'🔴 YES' if state['paused'] else '🟢 NO'}",
-        f"Consec losses: {state['consec_losses']}",
-        f"Daily loss: {state['daily_loss']:.2f} USDT",
+        f"Balance  : <code>{balance:.2f} USDT</code>",
+        f"Paused   : {'🔴 YES' if state['paused'] else '🟢 NO'}",
+        f"Con. losses: {state['consec_losses']}",
+        f"Daily loss : {state['daily_loss']:.2f} USDT",
         f"",
-        f"<b>Monitored Symbols:</b> {', '.join(state['symbols']) or 'None'}",
-        f"",
+        f"<b>Watching:</b> {', '.join(state['symbols']) or 'None'}",
+        "",
     ]
     if state["positions"]:
         lines.append("<b>Open Positions:</b>")
         for sym, pos in state["positions"].items():
-            price  = get_current_price(sym)
-            pnl    = _estimate_pnl(pos, price)
-            days   = (time.time() - pos["entry_time"]) / 86400
-            emoji  = "🟢" if pos["direction"] == "LONG" else "🔴"
+            price = await get_price(sym)
+            pnl   = _estimate_pnl(pos, price)
+            days  = (time.time() - pos["entry_time"]) / 86400
+            e     = "🟢" if pos["direction"] == "LONG" else "🔴"
             lines.append(
-                f"{emoji} <b>{sym}</b> {pos['direction']}\n"
-                f"   Entry: {pos['entry_price']:.4f}  |  Now: {price:.4f}\n"
-                f"   SL: {pos['sl_price']:.4f}\n"
-                f"   TP1: {'✅' if pos['tp1_hit'] else '⬜'}  TP2: {'✅' if pos['tp2_hit'] else '⬜'}\n"
-                f"   Est PnL: {pnl:+.2f} USDT  |  Open: {days:.1f}d\n"
-                f"   Score: {pos['score']}/8"
+                f"{e} <b>{sym}</b> {pos['direction']}\n"
+                f"   Entry:{pos['entry_price']:.4f}  Now:{price:.4f}\n"
+                f"   SL:{pos['sl_price']:.4f}\n"
+                f"   TP1:{'✅' if pos['tp1_hit'] else '⬜'}  TP2:{'✅' if pos['tp2_hit'] else '⬜'}\n"
+                f"   PnL:{pnl:+.2f} USDT  Open:{days:.1f}d  Score:{pos['score']}/8"
             )
     else:
         lines.append("<b>No open positions.</b>")
-
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
-
 
 @owner_only
 async def cmd_pause(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1141,43 +806,38 @@ async def cmd_pause(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     state["paused"] = True
     save_state(state)
     await update.message.reply_text(
-        "⏸ <b>Bot paused.</b>\nNo new trades will be opened.\n"
-        "Existing positions continue to be managed (SL/TP).",
-        parse_mode="HTML",
-    )
-
+        "⏸ <b>Bot paused.</b> No new entries.\nExisting positions still managed.",
+        parse_mode="HTML")
 
 @owner_only
 async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     state = load_state()
-    state["paused"]       = False
+    state["paused"] = False
     state["consec_losses"] = 0
     save_state(state)
-    await update.message.reply_text(
-        "▶️ <b>Bot resumed.</b>\nMonitoring for new entries.",
-        parse_mode="HTML",
-    )
-
+    await update.message.reply_text("▶️ <b>Bot resumed.</b>", parse_mode="HTML")
 
 @owner_only
 async def cmd_balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    bal = get_balance_usdt()
+    bal = await get_balance()
     await update.message.reply_text(
-        f"💰 Available Balance: <code>{bal:.2f} USDT</code>",
-        parse_mode="HTML",
-    )
-
+        f"💰 Balance: <code>{bal:.2f} USDT</code>", parse_mode="HTML")
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  STARTUP — Webhook + aiohttp web server (Render Web Service compatible)
+#  STARTUP — Webhook + aiohttp (Render Web Service)
 # ─────────────────────────────────────────────────────────────────────────────
 async def main() -> None:
-    logger.info("Starting PsychologyBot v1...")
+    global _api_semaphore
+    _api_semaphore = asyncio.Semaphore(5)
 
-    # ── Build Telegram application ──────────────────────────────────────────
+    # Set thread pool as default executor
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(_executor)
+    logger.info(f"Thread pool: {_executor._max_workers} workers")
+
+    logger.info("Starting PsychologyBot v2...")
+
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-
-    # Register command handlers
     app.add_handler(CommandHandler("start",          cmd_start))
     app.add_handler(CommandHandler("add_symbol",     cmd_add_symbol))
     app.add_handler(CommandHandler("remove_symbol",  cmd_remove_symbol))
@@ -1186,68 +846,58 @@ async def main() -> None:
     app.add_handler(CommandHandler("resume",         cmd_resume))
     app.add_handler(CommandHandler("balance",        cmd_balance))
 
-    # ── Set webhook on Telegram ─────────────────────────────────────────────
-    # Render injects RENDER_EXTERNAL_HOSTNAME automatically
-    base_url = os.environ.get(
-        "RENDER_EXTERNAL_HOSTNAME",
-        "psychology-trading-bot.onrender.com"
-    )
+    base_url    = os.environ.get("RENDER_EXTERNAL_HOSTNAME",
+                                 "psychology-trading-bot.onrender.com")
     webhook_url = f"https://{base_url}/webhook"
-    port = int(os.environ.get("PORT", 10000))
+    port        = int(os.environ.get("PORT", 10000))
 
     await app.bot.set_webhook(url=webhook_url, drop_pending_updates=True)
-    logger.info(f"Webhook set to: {webhook_url}")
+    logger.info(f"Webhook → {webhook_url}")
 
-    # ── Initialise and start the Telegram app ───────────────────────────────
     await app.initialize()
     await app.start()
 
-    # ── Launch the trading monitor loop as a background task ────────────────
+    # Start monitor loop as background task
     asyncio.create_task(monitor_loop(app))
     logger.info("Monitor loop task created.")
 
-    # ── aiohttp web server — binds the port Render requires ─────────────────
-    async def health_handler(request):
+    # aiohttp web server — binds port for Render Web Service
+    async def health(request):
         return web.Response(text="OK")
 
     async def webhook_handler(request):
         try:
-            data   = await request.json()
-            update = Update.de_json(data=data, bot=app.bot)
+            update = Update.de_json(await request.json(), app.bot)
             await app.update_queue.put(update)
             return web.Response(text="OK", status=200)
         except Exception as e:
-            logger.error(f"Webhook handler error: {e}")
+            logger.error(f"Webhook handler: {e}")
             return web.Response(text="Error", status=500)
 
     aio_app = web.Application()
-    aio_app.router.add_get("/",         health_handler)
-    aio_app.router.add_get("/health",   health_handler)
+    aio_app.router.add_get("/",         health)
+    aio_app.router.add_get("/health",   health)
     aio_app.router.add_post("/webhook", webhook_handler)
 
     runner = web.AppRunner(aio_app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    logger.info(f"Web server running on port {port}")
-    logger.info("Bot fully running. Waiting for Telegram updates via webhook.")
+    await web.TCPSite(runner, "0.0.0.0", port).start()
+    logger.info(f"Web server on port {port}. Bot fully running.")
 
-    # ── Keep running forever ─────────────────────────────────────────────────
     try:
         await asyncio.Event().wait()
     except asyncio.CancelledError:
         pass
     finally:
-        logger.info("Shutting down gracefully...")
+        logger.info("Shutting down...")
         await app.stop()
         await app.shutdown()
         await runner.cleanup()
-
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Bot stopped by user.")
-    except Exception as exc:
-        logger.error(f"Fatal startup error: {exc}", exc_info=True)
+        logger.info("Stopped by user.")
+    except Exception as e:
+        logger.error(f"Fatal: {e}", exc_info=True)
