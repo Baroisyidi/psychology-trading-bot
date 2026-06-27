@@ -352,7 +352,7 @@ def _sync_place_order(symbol: str, side: str, qty: float,
     exceeds maxMktOrderQty (learned from reference code to handle low-price coins).
     """
     try:
-        min_qty, max_qty, qty_step, _ = _sync_get_instrument_constraints(symbol)
+        min_qty, max_qty, qty_step, _, _ = _sync_get_instrument_constraints(symbol)
         total_qty = _round_qty_step(qty, qty_step, min_qty)
         remaining  = total_qty
         last_result = None
