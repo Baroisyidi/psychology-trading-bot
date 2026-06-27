@@ -327,23 +327,33 @@ def _format_qty_str(qty: float, qty_step: float) -> str:
     return f"{qty:.{decimals}f}"
 
 def _sync_set_leverage(symbol: str) -> int:
-    """Set leverage for symbol, capped at the symbol's max allowed leverage.
-    Returns the actual leverage used."""
+    """
+    Set leverage for symbol, strictly capped at the symbol's max allowed leverage.
+    Uses floor() to stay safely under fractional limits (e.g. 9.5 → 9).
+    Returns the actual leverage successfully set.
+    """
+    import math
     try:
         _, _, _, _, max_lev = _sync_get_instrument_constraints(symbol)
-        actual_lev = min(LEVERAGE, int(max_lev))
-        # Use floor to stay safely under the max (e.g. 9.5 max → use 9)
-        if max_lev != int(max_lev):
-            actual_lev = int(max_lev)  # floor e.g. 9.5 → 9
-        bybit_session.set_leverage(
+        # Hard cap: never exceed 10x OR the symbol's max, whichever is lower
+        actual_lev = min(10, math.floor(max_lev))
+        if actual_lev < 1:
+            actual_lev = 1
+        resp = bybit_session.set_leverage(
             category="linear", symbol=symbol,
             buyLeverage=str(actual_lev), sellLeverage=str(actual_lev))
+        ret_code = resp.get("retCode", 0) if isinstance(resp, dict) else 0
+        if ret_code not in (0, 110043):  # 110043 = leverage not modified (already set)
+            logger.warning(f"[{symbol}] set_leverage retCode={ret_code}: {resp.get('retMsg','')}")
         if actual_lev < LEVERAGE:
-            logger.warning(f"[{symbol}] Leverage capped at {actual_lev}x (symbol max={max_lev}x, requested={LEVERAGE}x)")
+            logger.warning(f"[{symbol}] Leverage capped: {actual_lev}x used "
+                           f"(symbol max={max_lev}x, bot default={LEVERAGE}x)")
+        else:
+            logger.info(f"[{symbol}] Leverage set to {actual_lev}x")
         return actual_lev
     except Exception as e:
         logger.warning(f"set_leverage({symbol}): {e}")
-        return LEVERAGE
+        return 1   # safe fallback: 1x if we can't determine the max
 
 def _sync_place_order(symbol: str, side: str, qty: float,
                       reduce_only: bool = False) -> Optional[dict]:
@@ -367,9 +377,28 @@ def _sync_place_order(symbol: str, side: str, qty: float,
                 side=side, orderType="Market", qty=qty_str,
                 timeInForce="GoodTillCancel", reduceOnly=reduce_only)
 
-            if resp.get("retCode", 0) != 0:
-                logger.error(f"_sync_place_order({symbol}): retCode={resp.get('retCode')} msg={resp.get('retMsg')}")
-                return {"__error__": resp.get("retMsg", "Unknown error"), "__code__": resp.get("retCode")}
+            ret_code = resp.get("retCode", 0)
+            if ret_code != 0:
+                logger.error(f"_sync_place_order({symbol}): retCode={ret_code} msg={resp.get('retMsg')} qty={qty_str}")
+                # 110090 = position exceeds max limit — reduce qty by 20% and retry once
+                if ret_code == 110090 and batch_qty > min_qty:
+                    reduced = _round_qty_step(batch_qty * 0.80, qty_step, min_qty)
+                    if reduced < min_qty or reduced >= batch_qty:
+                        return {"__error__": resp.get("retMsg", "Unknown error"), "__code__": ret_code}
+                    logger.warning(f"_sync_place_order({symbol}): 110090 hit, retrying with reduced qty={reduced}")
+                    qty_str2 = _format_qty_str(reduced, qty_step)
+                    resp2 = bybit_session.place_order(
+                        category="linear", symbol=symbol,
+                        side=side, orderType="Market", qty=qty_str2,
+                        timeInForce="GoodTillCancel", reduceOnly=reduce_only)
+                    if resp2.get("retCode", 0) == 0:
+                        last_result = resp2["result"]
+                        remaining -= reduced
+                        if remaining > 0:
+                            import time as _time
+                            _time.sleep(0.5)
+                        continue
+                return {"__error__": resp.get("retMsg", "Unknown error"), "__code__": ret_code}
 
             last_result = resp["result"]
             remaining  -= batch_qty
@@ -686,13 +715,22 @@ async def open_trade(symbol: str, direction: str, indicators: dict, bot) -> None
     sl       = _calc_sl(entry, direction, indicators["e100_4h"])
     tp1, tp2 = _calc_tps(entry, sl, direction)
     min_q, max_q, step, min_notional, max_lev = await get_instrument_constraints(symbol)
-    # Use actual leverage (may be capped below 10x for some coins)
-    effective_lev = min(actual_lev, int(max_lev))
-    raw_qty  = (balance * POSITION_PCT * effective_lev) / entry
-    raw_qty  = max(raw_qty, min_notional / entry)   # respect min notional
-    qty      = _round_qty(raw_qty, min_q, step)
+    # effective_lev is what was actually set on Bybit (already floored to symbol max)
+    effective_lev = actual_lev
+
+    # Position notional = qty × entry_price / leverage  (this is what Bybit checks)
+    # We target 20% of balance as margin, so notional = margin × leverage
+    target_margin   = balance * POSITION_PCT
+    target_notional = target_margin * effective_lev
+    raw_qty         = target_notional / entry
+    raw_qty         = max(raw_qty, min_notional / entry)   # respect min notional
+
+    # Cap qty so each individual batch order never exceeds maxMktOrderQty
+    qty = _round_qty(raw_qty, min_q, step)
+
     logger.info(f"[{symbol}] Sizing: balance={balance:.2f} lev={effective_lev}x "
-                f"raw_qty={raw_qty:.6f} final_qty={qty} max_single_order={max_q}")
+                f"target_notional={target_notional:.2f} raw_qty={raw_qty:.6f} "
+                f"final_qty={qty} max_single_order={max_q}")
 
     if qty <= 0:
         await alert(bot, f"⚠️ [{symbol}] Position size too small.")
@@ -706,6 +744,8 @@ async def open_trade(symbol: str, direction: str, indicators: dict, bot) -> None
         hint = ""
         if "symbol" in str(err_msg).lower() or err_code == 10001:
             hint = "\n💡 Check the symbol name is correct on Bybit (e.g. BTCUSDT not BTCUSD)"
+        elif err_code == 110090:
+            hint = "\n💡 Position exceeds Bybit's max limit for this symbol — leverage was already capped"
         elif err_code in (110007, 110043):
             hint = "\n💡 Leverage or margin issue — check your Bybit account settings"
         elif "insufficient" in str(err_msg).lower():
