@@ -312,10 +312,14 @@ def _sync_place_order(symbol: str, side: str, qty: float,
             category="linear", symbol=symbol,
             side=side, orderType="Market", qty=str(qty),
             timeInForce="GoodTillCancel", reduceOnly=reduce_only)
+        # Return error details if Bybit rejected the order
+        if resp.get("retCode", 0) != 0:
+            logger.error(f"_sync_place_order({symbol}): retCode={resp.get('retCode')} msg={resp.get('retMsg')}")
+            return {"__error__": resp.get("retMsg", "Unknown error"), "__code__": resp.get("retCode")}
         return resp["result"]
     except Exception as e:
         logger.error(f"_sync_place_order({symbol},{side},{qty}): {e}")
-        return None
+        return {"__error__": str(e)}
 
 def _sync_set_sl(symbol: str, sl_price: float) -> None:
     try:
@@ -619,8 +623,21 @@ async def open_trade(symbol: str, direction: str, indicators: dict, bot) -> None
 
     side   = "Buy" if direction == "LONG" else "Sell"
     result = await place_order(symbol, side, qty)
-    if not result:
-        await alert(bot, f"⚠️ [{symbol}] Order placement failed.")
+    if not result or "__error__" in result:
+        err_msg = result.get("__error__", "Unknown") if result else "No response from Bybit"
+        err_code = result.get("__code__", "") if result else ""
+        hint = ""
+        if "symbol" in str(err_msg).lower() or err_code == 10001:
+            hint = "\n💡 Check the symbol name is correct on Bybit (e.g. BTCUSDT not BTCUSD)"
+        elif err_code in (110007, 110043):
+            hint = "\n💡 Leverage or margin issue — check your Bybit account settings"
+        elif "insufficient" in str(err_msg).lower():
+            hint = "\n💡 Insufficient balance for this position size"
+        await alert(bot,
+            f"⚠️ <b>Order failed — {symbol} {direction}</b>\n"
+            f"Reason: <code>{err_msg}</code>\n"
+            f"Code: {err_code}{hint}\n"
+            f"Bot goes FLAT on {symbol} and will retry next valid signal.")
         return
 
     # Get actual fill price from Bybit
@@ -1050,6 +1067,22 @@ async def cmd_add_symbol(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     if symbol in monitored_symbols:
         await update.message.reply_text(f"⚠️ {symbol} is already being monitored.")
         return
+    # Validate symbol exists on Bybit before adding
+    await update.message.reply_text(f"🔍 Validating {symbol} on Bybit...")
+    try:
+        info = await asyncio.to_thread(
+            bybit_session.get_instruments_info, category="linear", symbol=symbol)
+        if not info["result"]["list"]:
+            await update.message.reply_text(
+                f"❌ <b>{symbol}</b> not found on Bybit linear futures.\n"
+                f"Check the exact symbol name at bybit.com/trade/usdt/\n"
+                f"Example: BTCUSDT, ETHUSDT, SOLUSDT",
+                parse_mode="HTML")
+            return
+    except Exception as e:
+        await update.message.reply_text(
+            f"⚠️ Could not validate {symbol}: {e}\nAdding anyway — watch for errors.")
+
     monitored_symbols.append(symbol)
     save_state()
     subscribe_ws_symbol(symbol)
