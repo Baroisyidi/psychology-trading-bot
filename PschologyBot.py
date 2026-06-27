@@ -289,13 +289,38 @@ def _sync_get_klines(symbol: str, interval: str, limit: int = 300) -> Optional[p
         logger.error(f"_sync_get_klines({symbol},{interval}): {e}")
         return None
 
-def _sync_get_min_qty(symbol: str) -> float:
+def _sync_get_instrument_constraints(symbol: str) -> tuple:
+    """Returns (min_qty, max_qty, qty_step, min_notional)."""
     try:
         resp = bybit_session.get_instruments_info(category="linear", symbol=symbol)
         lot  = resp["result"]["list"][0]["lotSizeFilter"]
-        return float(lot["minOrderQty"])
-    except Exception:
-        return 0.001
+        min_qty      = float(lot["minOrderQty"])
+        max_qty      = float(lot.get("maxMktOrderQty", lot.get("maxOrderQty", 1_000_000)))
+        qty_step     = float(lot["qtyStep"])
+        min_notional = float(lot.get("minNotionalValue", 5.0))
+        logger.info(f"[CONSTRAINTS] {symbol}: min={min_qty} max={max_qty} step={qty_step} min_notional={min_notional}")
+        return min_qty, max_qty, qty_step, min_notional
+    except Exception as e:
+        logger.error(f"_sync_get_instrument_constraints({symbol}): {e}")
+        return 0.001, 1_000_000.0, 0.001, 5.0
+
+def _sync_get_min_qty(symbol: str) -> float:
+    min_qty, _, _, _ = _sync_get_instrument_constraints(symbol)
+    return min_qty
+
+def _round_qty_step(qty: float, qty_step: float, min_qty: float) -> float:
+    """Round qty DOWN to nearest valid step, respecting minimum."""
+    if qty_step > 0:
+        qty = (qty // qty_step) * qty_step
+    return max(min_qty, qty)
+
+def _format_qty_str(qty: float, qty_step: float) -> str:
+    """Format qty string with correct decimal precision from step size."""
+    if qty_step >= 1:
+        return str(int(qty))
+    step_str = f"{qty_step:.10f}".rstrip("0")
+    decimals = len(step_str.split(".")[1]) if "." in step_str else 0
+    return f"{qty:.{decimals}f}"
 
 def _sync_set_leverage(symbol: str) -> None:
     try:
@@ -307,16 +332,38 @@ def _sync_set_leverage(symbol: str) -> None:
 
 def _sync_place_order(symbol: str, side: str, qty: float,
                       reduce_only: bool = False) -> Optional[dict]:
+    """
+    Place a market order. Automatically batches into multiple orders if qty
+    exceeds maxMktOrderQty (learned from reference code to handle low-price coins).
+    """
     try:
-        resp = bybit_session.place_order(
-            category="linear", symbol=symbol,
-            side=side, orderType="Market", qty=str(qty),
-            timeInForce="GoodTillCancel", reduceOnly=reduce_only)
-        # Return error details if Bybit rejected the order
-        if resp.get("retCode", 0) != 0:
-            logger.error(f"_sync_place_order({symbol}): retCode={resp.get('retCode')} msg={resp.get('retMsg')}")
-            return {"__error__": resp.get("retMsg", "Unknown error"), "__code__": resp.get("retCode")}
-        return resp["result"]
+        min_qty, max_qty, qty_step, _ = _sync_get_instrument_constraints(symbol)
+        total_qty = _round_qty_step(qty, qty_step, min_qty)
+        remaining  = total_qty
+        last_result = None
+
+        while remaining > 0:
+            batch_qty = min(remaining, max_qty)
+            batch_qty = _round_qty_step(batch_qty, qty_step, min_qty)
+            qty_str   = _format_qty_str(batch_qty, qty_step)
+
+            resp = bybit_session.place_order(
+                category="linear", symbol=symbol,
+                side=side, orderType="Market", qty=qty_str,
+                timeInForce="GoodTillCancel", reduceOnly=reduce_only)
+
+            if resp.get("retCode", 0) != 0:
+                logger.error(f"_sync_place_order({symbol}): retCode={resp.get('retCode')} msg={resp.get('retMsg')}")
+                return {"__error__": resp.get("retMsg", "Unknown error"), "__code__": resp.get("retCode")}
+
+            last_result = resp["result"]
+            remaining  -= batch_qty
+
+            if remaining > 0:
+                import time as _time
+                _time.sleep(0.5)   # small pause between batches
+
+        return last_result
     except Exception as e:
         logger.error(f"_sync_place_order({symbol},{side},{qty}): {e}")
         return {"__error__": str(e)}
@@ -381,6 +428,10 @@ async def get_klines(symbol: str, interval: str, limit: int = 300) -> Optional[p
 async def get_min_qty(symbol: str) -> float:
     async with _api_semaphore:
         return await asyncio.to_thread(_sync_get_min_qty, symbol)
+
+async def get_instrument_constraints(symbol: str) -> tuple:
+    async with _api_semaphore:
+        return await asyncio.to_thread(_sync_get_instrument_constraints, symbol)
 
 async def place_order(symbol: str, side: str, qty: float,
                       reduce_only: bool = False) -> Optional[dict]:
@@ -562,8 +613,11 @@ def _compute_trailing_sl(df_4h: pd.DataFrame, direction: str, cur_sl: float) -> 
 # ─────────────────────────────────────────────────────────────────────────────
 #  POSITION SIZING & SL/TP HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
-def _round_qty(qty: float, min_q: float) -> float:
-    return max(min_q, round(qty // min_q * min_q, 8))
+def _round_qty(qty: float, min_q: float, step: float = 0.0) -> float:
+    """Round qty to step size, respecting minimum."""
+    if step > 0:
+        qty = (qty // step) * step
+    return max(min_q, round(qty, 8))
 
 def _calc_sl(entry: float, direction: str, e100_4h: float) -> float:
     if direction == "LONG":
@@ -614,8 +668,11 @@ async def open_trade(symbol: str, direction: str, indicators: dict, bot) -> None
 
     sl       = _calc_sl(entry, direction, indicators["e100_4h"])
     tp1, tp2 = _calc_tps(entry, sl, direction)
-    min_q    = await get_min_qty(symbol)
-    qty      = _round_qty((balance * POSITION_PCT * LEVERAGE) / entry, min_q)
+    min_q, max_q, step, min_notional = await get_instrument_constraints(symbol)
+    raw_qty  = (balance * POSITION_PCT * LEVERAGE) / entry
+    raw_qty  = max(raw_qty, min_notional / entry)   # respect min notional
+    qty      = _round_qty(raw_qty, min_q, step)
+    logger.info(f"[{symbol}] Sizing: balance={balance:.2f} raw_qty={raw_qty:.6f} final_qty={qty} max_q={max_q}")
 
     if qty <= 0:
         await alert(bot, f"⚠️ [{symbol}] Position size too small.")
@@ -762,8 +819,8 @@ async def manage_position(pos: dict, bot) -> None:
         tp1_hit = (direction == "LONG"  and current_price >= pos["tp1_price"]) or \
                   (direction == "SHORT" and current_price <= pos["tp1_price"])
         if tp1_hit:
-            min_q     = await get_min_qty(symbol)
-            close_qty = _round_qty(pos["original_qty"] * 0.40, min_q)
+            min_q, _, step, _ = await get_instrument_constraints(symbol)
+            close_qty = _round_qty(pos["original_qty"] * 0.40, min_q, step)
             await place_order(symbol, "Sell" if direction == "LONG" else "Buy",
                               close_qty, reduce_only=True)
             pos["remaining_qty"] = round(pos["original_qty"] * 0.60, 8)
@@ -787,8 +844,8 @@ async def manage_position(pos: dict, bot) -> None:
         tp2_hit = (direction == "LONG"  and current_price >= pos["tp2_price"]) or \
                   (direction == "SHORT" and current_price <= pos["tp2_price"])
         if tp2_hit:
-            min_q     = await get_min_qty(symbol)
-            close_qty = _round_qty(pos["original_qty"] * 0.40, min_q)
+            min_q, _, step, _ = await get_instrument_constraints(symbol)
+            close_qty = _round_qty(pos["original_qty"] * 0.40, min_q, step)
             await place_order(symbol, "Sell" if direction == "LONG" else "Buy",
                               close_qty, reduce_only=True)
             pos["remaining_qty"] = round(pos["original_qty"] * 0.20, 8)
