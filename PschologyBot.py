@@ -290,22 +290,26 @@ def _sync_get_klines(symbol: str, interval: str, limit: int = 300) -> Optional[p
         return None
 
 def _sync_get_instrument_constraints(symbol: str) -> tuple:
-    """Returns (min_qty, max_qty, qty_step, min_notional)."""
+    """Returns (min_qty, max_qty, qty_step, min_notional, max_leverage)."""
     try:
         resp = bybit_session.get_instruments_info(category="linear", symbol=symbol)
-        lot  = resp["result"]["list"][0]["lotSizeFilter"]
+        info         = resp["result"]["list"][0]
+        lot          = info["lotSizeFilter"]
+        lever_filter = info.get("leverageFilter", {})
         min_qty      = float(lot["minOrderQty"])
         max_qty      = float(lot.get("maxMktOrderQty", lot.get("maxOrderQty", 1_000_000)))
         qty_step     = float(lot["qtyStep"])
         min_notional = float(lot.get("minNotionalValue", 5.0))
-        logger.info(f"[CONSTRAINTS] {symbol}: min={min_qty} max={max_qty} step={qty_step} min_notional={min_notional}")
-        return min_qty, max_qty, qty_step, min_notional
+        max_leverage = float(lever_filter.get("maxLeverage", 10.0))
+        logger.info(f"[CONSTRAINTS] {symbol}: min={min_qty} max={max_qty} step={qty_step} "
+                    f"min_notional={min_notional} max_lev={max_leverage}")
+        return min_qty, max_qty, qty_step, min_notional, max_leverage
     except Exception as e:
         logger.error(f"_sync_get_instrument_constraints({symbol}): {e}")
-        return 0.001, 1_000_000.0, 0.001, 5.0
+        return 0.001, 1_000_000.0, 0.001, 5.0, 10.0
 
 def _sync_get_min_qty(symbol: str) -> float:
-    min_qty, _, _, _ = _sync_get_instrument_constraints(symbol)
+    min_qty, _, _, _, _ = _sync_get_instrument_constraints(symbol)
     return min_qty
 
 def _round_qty_step(qty: float, qty_step: float, min_qty: float) -> float:
@@ -322,13 +326,24 @@ def _format_qty_str(qty: float, qty_step: float) -> str:
     decimals = len(step_str.split(".")[1]) if "." in step_str else 0
     return f"{qty:.{decimals}f}"
 
-def _sync_set_leverage(symbol: str) -> None:
+def _sync_set_leverage(symbol: str) -> int:
+    """Set leverage for symbol, capped at the symbol's max allowed leverage.
+    Returns the actual leverage used."""
     try:
+        _, _, _, _, max_lev = _sync_get_instrument_constraints(symbol)
+        actual_lev = min(LEVERAGE, int(max_lev))
+        # Use floor to stay safely under the max (e.g. 9.5 max → use 9)
+        if max_lev != int(max_lev):
+            actual_lev = int(max_lev)  # floor e.g. 9.5 → 9
         bybit_session.set_leverage(
             category="linear", symbol=symbol,
-            buyLeverage=str(LEVERAGE), sellLeverage=str(LEVERAGE))
+            buyLeverage=str(actual_lev), sellLeverage=str(actual_lev))
+        if actual_lev < LEVERAGE:
+            logger.warning(f"[{symbol}] Leverage capped at {actual_lev}x (symbol max={max_lev}x, requested={LEVERAGE}x)")
+        return actual_lev
     except Exception as e:
         logger.warning(f"set_leverage({symbol}): {e}")
+        return LEVERAGE
 
 def _sync_place_order(symbol: str, side: str, qty: float,
                       reduce_only: bool = False) -> Optional[dict]:
@@ -430,6 +445,7 @@ async def get_min_qty(symbol: str) -> float:
         return await asyncio.to_thread(_sync_get_min_qty, symbol)
 
 async def get_instrument_constraints(symbol: str) -> tuple:
+    """Returns (min_qty, max_qty, qty_step, min_notional, max_leverage)."""
     async with _api_semaphore:
         return await asyncio.to_thread(_sync_get_instrument_constraints, symbol)
 
@@ -654,7 +670,8 @@ async def alert(bot, text: str) -> None:
 async def open_trade(symbol: str, direction: str, indicators: dict, bot) -> None:
     global consec_losses
 
-    await asyncio.to_thread(_sync_set_leverage, symbol)
+    # Set leverage capped at symbol's max — get back actual leverage used
+    actual_lev = await asyncio.to_thread(_sync_set_leverage, symbol)
 
     entry = await get_price(symbol)
     if not entry:
@@ -668,11 +685,14 @@ async def open_trade(symbol: str, direction: str, indicators: dict, bot) -> None
 
     sl       = _calc_sl(entry, direction, indicators["e100_4h"])
     tp1, tp2 = _calc_tps(entry, sl, direction)
-    min_q, max_q, step, min_notional = await get_instrument_constraints(symbol)
-    raw_qty  = (balance * POSITION_PCT * LEVERAGE) / entry
+    min_q, max_q, step, min_notional, max_lev = await get_instrument_constraints(symbol)
+    # Use actual leverage (may be capped below 10x for some coins)
+    effective_lev = min(actual_lev, int(max_lev))
+    raw_qty  = (balance * POSITION_PCT * effective_lev) / entry
     raw_qty  = max(raw_qty, min_notional / entry)   # respect min notional
     qty      = _round_qty(raw_qty, min_q, step)
-    logger.info(f"[{symbol}] Sizing: balance={balance:.2f} raw_qty={raw_qty:.6f} final_qty={qty} max_q={max_q}")
+    logger.info(f"[{symbol}] Sizing: balance={balance:.2f} lev={effective_lev}x "
+                f"raw_qty={raw_qty:.6f} final_qty={qty} max_single_order={max_q}")
 
     if qty <= 0:
         await alert(bot, f"⚠️ [{symbol}] Position size too small.")
@@ -741,7 +761,8 @@ async def open_trade(symbol: str, direction: str, indicators: dict, bot) -> None
         f"📊 Score  : {indicators['score']}/8\n"
         f"✅ Passed : {f_str}\n"
         f"❌ Failed : {fail_s}\n"
-        f"⚡ Qty    : {qty}  |  Leverage: {LEVERAGE}x  |  Balance: {balance:.2f} USDT"
+        f"⚡ Qty    : {qty}  |  Leverage: {effective_lev}x  |  Balance: {balance:.2f} USDT"
+        + (f"\n⚠️ Note: Leverage capped at {effective_lev}x (symbol max, requested {LEVERAGE}x)" if effective_lev < LEVERAGE else "")
     )
     logger.info(f"[{symbol}] Trade opened {direction} @ {fill_price}")
 
@@ -819,7 +840,7 @@ async def manage_position(pos: dict, bot) -> None:
         tp1_hit = (direction == "LONG"  and current_price >= pos["tp1_price"]) or \
                   (direction == "SHORT" and current_price <= pos["tp1_price"])
         if tp1_hit:
-            min_q, _, step, _ = await get_instrument_constraints(symbol)
+            min_q, _, step, _, _ = await get_instrument_constraints(symbol)
             close_qty = _round_qty(pos["original_qty"] * 0.40, min_q, step)
             await place_order(symbol, "Sell" if direction == "LONG" else "Buy",
                               close_qty, reduce_only=True)
@@ -844,7 +865,7 @@ async def manage_position(pos: dict, bot) -> None:
         tp2_hit = (direction == "LONG"  and current_price >= pos["tp2_price"]) or \
                   (direction == "SHORT" and current_price <= pos["tp2_price"])
         if tp2_hit:
-            min_q, _, step, _ = await get_instrument_constraints(symbol)
+            min_q, _, step, _, _ = await get_instrument_constraints(symbol)
             close_qty = _round_qty(pos["original_qty"] * 0.40, min_q, step)
             await place_order(symbol, "Sell" if direction == "LONG" else "Buy",
                               close_qty, reduce_only=True)
