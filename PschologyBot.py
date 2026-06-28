@@ -1226,29 +1226,16 @@ async def cmd_add_symbol(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     if symbol in monitored_symbols:
         await update.message.reply_text(f"⚠️ {symbol} is already being monitored.")
         return
-    # Validate symbol exists on Bybit before adding
-    await update.message.reply_text(f"🔍 Validating {symbol} on Bybit...")
-    try:
-        info = await asyncio.to_thread(
-            bybit_session.get_instruments_info, category="linear", symbol=symbol)
-        if not info["result"]["list"]:
-            await update.message.reply_text(
-                f"❌ <b>{symbol}</b> not found on Bybit linear futures.\n"
-                f"Check the exact symbol name at bybit.com/trade/usdt/\n"
-                f"Example: BTCUSDT, ETHUSDT, SOLUSDT",
-                parse_mode="HTML")
-            return
-    except Exception as e:
-        await update.message.reply_text(
-            f"⚠️ Could not validate {symbol}: {e}\nAdding anyway — watch for errors.")
-
     monitored_symbols.append(symbol)
-    save_state()
-    subscribe_ws_symbol(symbol)
 
-    # Stagger first run
-    idx    = monitored_symbols.index(symbol)
-    delay  = POLL_INTERVAL + idx * 1.25
+    # Reply FIRST — user sees confirmation immediately
+
+    # Non-blocking background tasks after reply
+    await asyncio.to_thread(save_state)
+    asyncio.create_task(asyncio.to_thread(subscribe_ws_symbol, symbol))
+
+    idx   = monitored_symbols.index(symbol)
+    delay = POLL_INTERVAL + idx * 1.25
 
     if ctx.job_queue:
         ctx.job_queue.run_repeating(
@@ -1261,12 +1248,6 @@ async def cmd_add_symbol(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
                   "circuit_alerted": False},
         )
 
-    await update.message.reply_text(
-        f"✅ <b>{symbol}</b> added!\n"
-        f"Bot will scan every {POLL_INTERVAL}s.\n"
-        f"You'll receive a 30-min status report and alerts on every trade event.\n"
-        f"Use /scan to see current indicator scores.",
-        parse_mode="HTML")
 
 @owner_only
 async def cmd_remove_symbol(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1973,21 +1954,19 @@ async def cmd_add_meme(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"{symbol} already in MemeBot watchlist.")
         return
 
-    await update.message.reply_text(f"Validating {symbol} on Bybit...")
-    try:
-        info = await asyncio.to_thread(
-            bybit_session.get_instruments_info, category="linear", symbol=symbol)
-        if not info["result"]["list"]:
-            await update.message.reply_text(
-                f"<b>{symbol}</b> not found on Bybit linear futures.",
-                parse_mode="HTML")
-            return
-    except Exception as e:
-        await update.message.reply_text(f"Could not validate {symbol}: {e}")
-
     meme_symbols.append(symbol)
-    save_state()
-    subscribe_ws_symbol(symbol)
+
+    # Reply FIRST so Telegram never appears frozen
+    await update.message.reply_text(
+        f"<b>{symbol}</b> added to MemeBot!\n"
+        f"Scanning every {MEME_POLL_INTERVAL}s on 5m timeframe.\n"
+        f"Max 5x leverage | 8% position | TP1 at 1:1 RR\n"
+        f"30-min dead trade timeout active.",
+        parse_mode="HTML")
+
+    # Background tasks after reply
+    await asyncio.to_thread(save_state)
+    asyncio.create_task(asyncio.to_thread(subscribe_ws_symbol, symbol))
 
     idx   = meme_symbols.index(symbol)
     delay = MEME_POLL_INTERVAL + idx * 1.5
@@ -2002,13 +1981,6 @@ async def cmd_add_meme(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             data={"symbol": symbol, "last_meme_report": 0,
                   "circuit_alerted": False},
         )
-
-    await update.message.reply_text(
-        f"<b>{symbol}</b> added to MemeBot!\n"
-        f"Scanning every {MEME_POLL_INTERVAL}s on 5m timeframe.\n"
-        f"Max 5x leverage | 8% position | TP1 at 1:1 RR\n"
-        f"30-min dead trade timeout active.",
-        parse_mode="HTML")
 
 
 @owner_only
@@ -2171,8 +2143,12 @@ async def main() -> None:
     # Start WebSocket
     if start_websocket():
         all_syms = list(set(monitored_symbols + meme_symbols))
+        # subscribe_ws_symbol can block — run all in thread pool at startup
         for sym in all_syms:
-            subscribe_ws_symbol(sym)
+            try:
+                subscribe_ws_symbol(sym)
+            except Exception as e:
+                print(f"[WS] subscribe {sym} error: {e}")
         print(f"[WS] Subscribed to {len(all_syms)} symbols "
               f"(psych:{len(monitored_symbols)} meme:{len(meme_symbols)})")
 
