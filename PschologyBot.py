@@ -66,12 +66,29 @@ try:
 except ValueError:
     raise ValueError(f"CHAT_ID must be an integer, got: {CHAT_ID_STR}")
 
-# Trading params
+# ── PsychologyBot trading params ──────────────────────────────────────────
 LEVERAGE         = 10
 POSITION_PCT     = 0.20     # 20% of balance per symbol
 POLL_INTERVAL    = 10       # seconds between monitor cycles
 DEAD_TRADE_DAYS  = 7        # close dead trade after 7 days
 SL_BUFFER        = 0.02     # 2% breathing room on initial SL
+
+# ── MemeBot trading params (volatile coins — 5m/3m timeframes) ────────────
+MEME_LEVERAGE        = 5        # Hard cap 5x — memecoins wick massively
+MEME_POSITION_PCT    = 0.08     # 8% of balance — smaller, safer
+MEME_POLL_INTERVAL   = 10       # seconds between monitor cycles
+MEME_DEAD_MINUTES    = 30       # close dead trade after 30 minutes
+MEME_MAX_POSITIONS   = 2        # max simultaneous memecoin positions
+MEME_VOL_MULT        = 3.0      # volume spike: 3× 20-period average
+MEME_RSI_LONG_MIN    = 45       # RSI floor for long entries
+MEME_RSI_LONG_MAX    = 75       # RSI ceiling for long entries
+MEME_RSI_SHORT_MIN   = 25       # RSI floor for short entries
+MEME_RSI_SHORT_MAX   = 55       # RSI ceiling for short entries
+MEME_RSI_EXIT_HIGH   = 85       # RSI emergency exit (long overbought)
+MEME_RSI_EXIT_LOW    = 15       # RSI emergency exit (short oversold)
+MEME_TP1_RR          = 1.0      # TP1 at 1:1 RR → close 50%
+MEME_TP2_RR          = 2.0      # TP2 at 1:2 RR → close 30%
+MEME_SL_ATR_MULT     = 1.5      # SL at 1.5× ATR(14) on 5m chart
 
 # Indicator params
 ADX_PERIOD   = 14
@@ -158,9 +175,9 @@ def get_ws_price(symbol: str) -> Optional[float]:
 # ─────────────────────────────────────────────────────────────────────────────
 #  STATE PERSISTENCE
 # ─────────────────────────────────────────────────────────────────────────────
-# Global state dicts
+# ── PsychologyBot global state ────────────────────────────────────────────
 monitored_symbols: list[str]              = []
-symbol_positions:  dict[str, dict]        = {}   # symbol -> position dict
+symbol_positions:  dict[str, dict]        = {}
 bot_paused:        bool                   = False
 daily_loss:        float                  = 0.0
 weekly_loss:       float                  = 0.0
@@ -168,10 +185,19 @@ consec_losses:     int                    = 0
 last_reset_day:    str                    = ""
 last_reset_week:   str                    = ""
 
+# ── MemeBot global state ───────────────────────────────────────────────────
+meme_symbols:       list[str]             = []
+meme_positions:     dict[str, dict]       = {}   # symbol -> memecoin position
+meme_paused:        bool                  = False
+meme_daily_loss:    float                 = 0.0
+meme_consec_losses: int                   = 0
+meme_monitor_running: dict[str, bool]     = {}   # per-symbol execution guard
+
 def save_state() -> None:
     try:
         os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
         state = {
+            # PsychologyBot state
             "monitored_symbols": monitored_symbols,
             "symbol_positions":  symbol_positions,
             "bot_paused":        bot_paused,
@@ -180,6 +206,12 @@ def save_state() -> None:
             "consec_losses":     consec_losses,
             "last_reset_day":    last_reset_day,
             "last_reset_week":   last_reset_week,
+            # MemeBot state
+            "meme_symbols":      meme_symbols,
+            "meme_positions":    meme_positions,
+            "meme_paused":       meme_paused,
+            "meme_daily_loss":   meme_daily_loss,
+            "meme_consec_losses":meme_consec_losses,
         }
         with open(STATE_FILE, "w") as f:
             json.dump(state, f, indent=2, default=str)
@@ -189,12 +221,14 @@ def save_state() -> None:
 def load_state() -> bool:
     global monitored_symbols, symbol_positions, bot_paused
     global daily_loss, weekly_loss, consec_losses, last_reset_day, last_reset_week
+    global meme_symbols, meme_positions, meme_paused, meme_daily_loss, meme_consec_losses
     if not os.path.exists(STATE_FILE):
         logger.info("[STATE] No state file found — starting fresh")
         return False
     try:
         with open(STATE_FILE) as f:
             s = json.load(f)
+        # PsychologyBot state
         monitored_symbols = s.get("monitored_symbols", [])
         symbol_positions  = s.get("symbol_positions",  {})
         bot_paused        = s.get("bot_paused",        False)
@@ -203,7 +237,14 @@ def load_state() -> bool:
         consec_losses     = s.get("consec_losses",     0)
         last_reset_day    = s.get("last_reset_day",    "")
         last_reset_week   = s.get("last_reset_week",   "")
-        logger.info(f"[STATE] Loaded — {len(monitored_symbols)} symbols, {len(symbol_positions)} open positions")
+        # MemeBot state
+        meme_symbols      = s.get("meme_symbols",      [])
+        meme_positions    = s.get("meme_positions",    {})
+        meme_paused       = s.get("meme_paused",       False)
+        meme_daily_loss   = s.get("meme_daily_loss",   0.0)
+        meme_consec_losses= s.get("meme_consec_losses",0)
+        logger.info(f"[STATE] Loaded — psych:{len(monitored_symbols)} symbols, "
+                    f"meme:{len(meme_symbols)} symbols")
         return True
     except Exception as e:
         logger.error(f"[STATE] load failed: {e}")
@@ -1358,6 +1399,744 @@ async def cmd_balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         f"💰 Balance: <code>{bal:.2f} USDT</code>", parse_mode="HTML")
 
+
+
+# =============================================================================
+#  MEMEBOT — Fast momentum strategy for highly volatile coins
+#  Timeframes : 5m (entry) + 3m (trailing exit)
+#  Leverage   : 5x hard cap | Position: 8% of balance
+#  Filters    : Volume spike + RSI zone + VWAP + Candle body +
+#               EMA micro-trend + No wick trap (ALL 6 required)
+#  Exits      : TP1 1:1 (50%) -> TP2 1:2 (30%) -> Trail 20% on 3m
+#  Emergency  : Volume collapse / wick spike / RSI extreme / 30min timeout
+# =============================================================================
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MEMEBOT — SYNCHRONOUS INDICATOR ENGINE (runs in thread)
+# ─────────────────────────────────────────────────────────────────────────────
+def _meme_compute_indicators(df_5m: pd.DataFrame, direction: str) -> dict:
+    """
+    Compute all 6 MemeBot entry filters on 5-minute candles.
+    Pure synchronous — called via asyncio.to_thread().
+    """
+    passed = []
+    failed = []
+    debug  = {}
+
+    price  = float(df_5m["close"].iloc[-1])
+    debug["price"] = price
+
+    # Filter 1: Volume spike >= 3x 20-period average
+    vol     = df_5m["volume"]
+    avg_vol = float(vol.iloc[-21:-1].mean())
+    cur_vol = float(vol.iloc[-2])
+    vol_ratio = cur_vol / avg_vol if avg_vol > 0 else 0
+    debug["vol_ratio"] = round(vol_ratio, 2)
+    debug["avg_vol"]   = round(avg_vol, 2)
+    lbl = f"VolSpike({vol_ratio:.1f}x)"
+    (passed if vol_ratio >= MEME_VOL_MULT else failed).append(lbl)
+
+    # Filter 2: RSI(7) in valid zone
+    rsi_s = ta.rsi(df_5m["close"], length=7)
+    rsi   = float(rsi_s.iloc[-1]) if rsi_s is not None and not rsi_s.isna().iloc[-1] else 50.0
+    debug["rsi"] = round(rsi, 2)
+    if direction == "LONG":
+        rsi_ok = MEME_RSI_LONG_MIN <= rsi <= MEME_RSI_LONG_MAX
+        lbl    = f"RSI({MEME_RSI_LONG_MIN}-{MEME_RSI_LONG_MAX})"
+    else:
+        rsi_ok = MEME_RSI_SHORT_MIN <= rsi <= MEME_RSI_SHORT_MAX
+        lbl    = f"RSI({MEME_RSI_SHORT_MIN}-{MEME_RSI_SHORT_MAX})"
+    (passed if rsi_ok else failed).append(lbl)
+
+    # Filter 3: Price above/below VWAP
+    tp_col   = (df_5m["high"] + df_5m["low"] + df_5m["close"]) / 3
+    cum_vol  = df_5m["volume"].cumsum()
+    vwap_val = float((tp_col * df_5m["volume"]).cumsum().iloc[-1] / cum_vol.iloc[-1]) if cum_vol.iloc[-1] > 0 else price
+    debug["vwap"] = round(vwap_val, 6)
+    if direction == "LONG":
+        (passed if price > vwap_val else failed).append("AboveVWAP")
+    else:
+        (passed if price < vwap_val else failed).append("BelowVWAP")
+
+    # Filter 4 (MANDATORY): Strong 5m candle body >= 60% of range
+    c        = df_5m.iloc[-2]
+    body     = abs(c["close"] - c["open"])
+    rng      = c["high"] - c["low"]
+    body_pct = body / rng if rng > 0 else 0
+    debug["body_pct"] = round(body_pct, 3)
+    if direction == "LONG":
+        candle_ok = (c["close"] > c["open"]) and (body_pct >= 0.60)
+        lbl = "BullishBody60pct"
+    else:
+        candle_ok = (c["close"] < c["open"]) and (body_pct >= 0.60)
+        lbl = "BearishBody60pct"
+    (passed if candle_ok else failed).append(lbl)
+
+    # Filter 5 (MANDATORY): EMA9 above EMA21 (micro-trend)
+    ema9  = float(df_5m["close"].ewm(span=9,  adjust=False).mean().iloc[-1])
+    ema21 = float(df_5m["close"].ewm(span=21, adjust=False).mean().iloc[-1])
+    debug["ema9"]  = round(ema9,  6)
+    debug["ema21"] = round(ema21, 6)
+    if direction == "LONG":
+        (passed if ema9 > ema21 else failed).append("EMA9aboveEMA21")
+    else:
+        (passed if ema9 < ema21 else failed).append("EMA9belowEMA21")
+
+    # Filter 6: No wick trap
+    if rng > 0:
+        if direction == "LONG":
+            upper_wick = c["high"] - max(c["open"], c["close"])
+            wick_ok    = (upper_wick / rng) < 0.40
+            lbl        = "NoUpperWickTrap"
+        else:
+            lower_wick = min(c["open"], c["close"]) - c["low"]
+            wick_ok    = (lower_wick / rng) < 0.40
+            lbl        = "NoLowerWickTrap"
+    else:
+        wick_ok = False
+        lbl     = "NoWickTrap"
+    (passed if wick_ok else failed).append(lbl)
+
+    # ATR(14) on 5m for SL calculation
+    atr_s = ta.atr(df_5m["high"], df_5m["low"], df_5m["close"], length=14)
+    atr   = float(atr_s.iloc[-1]) if atr_s is not None and not atr_s.isna().iloc[-1] else price * 0.01
+    debug["atr"] = round(atr, 6)
+
+    # Both mandatory filters (4 & 5) + all 6 total required
+    m4 = "BullishBody60pct" if direction == "LONG" else "BearishBody60pct"
+    m5 = "EMA9aboveEMA21"   if direction == "LONG" else "EMA9belowEMA21"
+    should_enter = (m4 in passed) and (m5 in passed) and len(passed) == 6
+
+    return {
+        "should_enter": should_enter,
+        "score":   len(passed),
+        "passed":  passed,
+        "failed":  failed,
+        "debug":   debug,
+        "atr":     atr,
+        "ema9":    ema9,
+        "ema21":   ema21,
+        "vwap":    vwap_val,
+    }
+
+
+def _meme_check_emergency_exit(df_5m: pd.DataFrame, direction: str,
+                               entry_vol: float) -> tuple:
+    """Check 3 emergency exit conditions. Returns (should_exit, reason)."""
+    c    = df_5m.iloc[-2]
+    body = abs(c["close"] - c["open"])
+    rng  = c["high"] - c["low"]
+    cur_vol = float(df_5m["volume"].iloc[-2])
+
+    if entry_vol > 0 and cur_vol < entry_vol * 0.30:
+        return True, f"Volume collapsed to {cur_vol/entry_vol*100:.0f}% of entry vol"
+
+    if rng > 0 and body > 0 and (rng / body) > 3.0:
+        return True, f"Wick spike — range {rng/body:.1f}x body (manipulation)"
+
+    rsi_s = ta.rsi(df_5m["close"], length=7)
+    if rsi_s is not None and not rsi_s.isna().iloc[-1]:
+        rsi = float(rsi_s.iloc[-1])
+        if direction == "LONG" and rsi > MEME_RSI_EXIT_HIGH:
+            return True, f"RSI(7) overbought at {rsi:.1f}"
+        if direction == "SHORT" and rsi < MEME_RSI_EXIT_LOW:
+            return True, f"RSI(7) oversold at {rsi:.1f}"
+
+    return False, ""
+
+
+def _meme_check_trailing_sl(df_3m: pd.DataFrame, direction: str,
+                            cur_sl: float) -> Optional[float]:
+    """Trail SL on 3m candle lows/highs. Returns new SL or None."""
+    try:
+        last = df_3m.iloc[-2]
+        if direction == "LONG":
+            candidate = float(last["low"])
+            return round(candidate, 6) if candidate > cur_sl else None
+        else:
+            candidate = float(last["high"])
+            return round(candidate, 6) if candidate < cur_sl else None
+    except Exception:
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MEMEBOT — SET LEVERAGE (hard cap 5x)
+# ─────────────────────────────────────────────────────────────────────────────
+def _meme_sync_set_leverage(symbol: str) -> int:
+    import math
+    try:
+        _, _, _, _, max_lev = _sync_get_instrument_constraints(symbol)
+        actual_lev = min(MEME_LEVERAGE, math.floor(max_lev))
+        if actual_lev < 1:
+            actual_lev = 1
+        bybit_session.set_leverage(
+            category="linear", symbol=symbol,
+            buyLeverage=str(actual_lev), sellLeverage=str(actual_lev))
+        logger.info(f"[MEME][{symbol}] Leverage set to {actual_lev}x")
+        return actual_lev
+    except Exception as e:
+        logger.warning(f"[MEME] set_leverage({symbol}): {e}")
+        return 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MEMEBOT — TRADE ENTRY
+# ─────────────────────────────────────────────────────────────────────────────
+async def meme_open_trade(symbol: str, direction: str,
+                          indicators: dict, bot) -> None:
+    global meme_consec_losses
+
+    if len(meme_positions) >= MEME_MAX_POSITIONS:
+        logger.info(f"[MEME][{symbol}] Max positions reached — skipping")
+        return
+
+    actual_lev = await asyncio.to_thread(_meme_sync_set_leverage, symbol)
+
+    entry = await get_price(symbol)
+    if not entry:
+        await alert(bot, f"[MEME][{symbol}] Cannot fetch price — skipped.")
+        return
+
+    balance = await get_balance()
+    if not balance:
+        await alert(bot, f"[MEME][{symbol}] Cannot fetch balance — skipped.")
+        return
+
+    atr     = indicators["atr"]
+    sl_dist = atr * MEME_SL_ATR_MULT
+    if direction == "LONG":
+        sl  = round(entry - sl_dist, 6)
+        tp1 = round(entry + sl_dist * MEME_TP1_RR, 6)
+        tp2 = round(entry + sl_dist * MEME_TP2_RR, 6)
+    else:
+        sl  = round(entry + sl_dist, 6)
+        tp1 = round(entry - sl_dist * MEME_TP1_RR, 6)
+        tp2 = round(entry - sl_dist * MEME_TP2_RR, 6)
+
+    min_q, max_q, step, min_notional, max_lev = await get_instrument_constraints(symbol)
+    raw_qty = (balance * MEME_POSITION_PCT * actual_lev) / entry
+    raw_qty = max(raw_qty, min_notional / entry)
+    qty     = _round_qty(raw_qty, min_q, step)
+
+    if qty <= 0:
+        await alert(bot, f"[MEME][{symbol}] Position size too small.")
+        return
+
+    side   = "Buy" if direction == "LONG" else "Sell"
+    result = await place_order(symbol, side, qty)
+    if not result or "__error__" in result:
+        err = result.get("__error__", "Unknown") if result else "No response"
+        await alert(bot,
+            f"[MEME] Order failed — {symbol} {direction}\n"
+            f"Reason: {err}")
+        return
+
+    await asyncio.sleep(1)
+    real_entry = await asyncio.to_thread(_sync_get_position_entry, symbol)
+    fill_price = real_entry if real_entry else entry
+
+    await set_sl(symbol, sl)
+
+    entry_vol = indicators["debug"].get("avg_vol", 0) * MEME_VOL_MULT
+
+    pos = {
+        "symbol":       symbol,
+        "direction":    direction,
+        "entry_price":  fill_price,
+        "sl_price":     sl,
+        "tp1_price":    tp1,
+        "tp2_price":    tp2,
+        "original_qty": qty,
+        "remaining_qty":qty,
+        "tp1_hit":      False,
+        "tp2_hit":      False,
+        "entry_time":   time.time(),
+        "entry_vol":    entry_vol,
+        "score":        indicators["score"],
+        "leverage":     actual_lev,
+    }
+    meme_positions[symbol] = pos
+    meme_consec_losses = 0
+    save_state()
+
+    def esc(s): return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    f_str = " | ".join([f"OK:{esc(p)}" for p in indicators["passed"]])
+    bal_used = balance * MEME_POSITION_PCT
+
+    msg = (
+        f"<b>MEME TRADE OPENED — {symbol} {direction}</b>\n"
+        f"Entry  : <code>{fill_price:.6g}</code>\n"
+        f"SL     : <code>{sl:.6g}</code>  (1.5x ATR)\n"
+        f"TP1    : <code>{tp1:.6g}</code>  (1:1 RR, close 50%)\n"
+        f"TP2    : <code>{tp2:.6g}</code>  (1:2 RR, close 30%)\n"
+        f"TP3    : Trailing 20% on 3m candle lows\n"
+        f"Score  : {indicators['score']}/6 — {f_str}\n"
+        f"Qty    : {qty}  |  Leverage: {actual_lev}x  |  Bal used: {bal_used:.2f} USDT\n"
+        f"Dead trade close in 30 min if no TP1"
+    )
+    await alert(bot, msg)
+    logger.info(f"[MEME][{symbol}] Trade opened {direction} @ {fill_price}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MEMEBOT — POSITION MANAGEMENT
+# ─────────────────────────────────────────────────────────────────────────────
+async def meme_manage_position(pos: dict, bot) -> None:
+    global meme_consec_losses, meme_daily_loss
+    symbol    = pos["symbol"]
+    direction = pos["direction"]
+
+    price, df_5m, df_3m = await asyncio.gather(
+        asyncio.to_thread(_sync_get_price, symbol),
+        asyncio.to_thread(_sync_get_klines, symbol, "5",  100),
+        asyncio.to_thread(_sync_get_klines, symbol, "3",   60),
+    )
+
+    if not price or df_5m is None:
+        return
+
+    def est_pnl():
+        diff = (price - pos["entry_price"]) if direction == "LONG" \
+               else (pos["entry_price"] - price)
+        return diff * pos["remaining_qty"] * pos["leverage"]
+
+    # Dead trade: 30-minute timeout
+    if not pos["tp1_hit"]:
+        elapsed_min = (time.time() - pos["entry_time"]) / 60
+        if elapsed_min >= MEME_DEAD_MINUTES:
+            await close_full(symbol, direction)
+            pnl = est_pnl()
+            meme_daily_loss += min(pnl, 0)
+            meme_positions.pop(symbol, None)
+            save_state()
+            await alert(bot,
+                f"<b>[MEME] DEAD TRADE — {symbol} {direction}</b>\n"
+                f"No TP1 after {MEME_DEAD_MINUTES} minutes.\n"
+                f"Closed @ <code>{price:.6g}</code>  Est PnL: {pnl:+.2f} USDT\n"
+                f"Memecoin lost momentum. Going FLAT.")
+            return
+
+    # Emergency exits
+    should_exit, reason = await asyncio.to_thread(
+        _meme_check_emergency_exit, df_5m, direction, pos["entry_vol"])
+    if should_exit:
+        min_q, _, step, _, _ = await get_instrument_constraints(symbol)
+        close_qty  = _round_qty(pos["remaining_qty"] * 0.50, min_q, step)
+        close_side = "Sell" if direction == "LONG" else "Buy"
+        await place_order(symbol, close_side, close_qty, reduce_only=True)
+        pos["remaining_qty"] = round(pos["remaining_qty"] * 0.50, 8)
+        save_state()
+        await alert(bot,
+            f"<b>[MEME] EMERGENCY EXIT 50% — {symbol} {direction}</b>\n"
+            f"Reason: {reason}\n"
+            f"Closed 50% @ <code>{price:.6g}</code>\n"
+            f"Remaining 50% still open — monitoring closely")
+        return
+
+    # Hard SL
+    sl = pos["sl_price"]
+    sl_hit = (direction == "LONG"  and price <= sl) or \
+             (direction == "SHORT" and price >= sl)
+    if sl_hit:
+        await close_full(symbol, direction)
+        pnl = est_pnl()
+        meme_consec_losses += 1
+        meme_daily_loss    += min(pnl, 0)
+        meme_positions.pop(symbol, None)
+        save_state()
+        warn = f"\n{meme_consec_losses} consecutive losses!" if meme_consec_losses >= 2 else ""
+        await alert(bot,
+            f"<b>[MEME] STOP LOSS — {symbol} {direction}</b>\n"
+            f"SL: <code>{sl:.6g}</code>  Price: <code>{price:.6g}</code>\n"
+            f"Est PnL: {pnl:+.2f} USDT{warn}")
+        return
+
+    # TP1: 1:1 RR -> close 50%
+    if not pos["tp1_hit"]:
+        tp1_hit = (direction == "LONG"  and price >= pos["tp1_price"]) or \
+                  (direction == "SHORT" and price <= pos["tp1_price"])
+        if tp1_hit:
+            min_q, _, step, _, _ = await get_instrument_constraints(symbol)
+            close_qty  = _round_qty(pos["original_qty"] * 0.50, min_q, step)
+            close_side = "Sell" if direction == "LONG" else "Buy"
+            await place_order(symbol, close_side, close_qty, reduce_only=True)
+            pos["remaining_qty"] = round(pos["original_qty"] * 0.50, 8)
+            pos["tp1_hit"]  = True
+            pos["sl_price"] = pos["entry_price"]
+            await set_sl(symbol, pos["entry_price"])
+            meme_consec_losses = 0
+            pnl_p = abs(pos["tp1_price"] - pos["entry_price"]) * close_qty * pos["leverage"]
+            save_state()
+            await alert(bot,
+                f"<b>[MEME] TP1 HIT — {symbol} {direction}</b>\n"
+                f"Closed 50% @ <code>{price:.6g}</code>\n"
+                f"Est partial PnL: +{pnl_p:.2f} USDT\n"
+                f"SL moved to breakeven <code>{pos['entry_price']:.6g}</code>\n"
+                f"Riding to TP2 @ <code>{pos['tp2_price']:.6g}</code>")
+            return
+
+    # TP2: 1:2 RR -> close 30%
+    if pos["tp1_hit"] and not pos["tp2_hit"]:
+        tp2_hit = (direction == "LONG"  and price >= pos["tp2_price"]) or \
+                  (direction == "SHORT" and price <= pos["tp2_price"])
+        if tp2_hit:
+            min_q, _, step, _, _ = await get_instrument_constraints(symbol)
+            close_qty  = _round_qty(pos["original_qty"] * 0.30, min_q, step)
+            close_side = "Sell" if direction == "LONG" else "Buy"
+            await place_order(symbol, close_side, close_qty, reduce_only=True)
+            pos["remaining_qty"] = round(pos["original_qty"] * 0.20, 8)
+            pos["tp2_hit"] = True
+            pnl_p = abs(pos["tp2_price"] - pos["entry_price"]) * close_qty * pos["leverage"]
+            save_state()
+            await alert(bot,
+                f"<b>[MEME] TP2 HIT — {symbol} {direction}</b>\n"
+                f"Closed 30% @ <code>{price:.6g}</code>\n"
+                f"Est partial PnL: +{pnl_p:.2f} USDT\n"
+                f"Trailing last 20% on 3m candle lows/highs")
+            return
+
+    # TP3: Trail last 20% on 3m candles
+    if pos["tp2_hit"] and df_3m is not None:
+        new_sl = await asyncio.to_thread(
+            _meme_check_trailing_sl, df_3m, direction, pos["sl_price"])
+        if new_sl:
+            pos["sl_price"] = new_sl
+            await set_sl(symbol, new_sl)
+            save_state()
+            logger.info(f"[MEME][{symbol}] Trailing SL -> {new_sl:.6g}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MEMEBOT — MAIN MONITOR LOOP
+# ─────────────────────────────────────────────────────────────────────────────
+async def _meme_monitor_inner(symbol: str, bot, job_data: dict) -> None:
+    global meme_daily_loss, meme_consec_losses, meme_paused
+
+    balance = await get_balance()
+
+    paused_circuit = (
+        meme_daily_loss    <= -0.03 * balance or
+        meme_consec_losses >= 3
+    )
+
+    if paused_circuit and not job_data.get("circuit_alerted"):
+        await alert(bot,
+            f"<b>[MEME] CIRCUIT BREAKER</b>\n"
+            f"Daily loss: {meme_daily_loss:.2f} USDT | "
+            f"Consec losses: {meme_consec_losses}\n"
+            f"No new MEME entries. Use /meme_resume to reset.")
+        job_data["circuit_alerted"] = True
+    elif not paused_circuit:
+        job_data["circuit_alerted"] = False
+
+    if symbol in meme_positions:
+        await meme_manage_position(meme_positions[symbol], bot)
+        await _meme_status_report(symbol, bot, job_data, balance)
+        return
+
+    if meme_paused or paused_circuit:
+        return
+
+    if len(meme_positions) >= MEME_MAX_POSITIONS:
+        return
+
+    df_5m = await get_klines(symbol, "5", 100)
+    if df_5m is None or len(df_5m) < 30:
+        return
+
+    for direction in ("LONG", "SHORT"):
+        indicators = await asyncio.to_thread(_meme_compute_indicators, df_5m, direction)
+        if indicators["should_enter"]:
+            logger.info(f"[MEME][{symbol}] {direction} signal ({indicators['score']}/6)")
+            await meme_open_trade(symbol, direction, indicators, bot)
+            return
+
+    await _meme_status_report(symbol, bot, job_data, balance, df_5m=df_5m)
+
+
+async def _meme_status_report(symbol: str, bot, job_data: dict,
+                               balance: float, df_5m=None) -> None:
+    now = time.time()
+    if now - job_data.get("last_meme_report", 0) < 1800:
+        return
+    job_data["last_meme_report"] = now
+
+    pos = meme_positions.get(symbol)
+    if pos:
+        price = await get_price(symbol)
+        diff  = (price - pos["entry_price"]) if pos["direction"] == "LONG" \
+                else (pos["entry_price"] - price)
+        pnl   = diff * pos["remaining_qty"] * pos["leverage"]
+        mins  = (time.time() - pos["entry_time"]) / 60
+        e     = "LONG" if pos["direction"] == "LONG" else "SHORT"
+        trade_info = (
+            f"Open {e} position\n"
+            f"Entry: <code>{pos['entry_price']:.6g}</code>  "
+            f"Now: <code>{price:.6g}</code>\n"
+            f"SL: <code>{pos['sl_price']:.6g}</code>\n"
+            f"TP1: {'YES' if pos['tp1_hit'] else 'NO'}  "
+            f"TP2: {'YES' if pos['tp2_hit'] else 'NO'}\n"
+            f"Est PnL: {pnl:+.2f} USDT  |  Open: {mins:.0f}m"
+        )
+    else:
+        trade_info = "No open position — watching for momentum signal"
+
+    ind_text = ""
+    if df_5m is not None:
+        try:
+            ind = await asyncio.to_thread(_meme_compute_indicators, df_5m, "LONG")
+            d   = ind["debug"]
+            ind_text = (
+                f"\nIndicators (5m):\n"
+                f"Price: <code>{d.get('price',0):.6g}</code>  "
+                f"RSI(7): <code>{d.get('rsi','?')}</code>\n"
+                f"Vol ratio: <code>{d.get('vol_ratio','?')}x</code>  "
+                f"VWAP: <code>{d.get('vwap','?'):.6g}</code>\n"
+                f"ATR(14): <code>{d.get('atr','?'):.6g}</code>  "
+                f"LONG score: {ind['score']}/6"
+            )
+        except Exception:
+            pass
+
+    await alert(bot,
+        f"<b>[MEME] 30-min Report — {symbol}</b>\n"
+        f"Balance: <code>{balance:.2f} USDT</code>  |  "
+        f"Paused: {'YES' if meme_paused else 'NO'}\n"
+        f"Consec losses: {meme_consec_losses}  |  "
+        f"Daily loss: {meme_daily_loss:.2f} USDT\n"
+        f"Open meme positions: {len(meme_positions)}/{MEME_MAX_POSITIONS}\n"
+        f"\n{trade_info}"
+        f"{ind_text}\n\n"
+        f"5x lev  |  8% bal  |  TP1=1:1  |  30min dead close")
+
+
+async def meme_monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
+    symbol   = context.job.data["symbol"]
+    job_data = context.job.data
+    if meme_monitor_running.get(symbol, False):
+        return
+    meme_monitor_running[symbol] = True
+    try:
+        await _meme_monitor_inner(symbol, context.bot, job_data)
+    except Exception as e:
+        logger.error(f"[MEME][{symbol}] Error: {e}", exc_info=True)
+    finally:
+        meme_monitor_running[symbol] = False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MEMEBOT — TELEGRAM COMMAND HANDLERS
+# ─────────────────────────────────────────────────────────────────────────────
+@owner_only
+async def cmd_meme_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "<b>MemeBot — Volatile Coin Strategy</b>\n"
+        "Timeframes: 5m entry + 3m trailing\n\n"
+        "<b>Commands:</b>\n"
+        "/add_meme SYMBOL — Monitor a memecoin\n"
+        "/remove_meme SYMBOL — Stop monitoring\n"
+        "/meme_status — Positions and scores\n"
+        "/scan_meme SYMBOL — Live indicator scan\n"
+        "/meme_pause — Pause new entries\n"
+        "/meme_resume — Resume entries\n\n"
+        "<b>Entry Filters (ALL 6 required):</b>\n"
+        "1. Volume spike 3x+ above 20-period avg (5m)\n"
+        "2. RSI(7) zone: 45-75 long / 25-55 short\n"
+        "3. Price above VWAP (long) / below (short)\n"
+        "4. MANDATORY: Strong 5m body 60%+ of range\n"
+        "5. MANDATORY: EMA9 above EMA21 (long)\n"
+        "6. No wick trap (wick below 40% of range)\n\n"
+        "<b>Sizing:</b> 8% balance | Max 5x leverage | Max 2 positions\n\n"
+        "<b>Take Profit:</b>\n"
+        "TP1: 1:1 RR close 50% then SL to breakeven\n"
+        "TP2: 1:2 RR close 30%\n"
+        "TP3: Trail last 20% on 3m candle lows\n\n"
+        "<b>Emergency Exits:</b>\n"
+        "Volume collapse 70% below entry vol\n"
+        "Wick spike range 3x+ the candle body\n"
+        "RSI extreme above 85 long / below 15 short\n"
+        "30-minute dead trade timeout\n\n"
+        "<b>Examples:</b>\n"
+        "<code>/add_meme PEPEUSDT</code>\n"
+        "<code>/scan_meme DOGEUSDT</code>",
+        parse_mode="HTML")
+
+
+@owner_only
+async def cmd_add_meme(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not ctx.args:
+        await update.message.reply_text("Usage: /add_meme PEPEUSDT")
+        return
+    symbol = ctx.args[0].upper()
+    if symbol in meme_symbols:
+        await update.message.reply_text(f"{symbol} already in MemeBot watchlist.")
+        return
+
+    await update.message.reply_text(f"Validating {symbol} on Bybit...")
+    try:
+        info = await asyncio.to_thread(
+            bybit_session.get_instruments_info, category="linear", symbol=symbol)
+        if not info["result"]["list"]:
+            await update.message.reply_text(
+                f"<b>{symbol}</b> not found on Bybit linear futures.",
+                parse_mode="HTML")
+            return
+    except Exception as e:
+        await update.message.reply_text(f"Could not validate {symbol}: {e}")
+
+    meme_symbols.append(symbol)
+    save_state()
+    subscribe_ws_symbol(symbol)
+
+    idx   = meme_symbols.index(symbol)
+    delay = MEME_POLL_INTERVAL + idx * 1.5
+
+    if ctx.job_queue:
+        ctx.job_queue.run_repeating(
+            callback=meme_monitor_symbol,
+            interval=MEME_POLL_INTERVAL,
+            first=delay,
+            chat_id=CHAT_ID,
+            name=f"meme_{symbol}_monitor",
+            data={"symbol": symbol, "last_meme_report": 0,
+                  "circuit_alerted": False},
+        )
+
+    await update.message.reply_text(
+        f"<b>{symbol}</b> added to MemeBot!\n"
+        f"Scanning every {MEME_POLL_INTERVAL}s on 5m timeframe.\n"
+        f"Max 5x leverage | 8% position | TP1 at 1:1 RR\n"
+        f"30-min dead trade timeout active.",
+        parse_mode="HTML")
+
+
+@owner_only
+async def cmd_remove_meme(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not ctx.args:
+        await update.message.reply_text("Usage: /remove_meme PEPEUSDT")
+        return
+    symbol = ctx.args[0].upper()
+    if symbol not in meme_symbols:
+        await update.message.reply_text(f"{symbol} not in MemeBot watchlist.")
+        return
+    meme_symbols.remove(symbol)
+    if symbol in meme_positions:
+        await update.message.reply_text(
+            f"{symbol} has open meme position — removed from monitoring "
+            f"but position still open on Bybit.")
+    if ctx.job_queue:
+        for job in ctx.job_queue.get_jobs_by_name(f"meme_{symbol}_monitor"):
+            job.schedule_removal()
+    save_state()
+    await update.message.reply_text(
+        f"<b>{symbol}</b> removed from MemeBot.", parse_mode="HTML")
+
+
+@owner_only
+async def cmd_meme_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    balance = await get_balance()
+    lines = [
+        "<b>MemeBot Status</b>",
+        "Balance: <code>" + f"{balance:.2f} USDT</code>",
+        f"Paused: {'YES' if meme_paused else 'NO'}",
+        f"Consec losses: {meme_consec_losses}",
+        f"Daily loss: {meme_daily_loss:.2f} USDT",
+        f"Open positions: {len(meme_positions)}/{MEME_MAX_POSITIONS}",
+        "",
+        "<b>Watching:</b> " + (", ".join(meme_symbols) or "None"),
+        "",
+    ]
+    if meme_positions:
+        lines.append("<b>Open Meme Positions:</b>")
+        for sym, pos in meme_positions.items():
+            price = await get_price(sym)
+            diff  = (price - pos["entry_price"]) if pos["direction"] == "LONG" \
+                    else (pos["entry_price"] - price)
+            pnl   = diff * pos["remaining_qty"] * pos["leverage"]
+            mins  = (time.time() - pos["entry_time"]) / 60
+            dead  = " DEAD-SOON" if not pos["tp1_hit"] and mins >= 25 else ""
+            lines.append(
+                f"<b>{sym}</b> {pos['direction']}{dead}\n"
+                f"Entry:{pos['entry_price']:.6g}  Now:{price:.6g}\n"
+                f"SL:{pos['sl_price']:.6g}\n"
+                f"TP1:{'YES' if pos['tp1_hit'] else 'NO'}  "
+                f"TP2:{'YES' if pos['tp2_hit'] else 'NO'}\n"
+                f"PnL:{pnl:+.2f} USDT  Open:{mins:.0f}min  Lev:{pos['leverage']}x"
+            )
+    else:
+        lines.append("No open meme positions.")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+@owner_only
+async def cmd_scan_meme(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not ctx.args and not meme_symbols:
+        await update.message.reply_text(
+            "Usage: /scan_meme PEPEUSDT\nOr add symbols first with /add_meme")
+        return
+
+    symbols = [ctx.args[0].upper()] if ctx.args else meme_symbols
+    await update.message.reply_text(f"Scanning {len(symbols)} meme symbol(s)...")
+
+    def esc(s): return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    for symbol in symbols:
+        df_5m = await get_klines(symbol, "5", 100)
+        if df_5m is None or len(df_5m) < 30:
+            await update.message.reply_text(f"{symbol}: Failed to fetch 5m candles.")
+            continue
+
+        for direction in ("LONG", "SHORT"):
+            ind    = await asyncio.to_thread(_meme_compute_indicators, df_5m, direction)
+            d      = ind["debug"]
+            status = "ENTRY SIGNAL!" if ind["should_enter"] else "Waiting"
+            p_str  = " | ".join([f"OK:{esc(p)}" for p in ind["passed"]]) or "none"
+            f_str  = " | ".join([f"NO:{esc(p)}" for p in ind["failed"]]) or "none"
+
+            await update.message.reply_text(
+                f"<b>{symbol} {direction}</b>  {status}\n"
+                f"Score: <b>{ind['score']}/6</b>\n"
+                f"Passed: {p_str}\n"
+                f"Failed: {f_str}\n"
+                f"Price: <code>{d.get('price',0):.6g}</code>  "
+                f"RSI(7): <code>{d.get('rsi','?')}</code>\n"
+                f"Vol ratio: <code>{d.get('vol_ratio','?')}x</code>  "
+                f"(need {MEME_VOL_MULT}x+)\n"
+                f"VWAP: <code>{d.get('vwap','?'):.6g}</code>\n"
+                f"Body pct: <code>{d.get('body_pct','?')}</code>  (need 0.60+)\n"
+                f"EMA9/21: <code>{d.get('ema9','?'):.6g}</code> / "
+                f"<code>{d.get('ema21','?'):.6g}</code>\n"
+                f"ATR(14): <code>{d.get('atr','?'):.6g}</code>",
+                parse_mode="HTML",
+            )
+
+
+@owner_only
+async def cmd_meme_pause(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    global meme_paused
+    meme_paused = True
+    save_state()
+    await update.message.reply_text(
+        "<b>MemeBot paused.</b> No new meme entries.\n"
+        "Existing positions still managed.",
+        parse_mode="HTML")
+
+
+@owner_only
+async def cmd_meme_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    global meme_paused, meme_consec_losses
+    meme_paused        = False
+    meme_consec_losses = 0
+    save_state()
+    await update.message.reply_text(
+        "<b>MemeBot resumed.</b> Scanning for momentum signals.",
+        parse_mode="HTML")
+
+# =============================================================================
+#  END OF MEMEBOT MODULE
+# =============================================================================
+
 async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error(f"Telegram error: {ctx.error}")
     try:
@@ -1381,7 +2160,7 @@ async def main() -> None:
     # Initialise semaphore
     _api_semaphore = asyncio.Semaphore(5)
 
-    print("=== PsychologyBot v3 startup ===")
+    print("=== PsychologyBot v3 + MemeBot startup ===")
     print(f"TELEGRAM_TOKEN loaded ({len(TELEGRAM_TOKEN)} chars)")
     print(f"CHAT_ID: {CHAT_ID}")
     print(f"Thread pool: {_executor._max_workers} workers")
@@ -1391,9 +2170,11 @@ async def main() -> None:
 
     # Start WebSocket
     if start_websocket():
-        for sym in monitored_symbols:
+        all_syms = list(set(monitored_symbols + meme_symbols))
+        for sym in all_syms:
             subscribe_ws_symbol(sym)
-        print(f"[WS] Subscribed to {len(monitored_symbols)} symbols")
+        print(f"[WS] Subscribed to {len(all_syms)} symbols "
+              f"(psych:{len(monitored_symbols)} meme:{len(meme_symbols)})")
 
     # Build Telegram app
     app = Application.builder().token(TELEGRAM_TOKEN).updater(None).build()
@@ -1405,6 +2186,14 @@ async def main() -> None:
     app.add_handler(CommandHandler("pause",          cmd_pause))
     app.add_handler(CommandHandler("resume",         cmd_resume))
     app.add_handler(CommandHandler("balance",        cmd_balance))
+    # ── MemeBot commands ──────────────────────────────────────────────────────
+    app.add_handler(CommandHandler("memebot",        cmd_meme_start))
+    app.add_handler(CommandHandler("add_meme",       cmd_add_meme))
+    app.add_handler(CommandHandler("remove_meme",    cmd_remove_meme))
+    app.add_handler(CommandHandler("meme_status",    cmd_meme_status))
+    app.add_handler(CommandHandler("scan_meme",      cmd_scan_meme))
+    app.add_handler(CommandHandler("meme_pause",     cmd_meme_pause))
+    app.add_handler(CommandHandler("meme_resume",    cmd_meme_resume))
     app.add_error_handler(error_handler)
 
     # Recurring jobs
@@ -1431,6 +2220,22 @@ async def main() -> None:
                           "circuit_alerted": False},
                 )
                 print(f"[STARTUP] Monitor job for {sym} (first run in {delay:.1f}s)")
+
+        # Recreate MemeBot monitoring jobs for restored symbols
+        for i, sym in enumerate(meme_symbols):
+            existing = app.job_queue.get_jobs_by_name(f"meme_{sym}_monitor")
+            if not existing:
+                delay = MEME_POLL_INTERVAL + i * 1.5
+                app.job_queue.run_repeating(
+                    callback=meme_monitor_symbol,
+                    interval=MEME_POLL_INTERVAL,
+                    first=delay,
+                    chat_id=CHAT_ID,
+                    name=f"meme_{sym}_monitor",
+                    data={"symbol": sym, "last_meme_report": 0,
+                          "circuit_alerted": False},
+                )
+                print(f"[STARTUP] MemeBot monitor for {sym} (first run in {delay:.1f}s)")
 
     # Webhook
     base_url    = os.environ.get("RENDER_EXTERNAL_HOSTNAME",
