@@ -1642,19 +1642,25 @@ async def meme_open_trade(symbol: str, direction: str,
     save_state()
 
     def esc(s): return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    f_str = " | ".join([f"OK:{esc(p)}" for p in indicators["passed"]])
+    f_str   = " ".join([f"✅{esc(p)}" for p in indicators["passed"]])
+    fail_s  = " ".join([f"❌{esc(p)}" for p in indicators["failed"]])
+    emoji   = "🟢" if direction == "LONG" else "🔴"
     bal_used = balance * MEME_POSITION_PCT
+    lev_note = f"\n⚠️ Leverage capped at {actual_lev}x (symbol max, requested {MEME_LEVERAGE}x)" if actual_lev < MEME_LEVERAGE else ""
 
     msg = (
-        f"<b>MEME TRADE OPENED — {symbol} {direction}</b>\n"
-        f"Entry  : <code>{fill_price:.6g}</code>\n"
-        f"SL     : <code>{sl:.6g}</code>  (1.5x ATR)\n"
-        f"TP1    : <code>{tp1:.6g}</code>  (1:1 RR, close 50%)\n"
-        f"TP2    : <code>{tp2:.6g}</code>  (1:2 RR, close 30%)\n"
-        f"TP3    : Trailing 20% on 3m candle lows\n"
-        f"Score  : {indicators['score']}/6 — {f_str}\n"
-        f"Qty    : {qty}  |  Leverage: {actual_lev}x  |  Bal used: {bal_used:.2f} USDT\n"
-        f"Dead trade close in 30 min if no TP1"
+        f"{emoji} <b>MEME TRADE OPENED — {symbol} {direction}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📌 Entry  : <code>{fill_price:.6g}</code>\n"
+        f"🛡 SL     : <code>{sl:.6g}</code>  (1.5x ATR)\n"
+        f"🎯 TP1    : <code>{tp1:.6g}</code>  (1:1 RR → close 50%)\n"
+        f"🎯 TP2    : <code>{tp2:.6g}</code>  (1:2 RR → close 30%)\n"
+        f"🌊 TP3    : Trailing 20% on 3m candle lows\n"
+        f"📊 Score  : {indicators['score']}/6\n"
+        f"✅ Passed : {f_str}\n"
+        f"❌ Failed : {fail_s}\n"
+        f"⚡ Qty    : {qty}  |  Leverage: {actual_lev}x  |  Bal used: {bal_used:.2f} USDT\n"
+        f"⏱ Dead trade close in 30 min if no TP1{lev_note}"
     )
     await alert(bot, msg)
     logger.info(f"[MEME][{symbol}] Trade opened {direction} @ {fill_price}")
@@ -1692,10 +1698,12 @@ async def meme_manage_position(pos: dict, bot) -> None:
             meme_positions.pop(symbol, None)
             save_state()
             await alert(bot,
-                f"<b>[MEME] DEAD TRADE — {symbol} {direction}</b>\n"
+                f"⏱ <b>[MEME] DEAD TRADE — {symbol} {direction}</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"No TP1 after {MEME_DEAD_MINUTES} minutes.\n"
-                f"Closed @ <code>{price:.6g}</code>  Est PnL: {pnl:+.2f} USDT\n"
-                f"Memecoin lost momentum. Going FLAT.")
+                f"Closed @ <code>{price:.6g}</code>\n"
+                f"Est PnL: {pnl:+.2f} USDT\n"
+                f"🟡 Memecoin lost momentum. Bot goes FLAT on {symbol}.")
             return
 
     # Emergency exits
@@ -1709,10 +1717,11 @@ async def meme_manage_position(pos: dict, bot) -> None:
         pos["remaining_qty"] = round(pos["remaining_qty"] * 0.50, 8)
         save_state()
         await alert(bot,
-            f"<b>[MEME] EMERGENCY EXIT 50% — {symbol} {direction}</b>\n"
-            f"Reason: {reason}\n"
+            f"🚨 <b>[MEME] EMERGENCY EXIT 50% — {symbol} {direction}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚠️ Reason: {reason}\n"
             f"Closed 50% @ <code>{price:.6g}</code>\n"
-            f"Remaining 50% still open — monitoring closely")
+            f"🔍 Remaining 50% still open — monitoring closely")
         return
 
     # Hard SL
@@ -1728,9 +1737,12 @@ async def meme_manage_position(pos: dict, bot) -> None:
         save_state()
         warn = f"\n{meme_consec_losses} consecutive losses!" if meme_consec_losses >= 2 else ""
         await alert(bot,
-            f"<b>[MEME] STOP LOSS — {symbol} {direction}</b>\n"
-            f"SL: <code>{sl:.6g}</code>  Price: <code>{price:.6g}</code>\n"
-            f"Est PnL: {pnl:+.2f} USDT{warn}")
+            f"🛑 <b>[MEME] STOP LOSS — {symbol} {direction}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"SL    : <code>{sl:.6g}</code>\n"
+            f"Price : <code>{price:.6g}</code>\n"
+            f"Est PnL: {pnl:+.2f} USDT\n"
+            f"Consecutive losses: {meme_consec_losses}{warn}")
         return
 
     # TP1: 1:1 RR -> close 50%
@@ -1750,10 +1762,11 @@ async def meme_manage_position(pos: dict, bot) -> None:
             pnl_p = abs(pos["tp1_price"] - pos["entry_price"]) * close_qty * pos["leverage"]
             save_state()
             await alert(bot,
-                f"<b>[MEME] TP1 HIT — {symbol} {direction}</b>\n"
+                f"🎯 <b>[MEME] TP1 HIT — {symbol} {direction}</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"Closed 50% @ <code>{price:.6g}</code>\n"
                 f"Est partial PnL: +{pnl_p:.2f} USDT\n"
-                f"SL moved to breakeven <code>{pos['entry_price']:.6g}</code>\n"
+                f"🔒 SL → Breakeven <code>{pos['entry_price']:.6g}</code>\n"
                 f"Riding to TP2 @ <code>{pos['tp2_price']:.6g}</code>")
             return
 
@@ -1771,10 +1784,11 @@ async def meme_manage_position(pos: dict, bot) -> None:
             pnl_p = abs(pos["tp2_price"] - pos["entry_price"]) * close_qty * pos["leverage"]
             save_state()
             await alert(bot,
-                f"<b>[MEME] TP2 HIT — {symbol} {direction}</b>\n"
+                f"🎯 <b>[MEME] TP2 HIT — {symbol} {direction}</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"Closed 30% @ <code>{price:.6g}</code>\n"
                 f"Est partial PnL: +{pnl_p:.2f} USDT\n"
-                f"Trailing last 20% on 3m candle lows/highs")
+                f"🌊 Trailing last 20% on 3m candle lows/highs")
             return
 
     # TP3: Trail last 20% on 3m candles
@@ -1803,10 +1817,12 @@ async def _meme_monitor_inner(symbol: str, bot, job_data: dict) -> None:
 
     if paused_circuit and not job_data.get("circuit_alerted"):
         await alert(bot,
-            f"<b>[MEME] CIRCUIT BREAKER</b>\n"
-            f"Daily loss: {meme_daily_loss:.2f} USDT | "
+            f"⚠️ <b>[MEME] CIRCUIT BREAKER</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"Daily loss   : {meme_daily_loss:.2f} USDT\n"
             f"Consec losses: {meme_consec_losses}\n"
-            f"No new MEME entries. Use /meme_resume to reset.")
+            f"🔴 No new MEME entries until conditions reset.\n"
+            f"Use /meme_resume to reset counter.")
         job_data["circuit_alerted"] = True
     elif not paused_circuit:
         job_data["circuit_alerted"] = False
@@ -1851,14 +1867,15 @@ async def _meme_status_report(symbol: str, bot, job_data: dict,
         pnl   = diff * pos["remaining_qty"] * pos["leverage"]
         mins  = (time.time() - pos["entry_time"]) / 60
         e     = "LONG" if pos["direction"] == "LONG" else "SHORT"
+        direction_emoji = "🟢" if pos["direction"] == "LONG" else "🔴"
         trade_info = (
-            f"Open {e} position\n"
-            f"Entry: <code>{pos['entry_price']:.6g}</code>  "
-            f"Now: <code>{price:.6g}</code>\n"
-            f"SL: <code>{pos['sl_price']:.6g}</code>\n"
-            f"TP1: {'YES' if pos['tp1_hit'] else 'NO'}  "
-            f"TP2: {'YES' if pos['tp2_hit'] else 'NO'}\n"
-            f"Est PnL: {pnl:+.2f} USDT  |  Open: {mins:.0f}m"
+            f"{direction_emoji} <b>Open {pos['direction']} position</b>\n"
+            f"   📌 Entry  : <code>{pos['entry_price']:.6g}</code>\n"
+            f"   💹 Current: <code>{price:.6g}</code>\n"
+            f"   🛡 SL     : <code>{pos['sl_price']:.6g}</code>\n"
+            f"   🎯 TP1    : {'✅' if pos['tp1_hit'] else '⬜'}  "
+            f"TP2: {'✅' if pos['tp2_hit'] else '⬜'}\n"
+            f"   Est PnL: {pnl:+.2f} USDT  |  Open: {mins:.0f}min"
         )
     else:
         trade_info = "No open position — watching for momentum signal"
@@ -1869,27 +1886,27 @@ async def _meme_status_report(symbol: str, bot, job_data: dict,
             ind = await asyncio.to_thread(_meme_compute_indicators, df_5m, "LONG")
             d   = ind["debug"]
             ind_text = (
-                f"\nIndicators (5m):\n"
-                f"Price: <code>{d.get('price',0):.6g}</code>  "
-                f"RSI(7): <code>{d.get('rsi','?')}</code>\n"
-                f"Vol ratio: <code>{d.get('vol_ratio','?')}x</code>  "
-                f"VWAP: <code>{d.get('vwap','?'):.6g}</code>\n"
-                f"ATR(14): <code>{d.get('atr','?'):.6g}</code>  "
-                f"LONG score: {ind['score']}/6"
+                f"\n📊 <b>Indicators (5m)</b>\n"
+                f"   Price    : <code>{d.get('price',0):.6g}</code>\n"
+                f"   RSI(7)   : <code>{d.get('rsi','?')}</code>\n"
+                f"   Vol ratio: <code>{d.get('vol_ratio','?')}x</code>  (need {MEME_VOL_MULT}x+)\n"
+                f"   VWAP     : <code>{d.get('vwap','?'):.6g}</code>\n"
+                f"   ATR(14)  : <code>{d.get('atr','?'):.6g}</code>\n"
+                f"   🟢 LONG score: {ind['score']}/6"
             )
         except Exception:
             pass
 
     await alert(bot,
-        f"<b>[MEME] 30-min Report — {symbol}</b>\n"
-        f"Balance: <code>{balance:.2f} USDT</code>  |  "
-        f"Paused: {'YES' if meme_paused else 'NO'}\n"
-        f"Consec losses: {meme_consec_losses}  |  "
-        f"Daily loss: {meme_daily_loss:.2f} USDT\n"
-        f"Open meme positions: {len(meme_positions)}/{MEME_MAX_POSITIONS}\n"
+        f"⚡ <b>[MEME] 30-min Report — {symbol}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 Balance : <code>{balance:.2f} USDT</code>\n"
+        f"⏸ Paused  : {'🔴 YES' if meme_paused else '🟢 NO'}\n"
+        f"📉 Consec losses: {meme_consec_losses}  |  Daily loss: {meme_daily_loss:.2f} USDT\n"
+        f"📊 Open positions: {len(meme_positions)}/{MEME_MAX_POSITIONS}\n"
         f"\n{trade_info}"
         f"{ind_text}\n\n"
-        f"5x lev  |  8% bal  |  TP1=1:1  |  30min dead close")
+        f"⚙️ 5x lev  |  8% bal  |  TP1=1:1 RR  |  30min dead close")
 
 
 async def meme_monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2063,26 +2080,27 @@ async def cmd_scan_meme(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             ind    = await asyncio.to_thread(_meme_compute_indicators, df_5m, direction)
             d      = ind["debug"]
             status = "ENTRY SIGNAL!" if ind["should_enter"] else "Waiting"
-            p_str  = " | ".join([f"OK:{esc(p)}" for p in ind["passed"]]) or "none"
-            f_str  = " | ".join([f"NO:{esc(p)}" for p in ind["failed"]]) or "none"
+            p_str  = "\n   ".join([f"✅{esc(p)}" for p in ind["passed"]]) or "none"
+            f_str  = "\n   ".join([f"❌{esc(p)}" for p in ind["failed"]]) or "none"
+            e_emoji = "🟢" if direction == "LONG" else "🔴"
 
             await update.message.reply_text(
-                f"<b>{symbol} {direction}</b>  {status}\n"
+                f"{e_emoji} <b>{symbol} — {direction}</b>  {status}\n"
                 f"Score: <b>{ind['score']}/6</b>\n"
-                f"Passed: {p_str}\n"
-                f"Failed: {f_str}\n"
-                f"Price: <code>{d.get('price',0):.6g}</code>  "
-                f"RSI(7): <code>{d.get('rsi','?')}</code>\n"
-                f"Vol ratio: <code>{d.get('vol_ratio','?')}x</code>  "
-                f"(need {MEME_VOL_MULT}x+)\n"
-                f"VWAP: <code>{d.get('vwap','?'):.6g}</code>\n"
-                f"Body pct: <code>{d.get('body_pct','?')}</code>  (need 0.60+)\n"
-                f"EMA9/21: <code>{d.get('ema9','?'):.6g}</code> / "
-                f"<code>{d.get('ema21','?'):.6g}</code>\n"
-                f"ATR(14): <code>{d.get('atr','?'):.6g}</code>",
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"<b>Passed:</b>\n   {p_str}\n"
+                f"<b>Failed:</b>\n   {f_str}\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"<b>Raw Values:</b>\n"
+                f"Price    : <code>{d.get('price',0):.6g}</code>\n"
+                f"RSI(7)   : <code>{d.get('rsi','?')}</code>\n"
+                f"Vol ratio: <code>{d.get('vol_ratio','?'):.6g}x</code>  (need {MEME_VOL_MULT}x+)\n"
+                f"VWAP     : <code>{d.get('vwap','?'):.6g}</code>\n"
+                f"Body pct : <code>{d.get('body_pct','?')}</code>  (need 0.60+)\n"
+                f"EMA9/21  : <code>{d.get('ema9','?'):.6g}</code> / <code>{d.get('ema21','?'):.6g}</code>\n"
+                f"ATR(14)  : <code>{d.get('atr','?'):.6g}</code>",
                 parse_mode="HTML",
             )
-
 
 @owner_only
 async def cmd_meme_pause(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
