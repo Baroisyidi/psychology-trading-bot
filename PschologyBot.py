@@ -52,11 +52,12 @@ symbol_monitor_running: dict[str, bool] = {}
 # ─────────────────────────────────────────────────────────────────────────────
 load_dotenv()
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-BYBIT_KEY      = os.getenv("BYBIT_API_KEY")
-BYBIT_SECRET   = os.getenv("BYBIT_API_SECRET")
-CHAT_ID_STR    = os.getenv("CHAT_ID")
-STATE_FILE     = os.getenv("STATE_FILE", "/opt/render/project/src/bot_state.json")
+TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN")
+BYBIT_KEY          = os.getenv("BYBIT_API_KEY")
+BYBIT_SECRET       = os.getenv("BYBIT_API_SECRET")
+CHAT_ID_STR        = os.getenv("CHAT_ID")
+STATE_FILE         = os.getenv("STATE_FILE", "/opt/render/project/src/bot_state.json")
+CRYPTOPANIC_TOKEN  = os.getenv("CRYPTOPANIC_TOKEN", "")   # Free at cryptopanic.com/developers/api/keys
 
 if not all([TELEGRAM_TOKEN, BYBIT_KEY, BYBIT_SECRET, CHAT_ID_STR]):
     raise ValueError("Missing required environment variables! Check .env or Render Environment Variables.")
@@ -193,6 +194,18 @@ meme_daily_loss:    float                 = 0.0
 meme_consec_losses: int                   = 0
 meme_monitor_running: dict[str, bool]     = {}   # per-symbol execution guard
 
+# ── NewsBot global state ───────────────────────────────────────────────────────
+news_seen_ids:      set                   = set()   # dedup — never alert same news twice
+news_enabled:       bool                  = True    # can be paused with /news_pause
+NEWS_POLL_INTERVAL: int                   = 120     # check every 2 minutes
+NEWS_MAX_AGE_HOURS: int                   = 1       # ignore news older than 1 hour
+
+# ── Trade history global state ─────────────────────────────────────────────────
+HISTORY_FILE      = os.getenv("STATE_FILE", "/opt/render/project/src/bot_state.json").replace(
+    "bot_state.json", "trade_history.json")
+HISTORY_KEEP_DAYS = 60    # keep last 60 days of trade records
+trade_history:    list    = []   # list of closed trade dicts
+
 def save_state() -> None:
     try:
         os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
@@ -249,6 +262,76 @@ def load_state() -> bool:
     except Exception as e:
         logger.error(f"[STATE] load failed: {e}")
         return False
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  TRADE HISTORY — persisted to a separate JSON file, 60-day rolling window
+# ─────────────────────────────────────────────────────────────────────────────
+def _load_history() -> None:
+    """Load trade history from disk on startup."""
+    global trade_history
+    try:
+        if os.path.exists(HISTORY_FILE):
+            with open(HISTORY_FILE) as f:
+                trade_history = json.load(f)
+            logger.info(f"[HISTORY] Loaded {len(trade_history)} trade records")
+        else:
+            trade_history = []
+            logger.info("[HISTORY] No history file found — starting fresh")
+    except Exception as e:
+        logger.error(f"[HISTORY] load failed: {e}")
+        trade_history = []
+
+def _save_history() -> None:
+    """Persist trade history to disk. Prunes records older than 60 days."""
+    global trade_history
+    try:
+        from datetime import timezone as _tz, datetime as _dt, timedelta as _td
+        cutoff = (_dt.now(_tz.utc) - _td(days=HISTORY_KEEP_DAYS)).isoformat()
+        trade_history = [t for t in trade_history if t.get("close_time", "") >= cutoff]
+        os.makedirs(os.path.dirname(HISTORY_FILE), exist_ok=True)
+        with open(HISTORY_FILE, "w") as f:
+            json.dump(trade_history, f, indent=2, default=str)
+    except Exception as e:
+        logger.error(f"[HISTORY] save failed: {e}")
+
+def _record_trade(pos: dict, exit_price: float, pnl: float,
+                  exit_reason: str, bot_type: str = "psych") -> None:
+    """
+    Record a completed trade to history.
+    Called whenever a position is fully or partially closed.
+    bot_type: 'psych' for PsychologyBot, 'meme' for MemeBot
+    """
+    from datetime import timezone as _tz, datetime as _dt
+    entry_time = pos.get("entry_time", 0)
+    duration_min = (time.time() - entry_time) / 60 if entry_time else 0
+
+    record = {
+        "id":           f"{pos['symbol']}_{int(entry_time)}",
+        "bot":          bot_type,
+        "symbol":       pos["symbol"],
+        "direction":    pos["direction"],
+        "entry_price":  round(pos.get("entry_price", 0), 6),
+        "exit_price":   round(exit_price, 6),
+        "sl_price":     round(pos.get("sl_price", 0), 6),
+        "tp1_price":    round(pos.get("tp1_price", 0), 6),
+        "tp2_price":    round(pos.get("tp2_price", 0), 6),
+        "tp1_hit":      pos.get("tp1_hit", False),
+        "tp2_hit":      pos.get("tp2_hit", False),
+        "qty":          pos.get("original_qty", 0),
+        "leverage":     pos.get("leverage", 10),
+        "score":        pos.get("score", 0),
+        "pnl":          round(pnl, 4),
+        "pnl_pct":      round((pnl / (pos.get("entry_price", 1) * pos.get("original_qty", 1))) * 100, 2) if pos.get("entry_price") and pos.get("original_qty") else 0,
+        "exit_reason":  exit_reason,   # "SL", "TP1", "TP2", "EMA_EXIT", "DEAD", "EMERGENCY", "MANUAL"
+        "duration_min": round(duration_min, 1),
+        "entry_time":   _dt.fromtimestamp(entry_time, tz=_tz.utc).isoformat() if entry_time else "",
+        "close_time":   _dt.now(_tz.utc).isoformat(),
+    }
+
+    # Remove duplicate if re-recording same trade
+    trade_history[:] = [t for t in trade_history if t["id"] != record["id"]]
+    trade_history.append(record)
+    _save_history()
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  MOTIVATIONAL QUOTES
@@ -877,7 +960,7 @@ async def manage_position(pos: dict, bot) -> None:
             f"Closed @ <code>{current_price:.4f}</code>\n"
             f"Est. PnL: {pnl:+.2f} USDT\n"
             f"Bot goes FLAT on {symbol}. Watching for next signal.")
-        _close_pos(symbol, pnl)
+        _close_pos(symbol, pnl, exit_price=current_price, exit_reason="DEAD")
         return
 
     # ── EMA inversion exit ───────────────────────────────────────────────────
@@ -893,7 +976,7 @@ async def manage_position(pos: dict, bot) -> None:
             f"Bot goes FLAT on {symbol}. Checking for reversal entry...")
         # Check for reversal entry
         await check_reversal_after_exit(symbol, direction, bot)
-        _close_pos(symbol, pnl)
+        _close_pos(symbol, pnl, exit_price=current_price, exit_reason="EMA_EXIT")
         return
 
     # ── Stop loss hit ────────────────────────────────────────────────────────
@@ -912,8 +995,7 @@ async def manage_position(pos: dict, bot) -> None:
             f"Est. PnL: {pnl:+.2f} USDT\n"
             f"Consecutive losses: {consec_losses}{loss_warn}\n"
             f"Bot goes FLAT on {symbol}. Waiting for next valid signal.")
-        _close_pos(symbol, pnl)
-        save_state()
+        _close_pos(symbol, pnl, exit_price=current_price, exit_reason="SL")
         return
 
     # ── TP1 ──────────────────────────────────────────────────────────────────
@@ -973,10 +1055,14 @@ async def manage_position(pos: dict, bot) -> None:
             save_state()
             logger.info(f"[{symbol}] Trailing SL {old_sl:.4f} → {new_sl:.4f}")
 
-def _close_pos(symbol: str, pnl: float) -> None:
+def _close_pos(symbol: str, pnl: float, exit_price: float = 0.0,
+               exit_reason: str = "UNKNOWN") -> None:
     global daily_loss, weekly_loss
     daily_loss  += min(pnl, 0)
     weekly_loss += min(pnl, 0)
+    pos = symbol_positions.get(symbol)
+    if pos and exit_price > 0:
+        _record_trade(pos, exit_price, pnl, exit_reason, bot_type="psych")
     symbol_positions.pop(symbol, None)
     save_state()
 
@@ -1695,6 +1781,7 @@ async def meme_manage_position(pos: dict, bot) -> None:
             await close_full(symbol, direction)
             pnl = est_pnl()
             meme_daily_loss += min(pnl, 0)
+            _record_trade(pos, price, pnl, "DEAD", bot_type="meme")
             meme_positions.pop(symbol, None)
             save_state()
             await alert(bot,
@@ -1733,6 +1820,7 @@ async def meme_manage_position(pos: dict, bot) -> None:
         pnl = est_pnl()
         meme_consec_losses += 1
         meme_daily_loss    += min(pnl, 0)
+        _record_trade(pos, price, pnl, "SL", bot_type="meme")
         meme_positions.pop(symbol, None)
         save_state()
         warn = f"\n{meme_consec_losses} consecutive losses!" if meme_consec_losses >= 2 else ""
@@ -2127,6 +2215,480 @@ async def cmd_meme_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
 #  END OF MEMEBOT MODULE
 # =============================================================================
 
+
+# =============================================================================
+#  NEWSBOT — Real-time Crypto News Intelligence
+#  Source   : CryptoPanic API (free tier — sign up at cryptopanic.com)
+#  Polling  : Every 2 minutes
+#  Logic    : Fetch "important" news → score each headline for impact →
+#             alert only if HIGH impact (hack, ETF, regulation, collapse etc.)
+#  Coins    : Auto-detects affected coins from CryptoPanic currency tags
+# =============================================================================
+
+# ── Impact keyword scoring ────────────────────────────────────────────────────
+# Each keyword adds points to the news impact score.
+# Only news scoring >= 3 gets sent to Telegram.
+# This filters out routine news and only catches market-moving events.
+
+NEWS_IMPACT_KEYWORDS = {
+    # 🚨 CRASH / CRISIS events — very high impact
+    "hack":          5, "hacked":        5, "exploit":      5, "stolen":        5,
+    "breach":        5, "attack":        5, "vulnerability":4, "collapse":      5,
+    "bankrupt":      5, "insolvent":     5, "fraud":        5, "scam":          5,
+    "rug pull":      5, "exit scam":     5, "ponzi":        5, "shutdown":      4,
+    "suspended":     4, "halted":        4, "seized":       4, "delisted":      4,
+    "insolvency":    5, "liquidation":   4, "crash":        4, "plunge":        3,
+    "dump":          3, "sell-off":      3, "panic":        3,
+
+    # 📈 BULLISH / POSITIVE events — high impact
+    "etf":           5, "etf approved":  5, "spot etf":     5, "etf launch":    5,
+    "approved":      4, "approval":      4, "listed":       3, "partnership":   3,
+    "institutional": 4, "reserve":       4, "strategic":    4, "treasury":      3,
+    "adoption":      4, "legal tender":  5, "regulation":   4, "regulated":     4,
+    "sec":           4, "cftc":          4, "congress":     3, "senate":        3,
+    "halving":       4, "upgrade":       3, "mainnet":      3, "launch":        3,
+    "ipo":           4, "acquisition":   4, "merger":       4, "investment":    3,
+    "all-time high": 5, "ath":           4, "record":       3, "billion":       3,
+    "whale":         3, "accumulation":  3,
+
+    # ⚖️ REGULATORY events
+    "ban":           5, "banned":        5, "illegal":      5, "lawsuit":       4,
+    "sued":          4, "indicted":      5, "arrested":     5, "investigated":  4,
+    "subpoena":      4, "crackdown":     5, "sanction":     5, "blacklist":     4,
+    "cbdc":          3, "stablecoin":    3, "aml":          3,
+
+    # 🏦 EXCHANGE / CUSTODIAL events
+    "exchange":      2, "outage":        4, "offline":      4, "withdrawal":    4,
+    "frozen":        5, "ftx":           5, "binance":      3, "coinbase":      3,
+    "kraken":        3, "bybit":         3,
+
+    # 🌐 MACRO events
+    "fed":           3, "interest rate": 4, "inflation":    3, "recession":     4,
+    "war":           4, "conflict":      3, "sanctions":    4, "trump":         3,
+    "china":         3, "us":            2, "network":      2,
+}
+
+# Minimum score to trigger an alert
+NEWS_MIN_SCORE = 6
+
+# These coin symbols map to full names for clearer alerts
+COIN_NAMES = {
+    "BTC": "Bitcoin",  "ETH": "Ethereum", "SOL": "Solana",
+    "BNB": "BNB",      "XRP": "XRP",      "ADA": "Cardano",
+    "DOGE":"Dogecoin", "MATIC":"Polygon", "DOT": "Polkadot",
+    "AVAX":"Avalanche","LINK":"Chainlink","UNI": "Uniswap",
+    "LTC": "Litecoin", "ATOM":"Cosmos",   "FTT": "FTX Token",
+    "LUNA":"Terra",    "UST": "TerraUSD", "USDT":"Tether",
+    "USDC":"USD Coin", "PEPE":"Pepe",     "WIF": "dogwifhat",
+    "BONK":"Bonk",     "SHIB":"Shiba Inu","TON": "Toncoin",
+    "SUI": "Sui",      "APT": "Aptos",    "ARB": "Arbitrum",
+    "OP":  "Optimism", "NEAR":"Near",     "FIL": "Filecoin",
+}
+
+
+def _sync_fetch_news() -> list:
+    """
+    Fetch latest important crypto news from CryptoPanic API.
+    Runs in background thread — never blocks event loop.
+    Returns list of raw news items.
+    """
+    import urllib.request, json as _json
+    if not CRYPTOPANIC_TOKEN:
+        return []
+    try:
+        url = (
+            f"https://cryptopanic.com/api/free/v1/posts/"
+            f"?auth_token={CRYPTOPANIC_TOKEN}"
+            f"&filter=important&public=true&kind=news"
+        )
+        with urllib.request.urlopen(url, timeout=15) as resp:
+            data = _json.loads(resp.read().decode())
+            return data.get("results", [])
+    except Exception as e:
+        logger.error(f"[NEWS] CryptoPanic fetch error: {e}")
+        return []
+
+
+def _score_news(title: str, body: str = "") -> tuple:
+    """
+    Score a news item based on impact keywords.
+    Returns (score: int, matched_keywords: list, sentiment: str)
+    """
+    text   = (title + " " + body).lower()
+    score  = 0
+    matched = []
+
+    for keyword, points in NEWS_IMPACT_KEYWORDS.items():
+        if keyword in text:
+            score += points
+            matched.append(keyword)
+
+    # Determine sentiment from keywords
+    bullish_keys = {"etf","approved","approval","adoption","reserve","strategic",
+                    "launch","mainnet","upgrade","ath","all-time high","partnership",
+                    "institutional","listed","halving","acquisition","investment"}
+    bearish_keys = {"hack","hacked","exploit","stolen","collapse","bankrupt",
+                    "fraud","scam","ban","banned","lawsuit","crash","plunge",
+                    "frozen","seized","insolvent","crackdown","sanction",
+                    "exit scam","rug pull","indicted","arrested"}
+
+    b_hits = sum(1 for k in matched if k in bullish_keys)
+    n_hits = sum(1 for k in matched if k in bearish_keys)
+
+    if n_hits > b_hits:
+        sentiment = "BEARISH"
+    elif b_hits > n_hits:
+        sentiment = "BULLISH"
+    else:
+        sentiment = "NEUTRAL"
+
+    return score, matched, sentiment
+
+
+def _format_news_alert(item: dict, score: int, matched: list,
+                       sentiment: str) -> str:
+    """Build the Telegram alert message for a high-impact news item."""
+    from datetime import timezone as _tz
+
+    title      = item.get("title", "No title")
+    url        = item.get("url", "")
+    source     = item.get("source", {}).get("title", "Unknown source")
+    published  = item.get("published_at", "")
+    currencies = item.get("currencies") or []
+    votes      = item.get("votes", {})
+
+    # Coin tags
+    coin_tags = []
+    for c in currencies:
+        code  = c.get("code", "")
+        cname = COIN_NAMES.get(code, c.get("title", code))
+        coin_tags.append(f"${code} ({cname})")
+
+    coins_str = " | ".join(coin_tags) if coin_tags else "General Market"
+
+    # Sentiment emoji
+    if sentiment == "BULLISH":
+        s_emoji = "📈 BULLISH"
+        border  = "🟢"
+    elif sentiment == "BEARISH":
+        s_emoji = "📉 BEARISH"
+        border  = "🔴"
+    else:
+        s_emoji = "⚪ NEUTRAL"
+        border  = "🟡"
+
+    # Community votes
+    bull_votes = votes.get("bullish", 0) or 0
+    bear_votes = votes.get("bearish", 0) or 0
+    imp_votes  = votes.get("important", 0) or 0
+
+    # Score bar
+    score_bar = "🔥" * min(score // 3, 5)
+
+    # Top matched keywords
+    top_keys = ", ".join(matched[:5])
+
+    msg = (
+        f"{border} <b>\U0001f5de\ufe0f MARKET NEWS ALERT</b> {border}\n"
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        f"\U0001f4f0 <b>{title}</b>\n\n"
+        f"\U0001f4a5 Impact    : {score_bar} ({score} pts)\n"
+        f"\U0001f4ca Sentiment : {s_emoji}\n"
+        f"\U0001f3af Coins     : {coins_str}\n"
+        f"\U0001f511 Keywords  : {top_keys}\n"
+        f"\U0001f4e1 Source    : {source}\n"
+        f"\U0001f465 Community : {bull_votes} bullish  |  {bear_votes} bearish  |  {imp_votes} important\n"
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        f"<a href=\"{url}\">Read full article</a>\n\n"
+        f"<i>You can act on this — check /status and /scan for affected coins</i>"
+    )
+    return msg
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  NEWSBOT — MAIN POLL LOOP (job callback)
+# ─────────────────────────────────────────────────────────────────────────────
+async def news_monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Runs every 2 minutes. Fetches CryptoPanic important news,
+    scores each item, and sends alerts for high-impact stories.
+    """
+    global news_seen_ids
+    if not news_enabled:
+        return
+    if not CRYPTOPANIC_TOKEN:
+        return
+
+    try:
+        items = await asyncio.to_thread(_sync_fetch_news)
+        if not items:
+            return
+
+        from datetime import timezone as _tz, datetime as _dt
+
+        for item in items:
+            item_id = item.get("id")
+            if not item_id or item_id in news_seen_ids:
+                continue
+
+            # Age check — ignore stale news
+            pub = item.get("published_at", "")
+            try:
+                pub_dt  = _dt.fromisoformat(pub.replace("Z", "+00:00"))
+                age_hrs = (_dt.now(_tz.utc) - pub_dt).total_seconds() / 3600
+                if age_hrs > NEWS_MAX_AGE_HOURS:
+                    news_seen_ids.add(item_id)
+                    continue
+            except Exception:
+                pass
+
+            title = item.get("title", "")
+            score, matched, sentiment = _score_news(title)
+
+            # Mark as seen regardless of whether we alert
+            news_seen_ids.add(item_id)
+
+            # Keep seen_ids from growing forever
+            if len(news_seen_ids) > 2000:
+                news_seen_ids = set(list(news_seen_ids)[-1000:])
+
+            if score < NEWS_MIN_SCORE:
+                continue
+
+            msg = _format_news_alert(item, score, matched, sentiment)
+            await alert(context.bot, msg)
+            logger.info(f"[NEWS] Alert sent: score={score} sentiment={sentiment} '{title[:60]}'")
+
+    except Exception as e:
+        logger.error(f"[NEWS] monitor error: {e}", exc_info=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  NEWSBOT — TELEGRAM COMMAND HANDLERS
+# ─────────────────────────────────────────────────────────────────────────────
+@owner_only
+async def cmd_news_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show NewsBot status and recent news summary."""
+    token_set = "✅ SET" if CRYPTOPANIC_TOKEN else "❌ NOT SET (add CRYPTOPANIC_TOKEN to Render env vars)"
+    await update.message.reply_text(
+        "<b>NewsBot Status</b>\n"
+        "Active       : " + ("YES" if news_enabled else "PAUSED") + "\n"
+        f"API Token    : {token_set}\n"
+        f"Poll interval: Every {NEWS_POLL_INTERVAL}s (2 min)\n"
+        f"Max news age : {NEWS_MAX_AGE_HOURS} hour(s)\n"
+        f"Min score    : {NEWS_MIN_SCORE} pts to trigger alert\n"
+        f"News seen    : {len(news_seen_ids)} articles (dedup cache)\n\n"
+        "<b>What triggers an alert:</b>\n"
+        "- Exchange hacks or exploits\n"
+        "- ETF approvals or rejections\n"
+        "- Exchange collapses (FTX-style)\n"
+        "- Government bans or regulations\n"
+        "- Whale moves or institutional buys\n"
+        "- Network outages or attacks\n"
+        "- Strategic reserve announcements\n"
+        "- All-time highs or major crashes\n\n"
+        "<b>Commands:</b>\n"
+        "/news_status  - This screen\n"
+        "/news_pause   - Pause alerts\n"
+        "/news_resume  - Resume alerts\n"
+        "/news_scan    - Fetch latest news NOW",
+        parse_mode="HTML")
+
+@owner_only
+async def cmd_news_pause(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    global news_enabled
+    news_enabled = False
+    await update.message.reply_text(
+        "NewsBot paused. No more news alerts until you use /news_resume.",
+        parse_mode="HTML")
+
+@owner_only
+async def cmd_news_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    global news_enabled
+    news_enabled = True
+    await update.message.reply_text(
+        "▶️ <b>NewsBot resumed.</b> Watching for market-moving news.",
+        parse_mode="HTML")
+
+@owner_only
+async def cmd_news_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    status = "YES" if news_enabled else "PAUSED"
+    token_ok = "SET" if CRYPTOPANIC_TOKEN else "NOT SET — add CRYPTOPANIC_TOKEN to Render env vars"
+    await update.message.reply_text(
+        f"<b>NewsBot Status</b>\n"
+        f"Active: {status}\n"
+        f"API Token: {token_ok}\n"
+        f"Poll: every {NEWS_POLL_INTERVAL}s\n"
+        f"Max age: {NEWS_MAX_AGE_HOURS}h\n"
+        f"Min score: {NEWS_MIN_SCORE} pts\n"
+        f"Seen: {len(news_seen_ids)} articles\n\n"
+        "<b>Triggers alerts for:</b>\n"
+        "- Hacks / exploits\n"
+        "- ETF approvals / rejections\n"
+        "- Exchange collapses\n"
+        "- Government bans / regulations\n"
+        "- Institutional buys / whale moves\n"
+        "- Network outages / attacks\n"
+        "- Strategic reserve announcements\n"
+        "- ATH or major crashes\n\n"
+        "<b>Commands:</b>\n"
+        "/news_status — this screen\n"
+        "/news_pause  — pause alerts\n"
+        "/news_resume — resume alerts\n"
+        "/news_scan   — fetch news now",
+        parse_mode="HTML")
+
+@owner_only
+async def cmd_news_pause(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    global news_enabled
+    news_enabled = False
+    await update.message.reply_text(
+        "<b>NewsBot paused.</b> No news alerts until /news_resume.",
+        parse_mode="HTML")
+
+@owner_only
+async def cmd_news_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    global news_enabled
+    news_enabled = True
+    await update.message.reply_text(
+        "<b>NewsBot resumed.</b> Watching for market-moving news.",
+        parse_mode="HTML")
+
+@owner_only
+async def cmd_news_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not CRYPTOPANIC_TOKEN:
+        await update.message.reply_text(
+            "<b>CRYPTOPANIC_TOKEN not set.</b>\n\n"
+            "How to set it up (FREE):\n"
+            "1. Go to cryptopanic.com/developers/api/keys\n"
+            "2. Create a free account\n"
+            "3. Copy your auth token\n"
+            "4. Add CRYPTOPANIC_TOKEN to Render Environment Variables\n"
+            "5. Redeploy — done!",
+            parse_mode="HTML")
+        return
+
+    await update.message.reply_text("Fetching latest important crypto news...")
+
+    items = await asyncio.to_thread(_sync_fetch_news)
+    if not items:
+        await update.message.reply_text("No news returned. Try again in a moment.")
+        return
+
+    from datetime import timezone as _tz, datetime as _dt
+    sent = 0
+    for item in items[:20]:
+        title = item.get("title", "")
+        score, matched, sentiment = _score_news(title)
+        if score < NEWS_MIN_SCORE:
+            continue
+
+        pub = item.get("published_at", "")
+        try:
+            pub_dt  = _dt.fromisoformat(pub.replace("Z", "+00:00"))
+            age_min = int((_dt.now(_tz.utc) - pub_dt).total_seconds() / 60)
+            age_str = f"{age_min}m ago"
+        except Exception:
+            age_str = "unknown"
+
+        msg = _format_news_alert(item, score, matched, sentiment)
+        msg += f"\n<i>Published: {age_str}</i>"
+        await update.message.reply_text(msg, parse_mode="HTML",
+                                        disable_web_page_preview=True)
+        sent += 1
+        if sent >= 5:
+            break
+
+    if sent == 0:
+        await update.message.reply_text(
+            "No high-impact news right now (score below threshold).\n"
+            "Markets appear calm. Bot will alert you when something significant breaks.")
+
+
+# =============================================================================
+#  END OF NEWSBOT MODULE
+# =============================================================================
+
+@owner_only
+async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show trade history summary for last 60 days."""
+    if not trade_history:
+        await update.message.reply_text(
+            "No trade history yet.\n"
+            "History is recorded from this version onwards.\n"
+            "Every closed trade will appear here automatically.")
+        return
+        return
+
+    from datetime import timezone as _tz, datetime as _dt, timedelta as _td
+
+    # Parse days filter from args e.g. /history 7
+    days = 60
+    if ctx.args:
+        try:
+            days = min(int(ctx.args[0]), 60)
+        except ValueError:
+            pass
+
+    cutoff = (_dt.now(_tz.utc) - _td(days=days)).isoformat()
+    trades = [t for t in trade_history if t.get("close_time", "") >= cutoff]
+
+    if not trades:
+        await update.message.reply_text(f"No trades in the last {days} days.")
+        return
+
+    # Split by bot
+    for bot_label, bot_key in [("PsychologyBot", "psych"), ("MemeBot", "meme")]:
+        bt = [t for t in trades if t.get("bot") == bot_key]
+        if not bt:
+            continue
+
+        wins   = [t for t in bt if t["pnl"] > 0]
+        losses = [t for t in bt if t["pnl"] <= 0]
+        total_pnl = sum(t["pnl"] for t in bt)
+        win_rate  = round(len(wins) / len(bt) * 100) if bt else 0
+        best  = max(bt, key=lambda x: x["pnl"]) if bt else None
+        worst = min(bt, key=lambda x: x["pnl"]) if bt else None
+        avg_dur = round(sum(t.get("duration_min",0) for t in bt) / len(bt)) if bt else 0
+
+        # Exit breakdown
+        sl_count   = sum(1 for t in bt if t.get("exit_reason") == "SL")
+        tp1_count  = sum(1 for t in bt if t.get("exit_reason") == "TP1")
+        tp2_count  = sum(1 for t in bt if t.get("exit_reason") == "TP2")
+        dead_count = sum(1 for t in bt if t.get("exit_reason") == "DEAD")
+        ema_count  = sum(1 for t in bt if t.get("exit_reason") == "EMA_EXIT")
+
+        # Recent 5 trades
+        recent = sorted(bt, key=lambda x: x.get("close_time",""), reverse=True)[:5]
+        recent_lines = []
+        for t in recent:
+            e = "✅" if t["pnl"] > 0 else "❌"
+            dt_str = t.get("close_time","")[:10]
+            recent_lines.append(
+                f"  {e} {t['symbol']} {t['direction']}  "
+                f"PnL:{t['pnl']:+.2f}  via {t.get('exit_reason','?')}  {dt_str}")
+
+        msg = (
+            f"<b>{bot_label} — Last {days} days</b>\n"
+            f"Total trades  : {len(bt)}\n"
+            f"Wins / Losses : {len(wins)} / {len(losses)}\n"
+            f"Win rate      : {win_rate}%\n"
+            f"Total PnL     : {total_pnl:+.2f} USDT\n"
+            f"Avg duration  : {avg_dur} min\n\n"
+            "<b>Exit reasons:</b>\n"
+            f"  Stop Loss  : {sl_count}\n"
+            f"  TP1 hit    : {tp1_count}\n"
+            f"  TP2 hit    : {tp2_count}\n"
+            f"  Dead trade : {dead_count}\n"
+            f"  EMA exit   : {ema_count}\n"
+        )
+        if best:
+            msg += f"Best trade  : {best['symbol']} {best['direction']} {best['pnl']:+.2f} USDT\n"
+        if worst:
+            msg += f"Worst trade : {worst['symbol']} {worst['direction']} {worst['pnl']:+.2f} USDT\n"
+        msg += "\nRecent 5 trades:\n" + "\n".join(recent_lines)
+        await update.message.reply_text(msg, parse_mode="HTML")
+
 async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error(f"Telegram error: {ctx.error}")
     try:
@@ -2157,6 +2719,7 @@ async def main() -> None:
 
     # Load persisted state
     load_state()
+    _load_history()
 
     # Start WebSocket
     if start_websocket():
@@ -2188,6 +2751,12 @@ async def main() -> None:
     app.add_handler(CommandHandler("scan_meme",      cmd_scan_meme))
     app.add_handler(CommandHandler("meme_pause",     cmd_meme_pause))
     app.add_handler(CommandHandler("meme_resume",    cmd_meme_resume))
+    # ── NewsBot commands ──────────────────────────────────────────────────────────
+    app.add_handler(CommandHandler("news_status",    cmd_news_status))
+    app.add_handler(CommandHandler("news_pause",     cmd_news_pause))
+    app.add_handler(CommandHandler("news_resume",    cmd_news_resume))
+    app.add_handler(CommandHandler("news_scan",      cmd_news_scan))
+    app.add_handler(CommandHandler("history",         cmd_history))
     app.add_error_handler(error_handler)
 
     # Recurring jobs
@@ -2230,6 +2799,19 @@ async def main() -> None:
                           "circuit_alerted": False},
                 )
                 print(f"[STARTUP] MemeBot monitor for {sym} (first run in {delay:.1f}s)")
+
+        # NewsBot — polls CryptoPanic every 2 minutes for high-impact news
+        if CRYPTOPANIC_TOKEN:
+            app.job_queue.run_repeating(
+                callback=news_monitor,
+                interval=NEWS_POLL_INTERVAL,
+                first=30,   # first check 30s after startup
+                chat_id=CHAT_ID,
+                name="news_monitor",
+            )
+            print(f"[STARTUP] NewsBot active — polling every {NEWS_POLL_INTERVAL}s")
+        else:
+            print("[STARTUP] NewsBot INACTIVE — set CRYPTOPANIC_TOKEN in Render env vars")
 
     # Webhook
     base_url    = os.environ.get("RENDER_EXTERNAL_HOSTNAME",
