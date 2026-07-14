@@ -56,7 +56,12 @@ TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN")
 BYBIT_KEY          = os.getenv("BYBIT_API_KEY")
 BYBIT_SECRET       = os.getenv("BYBIT_API_SECRET")
 CHAT_ID_STR        = os.getenv("CHAT_ID")
-STATE_FILE         = os.getenv("STATE_FILE", "/opt/render/project/src/bot_state.json")
+# Render persistent disk mounts at /var/data by default.
+# If you add a Render Disk (Dashboard → your service → Disks → Add Disk,
+# mount path: /var/data), state survives redeploys automatically.
+# Without a disk: state is lost on redeploy (free tier limitation).
+_DEFAULT_STATE_DIR = "/var/data" if os.path.isdir("/var/data") else "/opt/render/project/src"
+STATE_FILE         = os.getenv("STATE_FILE", f"{_DEFAULT_STATE_DIR}/bot_state.json")
 CRYPTOPANIC_TOKEN  = os.getenv("CRYPTOPANIC_TOKEN", "")   # Free at cryptopanic.com/developers/api/keys
 
 if not all([TELEGRAM_TOKEN, BYBIT_KEY, BYBIT_SECRET, CHAT_ID_STR]):
@@ -201,8 +206,7 @@ NEWS_POLL_INTERVAL: int                   = 120     # check every 2 minutes
 NEWS_MAX_AGE_HOURS: int                   = 1       # ignore news older than 1 hour
 
 # ── Trade history global state ─────────────────────────────────────────────────
-HISTORY_FILE      = os.getenv("STATE_FILE", "/opt/render/project/src/bot_state.json").replace(
-    "bot_state.json", "trade_history.json")
+HISTORY_FILE      = STATE_FILE.replace("bot_state.json", "trade_history.json")
 HISTORY_KEEP_DAYS = 60    # keep last 60 days of trade records
 trade_history:    list    = []   # list of closed trade dicts
 
@@ -357,10 +361,20 @@ async def send_motivational_quote(context: ContextTypes.DEFAULT_TYPE) -> None:
 #  OWNER GUARD
 # ─────────────────────────────────────────────────────────────────────────────
 def owner_only(func):
+    """Restrict trading/admin commands to the owner only."""
     async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if update.effective_chat.id != CHAT_ID:
-            await update.message.reply_text("⛔ Unauthorised. This bot is private.")
+            await update.message.reply_text(
+                "This command is restricted to the bot owner.\n"
+                "Use /start to see what this bot does.")
             return
+        return await func(update, ctx)
+    wrapper.__name__ = func.__name__
+    return wrapper
+
+def public_command(func):
+    """Allow any user to run this command — no restriction."""
+    async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await func(update, ctx)
     wrapper.__name__ = func.__name__
     return wrapper
@@ -1254,20 +1268,25 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 #  TELEGRAM COMMAND HANDLERS
 # ─────────────────────────────────────────────────────────────────────────────
-@owner_only
+@public_command
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    is_owner = update.effective_chat.id == CHAT_ID
     await update.message.reply_text(
         "🤖 <b>PsychologyBot v3 — Ready!</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         "<b>Commands:</b>\n"
-        "• /start               — Show this message\n"
-        "• /add_symbol &lt;SYMBOL&gt;   — Start monitoring a coin\n"
-        "• /remove_symbol &lt;SYMBOL&gt; — Stop monitoring a coin\n"
-        "• /status              — All positions &amp; scores\n"
-        "• /scan                — Live indicator scan now\n"
-        "• /pause               — Pause new entries\n"
-        "• /resume              — Resume new entries\n"
-        "• /balance             — Show USDT balance\n\n"
+        "• /start               — Show this message (public)\n"
+        "• /status              — Open positions &amp; scores (public)\n"
+        "• /scan                — Live indicator scan (public)\n"
+        "• /balance             — Show USDT balance (public)\n"
+        "• /history             — Trade history (public)\n"
+        "• /memebot             — MemeBot info (public)\n"
+        "• /meme_status         — MemeBot positions (public)\n"
+        "• /news_status         — NewsBot status (public)\n\n"
+        "• /add_symbol &lt;SYM&gt;     — Monitor a coin 🔒 owner\n"
+        "• /remove_symbol &lt;SYM&gt;  — Stop monitoring 🔒 owner\n"
+        "• /pause / /resume     — Pause bot 🔒 owner\n"
+        "• /add_meme &lt;SYM&gt;       — Add meme coin 🔒 owner\n\n"
         "<b>Entry Filters (5/8 required — conditions 5 &amp; 8 mandatory):</b>\n"
         "• 1. ADX &gt; 20 (trending market)\n"
         "• 2. Price above/below Ichimoku Cloud (Daily)\n"
@@ -1296,7 +1315,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "• All Bybit/pandas in background threads (never freezes)\n"
         "• 30-min status reports per symbol\n"
         "• State persistence for crash recovery\n"
-        "• Bot is PRIVATE — owner only\n\n"
+        "• Public bot — anyone can check status and scan signals\n"
+        "• Trading controls are owner-only for security\n\n"
         "<b>Examples:</b>\n"
         "<code>/add_symbol BTCUSDT</code>\n"
         "<code>/add_symbol ETHUSDT</code>",
@@ -1355,7 +1375,7 @@ async def cmd_remove_symbol(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     save_state()
     await update.message.reply_text(f"✅ <b>{symbol}</b> removed.", parse_mode="HTML")
 
-@owner_only
+@public_command
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     balance = await get_balance()
     lines   = [
@@ -1389,7 +1409,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         lines.append("No open positions.")
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
-@owner_only
+@public_command
 async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not monitored_symbols:
         await update.message.reply_text("No symbols monitored. Use /add_symbol first.")
@@ -1460,7 +1480,7 @@ async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     save_state()
     await update.message.reply_text("▶️ <b>Bot resumed.</b> Monitoring for entries.", parse_mode="HTML")
 
-@owner_only
+@public_command
 async def cmd_balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     bal = await get_balance()
     await update.message.reply_text(
@@ -2014,7 +2034,7 @@ async def meme_monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 #  MEMEBOT — TELEGRAM COMMAND HANDLERS
 # ─────────────────────────────────────────────────────────────────────────────
-@owner_only
+@public_command
 async def cmd_meme_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "<b>MemeBot — Volatile Coin Strategy</b>\n"
@@ -2110,7 +2130,7 @@ async def cmd_remove_meme(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         f"<b>{symbol}</b> removed from MemeBot.", parse_mode="HTML")
 
 
-@owner_only
+@public_command
 async def cmd_meme_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     balance = await get_balance()
     lines = [
@@ -2146,7 +2166,7 @@ async def cmd_meme_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
-@owner_only
+@public_command
 async def cmd_scan_meme(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not ctx.args and not meme_symbols:
         await update.message.reply_text(
@@ -2466,7 +2486,7 @@ async def news_monitor(context: ContextTypes.DEFAULT_TYPE) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 #  NEWSBOT — TELEGRAM COMMAND HANDLERS
 # ─────────────────────────────────────────────────────────────────────────────
-@owner_only
+@public_command
 async def cmd_news_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Show NewsBot status and recent news summary."""
     token_set = "✅ SET" if CRYPTOPANIC_TOKEN else "❌ NOT SET (add CRYPTOPANIC_TOKEN to Render env vars)"
@@ -2510,7 +2530,7 @@ async def cmd_news_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         "▶️ <b>NewsBot resumed.</b> Watching for market-moving news.",
         parse_mode="HTML")
 
-@owner_only
+@public_command
 async def cmd_news_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     status = "YES" if news_enabled else "PAUSED"
     token_ok = "SET" if CRYPTOPANIC_TOKEN else "NOT SET — add CRYPTOPANIC_TOKEN to Render env vars"
@@ -2609,7 +2629,7 @@ async def cmd_news_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 #  END OF NEWSBOT MODULE
 # =============================================================================
 
-@owner_only
+@public_command
 async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Show trade history summary for last 60 days."""
     if not trade_history:
@@ -2716,8 +2736,11 @@ async def main() -> None:
     print(f"TELEGRAM_TOKEN loaded ({len(TELEGRAM_TOKEN)} chars)")
     print(f"CHAT_ID: {CHAT_ID}")
     print(f"Thread pool: {_executor._max_workers} workers")
+    print(f"STATE_FILE: {STATE_FILE}")
+    print(f"State file exists: {os.path.exists(STATE_FILE)}")
 
     # Load persisted state
+    state_existed = os.path.exists(STATE_FILE)
     load_state()
     _load_history()
 
@@ -2847,6 +2870,51 @@ async def main() -> None:
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", port).start()
     print(f"Web server on port {port} — Bot v3 fully running!")
+
+    # Send startup notification to owner
+    from datetime import timezone as _tz, datetime as _dt
+    now_str = _dt.now(_tz.utc).strftime("%Y-%m-%d %H:%M UTC")
+    disk_ok = os.path.isdir("/var/data")
+
+    if state_existed and (monitored_symbols or meme_symbols):
+        # State was restored successfully
+        psych_syms = ", ".join(monitored_symbols) if monitored_symbols else "none"
+        meme_syms  = ", ".join(meme_symbols) if meme_symbols else "none"
+        open_pos   = len(symbol_positions) + len(meme_positions)
+        startup_msg = (
+            f"🔄 <b>Bot restarted &amp; state restored!</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🕒 Time: {now_str}\n"
+            f"💾 State: ✅ Loaded from disk\n"
+            f"💽 Persistent disk: {'✅ /var/data' if disk_ok else '⚠️ Not mounted — state may be lost on next redeploy'}\n\n"
+            f"<b>Restored:</b>\n"
+            f"📊 PsychologyBot: {psych_syms}\n"
+            f"⚡ MemeBot: {meme_syms}\n"
+            f"📈 Open positions: {open_pos}\n"
+            f"📋 Trade history: {len(trade_history)} records\n\n"
+            f"✅ All monitoring jobs restarted automatically.\n"
+            f"No action needed — bot is watching your symbols."
+        )
+    else:
+        # Fresh start — no state file or empty
+        startup_msg = (
+            f"🚀 <b>Bot started fresh</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🕒 Time: {now_str}\n"
+            f"💾 State: {'⚠️ No state file found' if not state_existed else '📭 State file empty'}\n"
+            f"💽 Persistent disk: {'✅ /var/data available' if disk_ok else '❌ Not mounted — ADD A RENDER DISK to survive redeploys'}\n\n"
+            f"<b>Action needed:</b>\n"
+            f"• Use /add_symbol BTCUSDT to start monitoring\n"
+            f"• Use /add_meme PEPEUSDT for MemeBot\n\n"
+            f"<b>To fix state loss permanently:</b>\n"
+            f"Render Dashboard → Your service → Disks → Add Disk\n"
+            f"Mount path: <code>/var/data</code> | Size: 1 GB (free tier available)"
+        )
+
+    try:
+        await app.bot.send_message(chat_id=CHAT_ID, text=startup_msg, parse_mode="HTML")
+    except Exception as e:
+        print(f"[STARTUP] Could not send startup notification: {e}")
 
     try:
         await asyncio.Event().wait()
