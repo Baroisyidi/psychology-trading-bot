@@ -212,7 +212,9 @@ trade_history:    list    = []   # list of closed trade dicts
 
 def save_state() -> None:
     try:
-        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        state_dir = os.path.dirname(STATE_FILE)
+        if state_dir:
+            os.makedirs(state_dir, exist_ok=True)
         state = {
             # PsychologyBot state
             "monitored_symbols": monitored_symbols,
@@ -2709,6 +2711,40 @@ async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         msg += "\nRecent 5 trades:\n" + "\n".join(recent_lines)
         await update.message.reply_text(msg, parse_mode="HTML")
 
+
+@owner_only
+async def cmd_backup(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show current state as text so owner can copy/save it."""
+    psych = ", ".join(monitored_symbols) if monitored_symbols else "none"
+    meme  = ", ".join(meme_symbols) if meme_symbols else "none"
+    open_p = len(symbol_positions)
+    open_m = len(meme_positions)
+
+    lines = [
+        "💾 <b>Bot State Backup</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"State file : <code>{STATE_FILE}</code>",
+        f"Disk       : {'✅ /var/data (persistent)' if os.path.isdir('/var/data') else '⚠️ No persistent disk'}",
+        "",
+        f"<b>PsychologyBot symbols:</b> <code>{psych}</code>",
+        f"<b>MemeBot symbols:</b> <code>{meme}</code>",
+        f"Open positions: {open_p} psych + {open_m} meme",
+        f"Trade history : {len(trade_history)} records",
+        f"Daily loss    : {daily_loss:.2f} USDT",
+        f"Consec losses : {consec_losses}",
+        "",
+        "<b>To restore after a fresh start:</b>",
+    ]
+    for sym in monitored_symbols:
+        lines.append(f"<code>/add_symbol {sym}</code>")
+    for sym in meme_symbols:
+        lines.append(f"<code>/add_meme {sym}</code>")
+
+    if not monitored_symbols and not meme_symbols:
+        lines.append("No symbols currently monitored.")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
 async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error(f"Telegram error: {ctx.error}")
     try:
@@ -2780,6 +2816,7 @@ async def main() -> None:
     app.add_handler(CommandHandler("news_resume",    cmd_news_resume))
     app.add_handler(CommandHandler("news_scan",      cmd_news_scan))
     app.add_handler(CommandHandler("history",         cmd_history))
+    app.add_handler(CommandHandler("backup",          cmd_backup))
     app.add_error_handler(error_handler)
 
     # Recurring jobs
