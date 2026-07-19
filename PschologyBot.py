@@ -244,8 +244,10 @@ def save_state() -> None:
         }
         with open(STATE_FILE, "w") as f:
             json.dump(state, f, indent=2, default=str)
+        logger.debug(f"[STATE] Saved → {STATE_FILE} "
+                     f"(symbols: {monitored_symbols}, meme: {meme_symbols})")
     except Exception as e:
-        logger.error(f"[STATE] save failed: {e}")
+        logger.error(f"[STATE] SAVE FAILED → {STATE_FILE}: {e}", exc_info=True)
 
 def load_state() -> bool:
     global monitored_symbols, symbol_positions, bot_paused
@@ -1382,19 +1384,26 @@ def _sync_detect_regime(symbol: str,
 
         # ── Leading 1: BB Squeeze (Keltner/BB crossover) ─────────────────────
         # When BB width contracts to a multi-month low, a breakout is IMMINENT.
-        # The direction of the first strong candle out of the squeeze is the signal.
-        # This fires days before ATR rises or ADX confirms.
+        # NOTE: bb_upper/bb_lower are scalars (float), kc_upper/kc_lower are Series.
+        # Must compare scalar to scalar using .iloc[-1].
         kc_atr  = ta.atr(high, low, close, length=20)
         kc_mid  = close.ewm(span=20, adjust=False).mean()
-        kc_upper = kc_mid + 1.5 * kc_atr
-        kc_lower = kc_mid - 1.5 * kc_atr
-        # Squeeze = BB inside Keltner Channel
-        bb_inside_kc = (bb_upper < kc_upper) & (bb_lower > kc_lower) if kc_atr is not None else pd.Series([False]*len(close))
-        squeeze_active  = bool(bb_inside_kc.iloc[-1])
-        squeeze_released = bool(bb_inside_kc.iloc[-2]) and not bool(bb_inside_kc.iloc[-1])
-        # BB width at 20-bar low = tightest squeeze in recent memory
-        bb_width_series = (bb_upper - bb_lower) / kc_mid * 100 if kc_atr is not None else pd.Series([bb_width]*len(close))
-        bb_at_20bar_low = float(bb_width_series.iloc[-1]) <= float(bb_width_series.rolling(20).min().iloc[-1]) * 1.05
+        if kc_atr is not None:
+            kc_upper_s = kc_mid + 1.5 * kc_atr   # Series
+            kc_lower_s = kc_mid - 1.5 * kc_atr   # Series
+            # Compare last two candles using scalar values only
+            squeeze_now  = (bb_upper < float(kc_upper_s.iloc[-1])) and                            (bb_lower > float(kc_lower_s.iloc[-1]))
+            squeeze_prev = (bb_upper < float(kc_upper_s.iloc[-2])) and                            (bb_lower > float(kc_lower_s.iloc[-2]))
+            squeeze_active   = squeeze_now
+            squeeze_released = squeeze_prev and not squeeze_now
+            # BB width at 20-bar low using Series (all scalars from bb)
+            bb_width_s = (kc_upper_s - kc_lower_s) / kc_mid * 100
+            bb_at_20bar_low = float(bb_width_s.iloc[-1]) <= float(
+                bb_width_s.rolling(20).min().iloc[-1]) * 1.05
+        else:
+            squeeze_active   = False
+            squeeze_released = False
+            bb_at_20bar_low  = False
 
         # ── Leading 2: EMA slope acceleration (2nd derivative) ───────────────
         # Slope inflecting from negative toward zero = trend birth, days before
@@ -1497,7 +1506,7 @@ def _sync_detect_regime(symbol: str,
         # Leading: volume confirms buying
         if vol_confirms_bull:      scores[REGIME_STRONG_UPTREND] += 5
         # Leading: squeeze released with price above midpoint = breakout up
-        if squeeze_released and price > float(bb_mid.iloc[-1] if hasattr(bb_mid,'iloc') else bb_mid):
+        if squeeze_released and price > bb_mid:
             scores[REGIME_STRONG_UPTREND] += 7
 
         # ── STRONG DOWNTREND scoring (max 44 pts) ────────────────────────────
@@ -1517,7 +1526,7 @@ def _sync_detect_regime(symbol: str,
         # Leading: volume confirms selling
         if vol_confirms_bear:      scores[REGIME_STRONG_DOWNTREND] += 5
         # Leading: squeeze released with price below midpoint = breakout down
-        if squeeze_released and price < float(bb_mid.iloc[-1] if hasattr(bb_mid,'iloc') else bb_mid):
+        if squeeze_released and price < bb_mid:
             scores[REGIME_STRONG_DOWNTREND] += 7
 
         # ── CHOPPY / RANGING scoring (max 30 pts) ────────────────────────────
@@ -1579,7 +1588,12 @@ def _sync_detect_regime(symbol: str,
         result["max_possible"]  = max_possible
 
     except Exception as e:
-        logger.error(f"[REGIME] _sync_detect_regime({symbol}): {e}", exc_info=True)
+        logger.error(f"[REGIME] _sync_detect_regime({symbol}) FAILED: {type(e).__name__}: {e}",
+                     exc_info=True)
+        # Return unknown with debug info so we can see it in /regime output
+        result["regime"]     = REGIME_UNKNOWN
+        result["confidence"] = 0
+        result["error"]      = f"{type(e).__name__}: {e}"
 
     return result
 
@@ -1958,8 +1972,8 @@ async def cmd_add_symbol(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
 
     # Reply FIRST — user sees confirmation immediately
 
-    # Non-blocking background tasks after reply
-    await asyncio.to_thread(save_state)
+    # Save synchronously — critical that this completes before anything else
+    save_state()
     asyncio.create_task(asyncio.to_thread(subscribe_ws_symbol, symbol))
 
     idx   = monitored_symbols.index(symbol)
@@ -2740,8 +2754,8 @@ async def cmd_add_meme(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"30-min dead trade timeout active.",
         parse_mode="HTML")
 
-    # Background tasks after reply
-    await asyncio.to_thread(save_state)
+    # Save synchronously — must complete before anything else
+    save_state()
     asyncio.create_task(asyncio.to_thread(subscribe_ws_symbol, symbol))
 
     idx   = meme_symbols.index(symbol)
@@ -3548,13 +3562,35 @@ async def main() -> None:
     print(f"TELEGRAM_TOKEN loaded ({len(TELEGRAM_TOKEN)} chars)")
     print(f"CHAT_ID: {CHAT_ID}")
     print(f"Thread pool: {_executor._max_workers} workers")
-    print(f"STATE_FILE: {STATE_FILE}")
-    print(f"State file exists: {os.path.exists(STATE_FILE)}")
 
-    # Load persisted state
+    # ── Step 1: Test write permission FIRST before anything else ─────────────
+    state_dir = os.path.dirname(STATE_FILE)
+    try:
+        os.makedirs(state_dir, exist_ok=True)
+        test_file = os.path.join(state_dir, ".write_test")
+        with open(test_file, "w") as f:
+            f.write("ok")
+        os.remove(test_file)
+        print(f"[STATE] Write permission OK: {state_dir}")
+        print(f"[STATE] STATE_FILE = {STATE_FILE}")
+    except Exception as e:
+        print(f"[STATE] ⚠️ WRITE FAILED for {state_dir}: {e}")
+        print(f"[STATE] Falling back to /tmp")
+        globals()["STATE_FILE"]   = "/tmp/bot_state.json"
+        globals()["HISTORY_FILE"] = "/tmp/trade_history.json"
+        print(f"[STATE] STATE_FILE now = {STATE_FILE}")
+
+    # ── Step 2: Check if state file exists THEN load it ──────────────────────
     state_existed = os.path.exists(STATE_FILE)
+    print(f"[STATE] State file exists: {state_existed} ({STATE_FILE})")
     load_state()
     _load_history()
+
+    # ── Step 3: Force-save immediately so file exists for next redeploy ───────
+    # This writes current state (may be empty on fresh start) to disk.
+    # On next redeploy load_state() will find this file and restore.
+    save_state()
+    print(f"[STATE] Startup save complete → {STATE_FILE}")
 
     # Start WebSocket
     if start_websocket():
@@ -3700,8 +3736,8 @@ async def main() -> None:
             f"🔄 <b>Bot restarted &amp; state restored!</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🕒 Time: {now_str}\n"
-            f"💾 State: ✅ Loaded from disk\n"
-            f"💽 Persistent disk: {'✅ /var/data' if disk_ok else '⚠️ Not mounted — state may be lost on next redeploy'}\n\n"
+            f"💾 State: ✅ Loaded from <code>{STATE_FILE}</code>\n"
+            f"💽 Persistent disk: {'✅ /var/data (state survives redeploys)' if disk_ok else '⚠️ Using /tmp — state may be lost on redeploy'}\n\n"
             f"<b>Restored:</b>\n"
             f"📊 PsychologyBot: {psych_syms}\n"
             f"⚡ MemeBot: {meme_syms}\n"
@@ -3712,18 +3748,25 @@ async def main() -> None:
         )
     else:
         # Fresh start — no state file or empty
+        using_tmp = STATE_FILE.startswith("/tmp")
         startup_msg = (
             f"🚀 <b>Bot started fresh</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🕒 Time: {now_str}\n"
+            f"💾 State file: <code>{STATE_FILE}</code>\n"
             f"💾 State: {'⚠️ No state file found' if not state_existed else '📭 State file empty'}\n"
-            f"💽 Persistent disk: {'✅ /var/data available' if disk_ok else '❌ Not mounted — ADD A RENDER DISK to survive redeploys'}\n\n"
-            f"<b>Action needed:</b>\n"
-            f"• Use /add_symbol BTCUSDT to start monitoring\n"
-            f"• Use /add_meme PEPEUSDT for MemeBot\n\n"
-            f"<b>To fix state loss permanently:</b>\n"
-            f"Render Dashboard → Your service → Disks → Add Disk\n"
-            f"Mount path: <code>/var/data</code> | Size: 1 GB (free tier available)"
+            f"💽 Disk: {'⚠️ /var/data not writable — using /tmp (state lost on redeploy)' if using_tmp else '✅ /var/data (persistent disk mounted)'}\n\n"
+            + (
+            f"<b>⚠️ State will NOT survive redeploys</b>\n"
+            f"Go to Render Dashboard → Your service → Disks → Add Disk\n"
+            f"Mount path: <code>/var/data</code>\n\n"
+            if using_tmp else ""
+            ) +
+            f"<b>Add your symbols:</b>\n"
+            f"• /add_symbol BTCUSDT\n"
+            f"• /add_symbol SOLUSDT\n"
+            f"• /add_meme PEPEUSDT\n"
+            f"(State will save automatically and survive future redeploys)"
         )
 
     try:
