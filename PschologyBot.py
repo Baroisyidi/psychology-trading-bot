@@ -804,7 +804,21 @@ def _round_qty(qty: float, min_q: float, step: float = 0.0) -> float:
         qty = (qty // step) * step
     return max(min_q, round(qty, 8))
 
-def _calc_sl(entry: float, direction: str, e100_4h: float) -> float:
+def _calc_sl(entry: float, direction: str, e100_4h: float,
+             regime: str = REGIME_UNKNOWN, atr: float = 0.0) -> float:
+    """
+    Regime-aware SL calculation:
+    - Volatile Breakout: tighter SL at 0.8× ATR (fast exit if breakout fails)
+    - All others: standard SL at 4H EMA100 − 2% buffer
+    """
+    if regime == REGIME_VOLATILE_BREAKOUT and atr > 0:
+        # Tight ATR-based SL — 0.8× ATR from entry
+        sl_dist = atr * 0.8
+        if direction == "LONG":
+            return round(entry - sl_dist, 6)
+        else:
+            return round(entry + sl_dist, 6)
+    # Standard SL
     if direction == "LONG":
         base = min(e100_4h, entry * (1 - 0.015))
         return round(base * (1 - SL_BUFFER), 6)
@@ -855,22 +869,38 @@ async def open_trade(symbol: str, direction: str, indicators: dict, bot) -> None
     sl       = _calc_sl(entry, direction, indicators["e100_4h"])
     tp1, tp2 = _calc_tps(entry, sl, direction)
     min_q, max_q, step, min_notional, max_lev = await get_instrument_constraints(symbol)
-    # effective_lev is what was actually set on Bybit (already floored to symbol max)
     effective_lev = actual_lev
 
-    # Position notional = qty × entry_price / leverage  (this is what Bybit checks)
-    # We target 20% of balance as margin, so notional = margin × leverage
-    target_margin   = balance * POSITION_PCT
+    # ── REGIME ADAPTATION — position size and leverage ──────────────────────
+    # Volatile Breakout: halve position, cap leverage at 5x
+    # All other regimes: normal sizing
+    current_regime = indicators.get("regime", REGIME_UNKNOWN)
+    if current_regime == REGIME_VOLATILE_BREAKOUT:
+        regime_pos_pct = POSITION_PCT * 0.5    # 10% instead of 20%
+        regime_lev     = min(effective_lev, 5)  # hard cap 5x
+        # Re-set leverage on Bybit to the regime cap
+        if regime_lev < effective_lev:
+            import math
+            try:
+                bybit_session.set_leverage(
+                    category="linear", symbol=symbol,
+                    buyLeverage=str(regime_lev), sellLeverage=str(regime_lev))
+                effective_lev = regime_lev
+            except Exception:
+                pass
+    else:
+        regime_pos_pct = POSITION_PCT          # 20% normal
+        regime_lev     = effective_lev
+
+    target_margin   = balance * regime_pos_pct
     target_notional = target_margin * effective_lev
     raw_qty         = target_notional / entry
-    raw_qty         = max(raw_qty, min_notional / entry)   # respect min notional
+    raw_qty         = max(raw_qty, min_notional / entry)
 
-    # Cap qty so each individual batch order never exceeds maxMktOrderQty
     qty = _round_qty(raw_qty, min_q, step)
 
-    logger.info(f"[{symbol}] Sizing: balance={balance:.2f} lev={effective_lev}x "
-                f"target_notional={target_notional:.2f} raw_qty={raw_qty:.6f} "
-                f"final_qty={qty} max_single_order={max_q}")
+    logger.info(f"[{symbol}] Sizing: regime={current_regime} pos_pct={regime_pos_pct*100:.0f}% "
+                f"lev={effective_lev}x notional={target_notional:.2f} qty={qty}")
 
     if qty <= 0:
         await alert(bot, f"⚠️ [{symbol}] Position size too small.")
@@ -902,8 +932,10 @@ async def open_trade(symbol: str, direction: str, indicators: dict, bot) -> None
     real_entry = await asyncio.to_thread(_sync_get_position_entry, symbol)
     fill_price = real_entry if real_entry else entry
 
-    # Recalculate SL/TP from actual fill
-    sl       = _calc_sl(fill_price, direction, indicators["e100_4h"])
+    # Recalculate SL/TP from actual fill — regime-aware
+    atr_val  = indicators.get("atr", 0.0)
+    sl       = _calc_sl(fill_price, direction, indicators["e100_4h"],
+                        regime=current_regime, atr=atr_val)
     tp1, tp2 = _calc_tps(fill_price, sl, direction)
     await set_sl(symbol, sl)
 
@@ -921,6 +953,10 @@ async def open_trade(symbol: str, direction: str, indicators: dict, bot) -> None
         "entry_time":     time.time(),
         "score":          indicators["score"],
         "filters_passed": indicators["passed"],
+        # Regime context — used by manage_position to adapt exit behaviour
+        "entry_regime":   current_regime,
+        "regime_conf":    indicators.get("regime_confidence", 0),
+        "entry_atr":      atr_val,
     }
     symbol_positions[symbol] = pos
     consec_losses = 0
@@ -930,19 +966,44 @@ async def open_trade(symbol: str, direction: str, indicators: dict, bot) -> None
     f_str  = " ".join([f"✅{p}" for p in indicators["passed"]])
     fail_s = " ".join([f"❌{p}" for p in indicators["failed"]])
 
+    # Build regime-specific trade plan lines
+    re = indicators.get("regime", REGIME_UNKNOWN)
+    rc = indicators.get("regime_confidence", 0)
+    if re == REGIME_VOLATILE_BREAKOUT:
+        tp_lines = (
+            f"🎯 TP1    : <code>{tp1:.4f}</code>  (close 40% — tight SL 0.8×ATR)\n"
+            f"🎯 TP2    : <code>{tp2:.4f}</code>  (close 40%)\n"
+            f"🌊 TP3    : Trailing last 20%\n"
+            f"⚡ Size   : HALF (10% bal, 5× lev) — breakout sizing"
+        )
+    elif re == REGIME_MEAN_REVERTING:
+        tp_lines = (
+            f"🎯 TP1    : <code>{tp1:.4f}</code>  (close 100% — full exit)\n"
+            f"⛔ TP2/TP3: SKIPPED — mean-reverting markets don't run\n"
+            f"🔄 Exit   : Take all profit at TP1, go flat"
+        )
+    else:
+        tp_lines = (
+            f"🎯 TP1    : <code>{tp1:.4f}</code>  (close 40%)\n"
+            f"🎯 TP2    : <code>{tp2:.4f}</code>  (close 40%)\n"
+            f"🌊 TP3    : Trailing last 20%"
+        )
+
+    sl_type = "0.8×ATR (tight)" if re == REGIME_VOLATILE_BREAKOUT and atr_val > 0 else "4H EMA100 −2%"
+    lev_note = f"\n⚠️ Leverage capped at {effective_lev}x (symbol max, requested {LEVERAGE}x)" if effective_lev < LEVERAGE else ""
+
     await alert(bot,
         f"{emoji} <b>TRADE OPENED — {symbol} {direction}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📌 Entry  : <code>{fill_price:.4f}</code>\n"
-        f"🛡 SL     : <code>{sl:.4f}</code>\n"
-        f"🎯 TP1    : <code>{tp1:.4f}</code>  (close 40%)\n"
-        f"🎯 TP2    : <code>{tp2:.4f}</code>  (close 40%)\n"
-        f"🌊 TP3    : Trailing last 20%\n"
+        f"🛡 SL     : <code>{sl:.4f}</code>  ({sl_type})\n"
+        f"{tp_lines}\n"
         f"📊 Score  : {indicators['score']}/8\n"
         f"✅ Passed : {f_str}\n"
         f"❌ Failed : {fail_s}\n"
-        f"⚡ Qty    : {qty}  |  Leverage: {effective_lev}x  |  Balance: {balance:.2f} USDT"
-        + (f"\n⚠️ Note: Leverage capped at {effective_lev}x (symbol max, requested {LEVERAGE}x)" if effective_lev < LEVERAGE else "")
+        f"{regime_emoji(re)} Regime: {regime_label(re)} ({rc}%)\n"
+        f"📋 Action : {regime_action(re)}\n"
+        f"⚡ Qty    : {qty}  |  Leverage: {effective_lev}x  |  Balance: {balance:.2f} USDT{lev_note}"
     )
     logger.info(f"[{symbol}] Trade opened {direction} @ {fill_price}")
 
@@ -966,13 +1027,77 @@ async def manage_position(pos: dict, bot) -> None:
 
     current_price = price
 
+    # ── Live regime re-check ─────────────────────────────────────────────────
+    # Regime can shift WHILE a trade is open. Re-evaluate every cycle.
+    # If it shifts, alert owner and update behaviour accordingly.
+    live_regime_result = await detect_regime(symbol, df_1d, df_4h)
+    live_regime        = live_regime_result["regime"]
+    live_regime_conf   = live_regime_result["confidence"]
+    entry_regime       = pos.get("entry_regime", REGIME_UNKNOWN)
+
+    # Alert if regime has changed since trade was opened
+    if live_regime != entry_regime and live_regime != pos.get("_last_alerted_regime"):
+        pos["_last_alerted_regime"] = live_regime
+        re_emoji = regime_emoji(live_regime)
+        entry_re_label = regime_label(entry_regime)
+        await alert(bot,
+            f"🔀 <b>REGIME SHIFT DURING OPEN TRADE — {symbol}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"Trade opened as : {regime_emoji(entry_regime)} {entry_re_label}\n"
+            f"Current regime  : {re_emoji} <b>{regime_label(live_regime)}</b> ({live_regime_conf}%)\n\n"
+            f"<b>What changes:</b>\n"
+            f"{regime_action(live_regime)}\n\n"
+            f"<b>What stays the same:</b>\n"
+            f"SL, TP prices, and position size are locked from entry.\n"
+            f"Only future TP behaviour adapts to the new regime.")
+
+    # If regime is now VOLATILE_BREAKOUT and SL hasn't been tightened yet,
+    # tighten it using ATR to protect against whipsaw
+    if (live_regime == REGIME_VOLATILE_BREAKOUT and
+        not pos.get("_vol_sl_tightened") and
+        not pos["tp1_hit"]):
+        atr_series = ta.atr(df_4h["high"], df_4h["low"], df_4h["close"], length=14)
+        if atr_series is not None:
+            atr_val = float(atr_series.iloc[-1])
+            if direction == "LONG":
+                tight_sl = round(current_price - atr_val * 0.8, 6)
+                if tight_sl > pos["sl_price"]:   # only tighten, never widen
+                    pos["sl_price"] = tight_sl
+                    await set_sl(symbol, tight_sl)
+                    pos["_vol_sl_tightened"] = True
+                    save_state()
+                    await alert(bot,
+                        f"💥 <b>VOLATILE BREAKOUT — SL tightened — {symbol}</b>\n"
+                        f"Regime shifted to Volatile Breakout during open trade.\n"
+                        f"SL tightened to 0.8×ATR: <code>{tight_sl:.4f}</code>\n"
+                        f"Protects against breakout failure / whipsaw.")
+            else:
+                tight_sl = round(current_price + atr_val * 0.8, 6)
+                if tight_sl < pos["sl_price"]:
+                    pos["sl_price"] = tight_sl
+                    await set_sl(symbol, tight_sl)
+                    pos["_vol_sl_tightened"] = True
+                    save_state()
+                    await alert(bot,
+                        f"💥 <b>VOLATILE BREAKOUT — SL tightened — {symbol}</b>\n"
+                        f"Regime shifted to Volatile Breakout during open trade.\n"
+                        f"SL tightened to 0.8×ATR: <code>{tight_sl:.4f}</code>\n"
+                        f"Protects against breakout failure / whipsaw.")
+
+    # Update pos with live regime for TP/trailing logic below
+    pos["live_regime"] = live_regime
+
     # ── Dead trade ───────────────────────────────────────────────────────────
-    if not pos["tp1_hit"] and (time.time() - pos["entry_time"]) / 86400 >= DEAD_TRADE_DAYS:
+    # Mean Reverting: dead trade timeout is 3 days (not 7) — ranging markets
+    # don't need 7 days to prove they're not working
+    dead_days = 3 if live_regime == REGIME_MEAN_REVERTING else DEAD_TRADE_DAYS
+    if not pos["tp1_hit"] and (time.time() - pos["entry_time"]) / 86400 >= dead_days:
         await close_full(symbol, direction)
         pnl = _est_pnl(pos, current_price)
         await alert(bot,
             f"⏱ <b>DEAD TRADE CLOSED — {symbol} {direction}</b>\n"
-            f"No TP1 after {DEAD_TRADE_DAYS} days with no movement.\n"
+            f"No TP1 after {dead_days} days.\n"
+            f"Regime at close: {regime_emoji(live_regime)} {regime_label(live_regime)}\n"
             f"Closed @ <code>{current_price:.4f}</code>\n"
             f"Est. PnL: {pnl:+.2f} USDT\n"
             f"Bot goes FLAT on {symbol}. Watching for next signal.")
@@ -1014,32 +1139,57 @@ async def manage_position(pos: dict, bot) -> None:
         _close_pos(symbol, pnl, exit_price=current_price, exit_reason="SL")
         return
 
+    # ── Regime context for this position ────────────────────────────────────
+    # Use LIVE regime for exit decisions — the market may have changed
+    # since the trade was opened. Live regime = current market reality.
+    entry_regime = pos.get("entry_regime", REGIME_UNKNOWN)
+    effective_regime = live_regime   # use live, not entry, for exit behaviour
+    is_mean_rev  = effective_regime == REGIME_MEAN_REVERTING
+
     # ── TP1 ──────────────────────────────────────────────────────────────────
     if not pos["tp1_hit"]:
         tp1_hit = (direction == "LONG"  and current_price >= pos["tp1_price"]) or \
                   (direction == "SHORT" and current_price <= pos["tp1_price"])
         if tp1_hit:
             min_q, _, step, _, _ = await get_instrument_constraints(symbol)
-            close_qty = _round_qty(pos["original_qty"] * 0.40, min_q, step)
+            if is_mean_rev:
+                # MEAN REVERTING: close 100% at TP1 — these markets don't run to TP2
+                close_qty = _round_qty(pos["remaining_qty"], min_q, step)
+            else:
+                # Normal: close 40% at TP1
+                close_qty = _round_qty(pos["original_qty"] * 0.40, min_q, step)
             await place_order(symbol, "Sell" if direction == "LONG" else "Buy",
                               close_qty, reduce_only=True)
-            pos["remaining_qty"] = round(pos["original_qty"] * 0.60, 8)
-            pos["tp1_hit"]  = True
-            pos["sl_price"] = pos["entry_price"]
-            await set_sl(symbol, pos["entry_price"])
             consec_losses = 0
             pnl_p = abs(pos["tp1_price"] - pos["entry_price"]) * close_qty * LEVERAGE
             save_state()
-            await alert(bot,
-                f"🎯 <b>TP1 HIT — {symbol} {direction}</b>\n"
-                f"Closed 40% @ <code>{current_price:.4f}</code>\n"
-                f"Est. partial PnL: +{pnl_p:.2f} USDT\n"
-                f"🔒 SL moved to breakeven: <code>{pos['entry_price']:.4f}</code>\n"
-                f"Remaining qty: {pos['remaining_qty']}\n"
-                f"Riding to TP2 @ <code>{pos['tp2_price']:.4f}</code>")
+            if is_mean_rev:
+                # Close fully — record and remove position
+                _close_pos(symbol, pnl_p, exit_price=current_price, exit_reason="TP1_MEAN_REV")
+                await alert(bot,
+                    f"🎯 <b>TP1 HIT (MEAN REVERTING) — {symbol} {direction}</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"Closed 100% @ <code>{current_price:.4f}</code>\n"
+                    f"Est. PnL: +{pnl_p:.2f} USDT\n"
+                    f"🔄 Mean Reverting regime — taking all profit at TP1\n"
+                    f"No trailing in oscillating markets. Going FLAT.")
+            else:
+                pos["remaining_qty"] = round(pos["original_qty"] * 0.60, 8)
+                pos["tp1_hit"]  = True
+                pos["sl_price"] = pos["entry_price"]
+                await set_sl(symbol, pos["entry_price"])
+                await alert(bot,
+                    f"🎯 <b>TP1 HIT — {symbol} {direction}</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"Closed 40% @ <code>{current_price:.4f}</code>\n"
+                    f"Est. partial PnL: +{pnl_p:.2f} USDT\n"
+                    f"🔒 SL moved to breakeven: <code>{pos['entry_price']:.4f}</code>\n"
+                    f"Remaining qty: {pos['remaining_qty']}\n"
+                    f"Riding to TP2 @ <code>{pos['tp2_price']:.4f}</code>")
             return
 
     # ── TP2 ──────────────────────────────────────────────────────────────────
+    # Skipped entirely in Mean Reverting regime (position closed at TP1 above)
     if pos["tp1_hit"] and not pos["tp2_hit"]:
         tp2_hit = (direction == "LONG"  and current_price >= pos["tp2_price"]) or \
                   (direction == "SHORT" and current_price <= pos["tp2_price"])
@@ -1054,6 +1204,7 @@ async def manage_position(pos: dict, bot) -> None:
             save_state()
             await alert(bot,
                 f"🎯 <b>TP2 HIT — {symbol} {direction}</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"Closed 40% @ <code>{current_price:.4f}</code>\n"
                 f"Est. partial PnL: +{pnl_p:.2f} USDT\n"
                 f"🌊 Trailing stop now active on last 20%\n"
@@ -1061,6 +1212,7 @@ async def manage_position(pos: dict, bot) -> None:
             return
 
     # ── Trailing SL after TP2 ────────────────────────────────────────────────
+    # Skipped in Mean Reverting regime (never reaches here — closed at TP1)
     if pos["tp2_hit"]:
         new_sl = await asyncio.to_thread(
             _compute_trailing_sl, df_4h, direction, pos["sl_price"])
@@ -1109,6 +1261,412 @@ async def check_reversal_after_exit(symbol: str, old_direction: str, bot) -> Non
             f"(score {indicators['score']}/8 — need 5).\n"
             f"Bot watches and waits for next valid signal.")
 
+
+# =============================================================================
+#  MARKET REGIME DETECTOR
+#  Classifies market conditions every monitoring cycle using 7 indicators.
+#  The regime adjusts HOW the bot trades — entry direction, position size,
+#  TP targets, and SL tightness — without overriding the core strategy filters.
+#
+#  Regimes:
+#   STRONG_UPTREND   — trending up, LONG only, wider TPs
+#   STRONG_DOWNTREND — trending down, SHORT only, wider TPs
+#   CHOPPY_RANGING   — no clear direction, skip new entries
+#   VOLATILE_BREAKOUT— fast explosive move, tighter SL, smaller size
+#   MEAN_REVERTING   — oscillating, smaller TPs, quick exits
+# =============================================================================
+
+# ── Regime constants ──────────────────────────────────────────────────────────
+REGIME_STRONG_UPTREND    = "STRONG_UPTREND"
+REGIME_STRONG_DOWNTREND  = "STRONG_DOWNTREND"
+REGIME_CHOPPY_RANGING    = "CHOPPY_RANGING"
+REGIME_VOLATILE_BREAKOUT = "VOLATILE_BREAKOUT"
+REGIME_MEAN_REVERTING    = "MEAN_REVERTING"
+REGIME_UNKNOWN           = "UNKNOWN"
+
+# Cache: symbol -> (regime, confidence, timestamp, detail_dict)
+regime_cache: dict[str, tuple] = {}
+REGIME_CACHE_TTL = 300   # reuse for 5 min unless forced refresh
+
+# Per-symbol last known regime (for change detection)
+regime_last: dict[str, str] = {}
+
+
+def _sync_detect_regime(symbol: str,
+                         df_1d: "pd.DataFrame",
+                         df_4h: "pd.DataFrame") -> dict:
+    """
+    Synchronous regime classifier — runs in background thread.
+    Returns a dict with regime, confidence (0-100), and all raw values.
+
+    Scoring algorithm:
+    - Each regime accumulates points from relevant indicators.
+    - The regime with the highest score wins.
+    - Confidence = winner_score / total_possible_points * 100.
+    """
+    import numpy as np
+
+    result = {
+        "regime":     REGIME_UNKNOWN,
+        "confidence": 0,
+        "symbol":     symbol,
+        "indicators": {},
+    }
+
+    try:
+        close = df_1d["close"]
+        high  = df_1d["high"]
+        low   = df_1d["low"]
+
+        # ── Indicator 1: ADX (trend strength) ────────────────────────────────
+        adx_s = ta.adx(high, low, close, length=14)
+        adx   = float(adx_s[f"ADX_14"].iloc[-1]) if adx_s is not None else 20.0
+        dmp   = float(adx_s[f"DMP_14"].iloc[-1]) if adx_s is not None else 0.0
+        dmn   = float(adx_s[f"DMN_14"].iloc[-1]) if adx_s is not None else 0.0
+
+        # ── Indicator 2: ATR % (volatility relative to price) ────────────────
+        atr_s   = ta.atr(high, low, close, length=14)
+        atr     = float(atr_s.iloc[-1]) if atr_s is not None else 0.0
+        price   = float(close.iloc[-1])
+        atr_pct = (atr / price * 100) if price > 0 else 0.0
+
+        # ── Indicator 3: Bollinger Band width (squeeze = range, expand = trend)
+        bb = ta.bbands(close, length=20, std=2.0)
+        if bb is not None:
+            bb_upper = float(bb["BBU_20_2.0"].iloc[-1])
+            bb_lower = float(bb["BBL_20_2.0"].iloc[-1])
+            bb_mid   = float(bb["BBM_20_2.0"].iloc[-1])
+            bb_width = (bb_upper - bb_lower) / bb_mid * 100 if bb_mid > 0 else 2.0
+        else:
+            bb_upper = bb_lower = bb_mid = price
+            bb_width = 2.0
+
+        # ── Indicator 4: EMA slope (direction and angle) ──────────────────────
+        ema50  = close.ewm(span=50,  adjust=False).mean()
+        ema200 = close.ewm(span=200, adjust=False).mean()
+        # Slope as % change over last 5 candles
+        ema50_slope  = float((ema50.iloc[-1]  - ema50.iloc[-6])  / ema50.iloc[-6]  * 100) if len(ema50)  > 6 else 0.0
+        ema200_slope = float((ema200.iloc[-1] - ema200.iloc[-6]) / ema200.iloc[-6] * 100) if len(ema200) > 6 else 0.0
+        ema_aligned_bull = float(ema50.iloc[-1]) > float(ema200.iloc[-1])
+        ema_aligned_bear = float(ema50.iloc[-1]) < float(ema200.iloc[-1])
+        price_above_ema50  = price > float(ema50.iloc[-1])
+        price_below_ema50  = price < float(ema50.iloc[-1])
+        price_above_ema200 = price > float(ema200.iloc[-1])
+        price_below_ema200 = price < float(ema200.iloc[-1])
+
+        # ── Indicator 5: RSI (overbought/oversold/midrange) ──────────────────
+        rsi_s = ta.rsi(close, length=14)
+        rsi   = float(rsi_s.iloc[-1]) if rsi_s is not None else 50.0
+
+        # ── Indicator 6: Volume ratio (current vs 20-period avg) ─────────────
+        vol     = df_1d["volume"]
+        avg_vol = float(vol.iloc[-21:-1].mean()) if len(vol) > 21 else float(vol.mean())
+        cur_vol = float(vol.iloc[-1])
+        vol_ratio = cur_vol / avg_vol if avg_vol > 0 else 1.0
+
+        # ── Indicator 7: BB %B (where price sits in the band) ────────────────
+        bb_pct_b = (price - bb_lower) / (bb_upper - bb_lower) if (bb_upper - bb_lower) > 0 else 0.5
+
+        # ── Historical volatility (20-day rolling std of returns) ─────────────
+        returns  = close.pct_change().dropna()
+        hist_vol = float(returns.rolling(20).std().iloc[-1] * 100) if len(returns) >= 20 else atr_pct
+
+        # ═════════════════════════════════════════════════════════════════════
+        #  LEADING INDICATORS — fire BEFORE lagging ADX catches up
+        #  These detect regime shifts 3–10 candles earlier than ADX alone.
+        # ═════════════════════════════════════════════════════════════════════
+
+        # ── Leading 1: BB Squeeze (Keltner/BB crossover) ─────────────────────
+        # When BB width contracts to a multi-month low, a breakout is IMMINENT.
+        # The direction of the first strong candle out of the squeeze is the signal.
+        # This fires days before ATR rises or ADX confirms.
+        kc_atr  = ta.atr(high, low, close, length=20)
+        kc_mid  = close.ewm(span=20, adjust=False).mean()
+        kc_upper = kc_mid + 1.5 * kc_atr
+        kc_lower = kc_mid - 1.5 * kc_atr
+        # Squeeze = BB inside Keltner Channel
+        bb_inside_kc = (bb_upper < kc_upper) & (bb_lower > kc_lower) if kc_atr is not None else pd.Series([False]*len(close))
+        squeeze_active  = bool(bb_inside_kc.iloc[-1])
+        squeeze_released = bool(bb_inside_kc.iloc[-2]) and not bool(bb_inside_kc.iloc[-1])
+        # BB width at 20-bar low = tightest squeeze in recent memory
+        bb_width_series = (bb_upper - bb_lower) / kc_mid * 100 if kc_atr is not None else pd.Series([bb_width]*len(close))
+        bb_at_20bar_low = float(bb_width_series.iloc[-1]) <= float(bb_width_series.rolling(20).min().iloc[-1]) * 1.05
+
+        # ── Leading 2: EMA slope acceleration (2nd derivative) ───────────────
+        # Slope inflecting from negative toward zero = trend birth, days before
+        # EMA actually crosses or ADX rises. This is the "turn" not the "trend".
+        # Slope of slope = (current_slope - slope_5_bars_ago)
+        if len(ema50) > 11:
+            ema50_slope_5ago = float((ema50.iloc[-6] - ema50.iloc[-11]) / ema50.iloc[-11] * 100)
+            slope_accel = ema50_slope - ema50_slope_5ago  # positive = accelerating up
+        else:
+            slope_accel = 0.0
+        slope_turning_bull = slope_accel > 0.02 and ema50_slope > ema50_slope_5ago
+        slope_turning_bear = slope_accel < -0.02 and ema50_slope < ema50_slope_5ago
+
+        # ── Leading 3: Price structure (higher highs / lower lows) ───────────
+        # No smoothing — raw price action. 3 consecutive higher closes =
+        # uptrend forming. 3 lower closes = downtrend forming.
+        # Faster than any moving average by definition.
+        if len(close) >= 5:
+            c1, c2, c3, c4 = (float(close.iloc[-i]) for i in (1,2,3,4))
+            hh_hl = c1 > c2 > c3       # 3 consecutive higher closes
+            lh_ll = c1 < c2 < c3       # 3 consecutive lower closes
+            # Confirm with 4th candle for reliability
+            strong_hh = c1 > c2 > c3 > c4
+            strong_ll  = c1 < c2 < c3 < c4
+        else:
+            hh_hl = lh_ll = strong_hh = strong_ll = False
+
+        # ── Leading 4: Volume-price divergence (accumulation/distribution) ───
+        # Rising volume with rising price = strong buying = trend confirmation
+        # Rising volume with falling price = distribution = trend confirmation
+        # High volume with small price move = absorption = range/reversal
+        if len(close) >= 3 and len(vol) >= 3:
+            price_chg_3d  = (float(close.iloc[-1]) - float(close.iloc[-4])) / float(close.iloc[-4]) * 100
+            vol_3d_avg    = float(vol.iloc[-4:-1].mean())
+            vol_expanding = float(vol.iloc[-1]) > vol_3d_avg * 1.2
+            # Trend confirmation: big price move + expanding volume
+            vol_confirms_bull = price_chg_3d > 1.0 and vol_expanding
+            vol_confirms_bear = price_chg_3d < -1.0 and vol_expanding
+            # Chop signal: high volume but price barely moved
+            vol_chop_signal   = vol_ratio > 1.3 and abs(price_chg_3d) < 0.5
+        else:
+            vol_confirms_bull = vol_confirms_bear = vol_chop_signal = False
+            price_chg_3d = 0.0
+
+        # Store all raw values — now including leading indicators
+        result["indicators"] = {
+            "adx":               round(adx, 1),
+            "dmp":               round(dmp, 1),
+            "dmn":               round(dmn, 1),
+            "atr_pct":           round(atr_pct, 2),
+            "bb_width":          round(bb_width, 2),
+            "ema50_slope":       round(ema50_slope, 3),
+            "ema200_slope":      round(ema200_slope, 3),
+            "slope_accel":       round(slope_accel, 4),
+            "rsi":               round(rsi, 1),
+            "vol_ratio":         round(vol_ratio, 2),
+            "bb_pct_b":          round(bb_pct_b, 2),
+            "hist_vol":          round(hist_vol, 2),
+            "price":             round(price, 6),
+            "price_chg_3d":      round(price_chg_3d, 2),
+            # Leading signals (bool → shown clearly in /regime output)
+            "squeeze_active":    squeeze_active,
+            "squeeze_released":  squeeze_released,
+            "bb_at_20bar_low":   bb_at_20bar_low,
+            "slope_turning_bull":slope_turning_bull,
+            "slope_turning_bear":slope_turning_bear,
+            "hh_hl":             hh_hl,
+            "lh_ll":             lh_ll,
+            "strong_hh":         strong_hh,
+            "strong_ll":         strong_ll,
+            "vol_confirms_bull": vol_confirms_bull,
+            "vol_confirms_bear": vol_confirms_bear,
+            "vol_chop_signal":   vol_chop_signal,
+        }
+
+        # ── REGIME SCORING ────────────────────────────────────────────────────
+        scores = {
+            REGIME_STRONG_UPTREND:    0,
+            REGIME_STRONG_DOWNTREND:  0,
+            REGIME_CHOPPY_RANGING:    0,
+            REGIME_VOLATILE_BREAKOUT: 0,
+            REGIME_MEAN_REVERTING:    0,
+        }
+
+        # ── STRONG UPTREND scoring (max 44 pts) ──────────────────────────────
+        # Lagging confirmators (ADX — still useful once trend is established)
+        if adx > 25:               scores[REGIME_STRONG_UPTREND] += 4
+        elif adx > 20:             scores[REGIME_STRONG_UPTREND] += 2
+        if dmp > dmn:              scores[REGIME_STRONG_UPTREND] += 3
+        if ema_aligned_bull:       scores[REGIME_STRONG_UPTREND] += 3
+        if ema50_slope > 0.05:     scores[REGIME_STRONG_UPTREND] += 2
+        if price_above_ema50:      scores[REGIME_STRONG_UPTREND] += 2
+        if price_above_ema200:     scores[REGIME_STRONG_UPTREND] += 1
+        if rsi > 50:               scores[REGIME_STRONG_UPTREND] += 1
+        # Leading: price structure (fires 3–5 candles before ADX)
+        if hh_hl:                  scores[REGIME_STRONG_UPTREND] += 6
+        if strong_hh:              scores[REGIME_STRONG_UPTREND] += 4   # extra for 4 consecutive
+        # Leading: EMA slope turning bullish (fires before EMA crosses)
+        if slope_turning_bull:     scores[REGIME_STRONG_UPTREND] += 6
+        # Leading: volume confirms buying
+        if vol_confirms_bull:      scores[REGIME_STRONG_UPTREND] += 5
+        # Leading: squeeze released with price above midpoint = breakout up
+        if squeeze_released and price > float(bb_mid.iloc[-1] if hasattr(bb_mid,'iloc') else bb_mid):
+            scores[REGIME_STRONG_UPTREND] += 7
+
+        # ── STRONG DOWNTREND scoring (max 44 pts) ────────────────────────────
+        if adx > 25:               scores[REGIME_STRONG_DOWNTREND] += 4
+        elif adx > 20:             scores[REGIME_STRONG_DOWNTREND] += 2
+        if dmn > dmp:              scores[REGIME_STRONG_DOWNTREND] += 3
+        if ema_aligned_bear:       scores[REGIME_STRONG_DOWNTREND] += 3
+        if ema50_slope < -0.05:    scores[REGIME_STRONG_DOWNTREND] += 2
+        if price_below_ema50:      scores[REGIME_STRONG_DOWNTREND] += 2
+        if price_below_ema200:     scores[REGIME_STRONG_DOWNTREND] += 1
+        if rsi < 50:               scores[REGIME_STRONG_DOWNTREND] += 1
+        # Leading: price structure
+        if lh_ll:                  scores[REGIME_STRONG_DOWNTREND] += 6
+        if strong_ll:              scores[REGIME_STRONG_DOWNTREND] += 4
+        # Leading: EMA slope turning bearish
+        if slope_turning_bear:     scores[REGIME_STRONG_DOWNTREND] += 6
+        # Leading: volume confirms selling
+        if vol_confirms_bear:      scores[REGIME_STRONG_DOWNTREND] += 5
+        # Leading: squeeze released with price below midpoint = breakout down
+        if squeeze_released and price < float(bb_mid.iloc[-1] if hasattr(bb_mid,'iloc') else bb_mid):
+            scores[REGIME_STRONG_DOWNTREND] += 7
+
+        # ── CHOPPY / RANGING scoring (max 30 pts) ────────────────────────────
+        # Lagging ADX fine here — chop persists, lag doesn't matter
+        if adx < 20:               scores[REGIME_CHOPPY_RANGING] += 8
+        elif adx < 25:             scores[REGIME_CHOPPY_RANGING] += 4
+        if bb_width < 3.0:         scores[REGIME_CHOPPY_RANGING] += 6
+        elif bb_width < 5.0:       scores[REGIME_CHOPPY_RANGING] += 3
+        if abs(ema50_slope) < 0.02: scores[REGIME_CHOPPY_RANGING] += 4
+        if 40 < rsi < 60:          scores[REGIME_CHOPPY_RANGING] += 3
+        if vol_ratio < 0.8:        scores[REGIME_CHOPPY_RANGING] += 2
+        # Leading: squeeze still active = chop not yet broken out
+        if squeeze_active:         scores[REGIME_CHOPPY_RANGING] += 4
+        # Leading: volume + tiny price move = absorption = chop
+        if vol_chop_signal:        scores[REGIME_CHOPPY_RANGING] += 3
+
+        # ── VOLATILE BREAKOUT scoring (max 30 pts) ───────────────────────────
+        # Partially leading — BB compression fires before the explosion
+        if atr_pct > 3.0:          scores[REGIME_VOLATILE_BREAKOUT] += 5
+        elif atr_pct > 2.0:        scores[REGIME_VOLATILE_BREAKOUT] += 3
+        if vol_ratio > 2.5:        scores[REGIME_VOLATILE_BREAKOUT] += 5
+        elif vol_ratio > 1.5:      scores[REGIME_VOLATILE_BREAKOUT] += 3
+        if bb_width > 8.0:         scores[REGIME_VOLATILE_BREAKOUT] += 4
+        elif bb_width > 5.0:       scores[REGIME_VOLATILE_BREAKOUT] += 2
+        if hist_vol > 4.0:         scores[REGIME_VOLATILE_BREAKOUT] += 3
+        elif hist_vol > 2.5:       scores[REGIME_VOLATILE_BREAKOUT] += 2
+        if rsi > 70 or rsi < 30:   scores[REGIME_VOLATILE_BREAKOUT] += 2
+        # Leading: squeeze just released = breakout starting NOW
+        if squeeze_released:       scores[REGIME_VOLATILE_BREAKOUT] += 6
+        # Leading: BB at 20-bar low = maximum compression = breakout imminent
+        if bb_at_20bar_low:        scores[REGIME_VOLATILE_BREAKOUT] += 3
+
+        # ── MEAN REVERTING scoring (max 22 pts) ──────────────────────────────
+        if 0.2 < bb_pct_b < 0.8:   scores[REGIME_MEAN_REVERTING] += 5
+        if adx < 22:                scores[REGIME_MEAN_REVERTING] += 4
+        if abs(ema50_slope) < 0.04: scores[REGIME_MEAN_REVERTING] += 3
+        if atr_pct < 2.5:           scores[REGIME_MEAN_REVERTING] += 3
+        if 35 < rsi < 65:           scores[REGIME_MEAN_REVERTING] += 2
+        if vol_ratio < 1.2:         scores[REGIME_MEAN_REVERTING] += 2
+        # Leading: squeeze still in = mean reversion in full effect
+        if squeeze_active and not squeeze_released:
+            scores[REGIME_MEAN_REVERTING] += 3
+
+        # ── Winner ────────────────────────────────────────────────────────────
+        max_possible = {
+            REGIME_STRONG_UPTREND:    44,
+            REGIME_STRONG_DOWNTREND:  44,
+            REGIME_CHOPPY_RANGING:    30,
+            REGIME_VOLATILE_BREAKOUT: 30,
+            REGIME_MEAN_REVERTING:    22,
+        }
+        winner  = max(scores, key=lambda k: scores[k])
+        raw_score = scores[winner]
+        confidence = min(100, int(raw_score / max_possible[winner] * 100))
+
+        result["regime"]        = winner
+        result["confidence"]    = confidence
+        result["scores"]        = scores
+        result["max_possible"]  = max_possible
+
+    except Exception as e:
+        logger.error(f"[REGIME] _sync_detect_regime({symbol}): {e}", exc_info=True)
+
+    return result
+
+
+async def detect_regime(symbol: str,
+                         df_1d: "pd.DataFrame",
+                         df_4h: "pd.DataFrame",
+                         force: bool = False) -> dict:
+    """
+    Async wrapper for regime detection with caching.
+    Returns cached result if < REGIME_CACHE_TTL seconds old.
+    """
+    now = time.time()
+    cached = regime_cache.get(symbol)
+    if cached and not force and (now - cached[3]) < REGIME_CACHE_TTL:
+        return cached[0]   # return cached dict
+
+    result = await asyncio.to_thread(_sync_detect_regime, symbol, df_1d, df_4h)
+    regime_cache[symbol] = (result, result["confidence"], result["regime"], now)
+    return result
+
+
+def regime_emoji(regime: str) -> str:
+    return {
+        REGIME_STRONG_UPTREND:    "📈",
+        REGIME_STRONG_DOWNTREND:  "📉",
+        REGIME_CHOPPY_RANGING:    "↔️",
+        REGIME_VOLATILE_BREAKOUT: "💥",
+        REGIME_MEAN_REVERTING:    "🔄",
+        REGIME_UNKNOWN:           "❓",
+    }.get(regime, "❓")
+
+
+def regime_label(regime: str) -> str:
+    return {
+        REGIME_STRONG_UPTREND:    "Strong Uptrend",
+        REGIME_STRONG_DOWNTREND:  "Strong Downtrend",
+        REGIME_CHOPPY_RANGING:    "Choppy / Ranging",
+        REGIME_VOLATILE_BREAKOUT: "Volatile Breakout",
+        REGIME_MEAN_REVERTING:    "Mean Reverting",
+        REGIME_UNKNOWN:           "Unknown",
+    }.get(regime, "Unknown")
+
+
+def regime_action(regime: str) -> str:
+    return {
+        REGIME_STRONG_UPTREND:    "LONG entries only · Wider TP targets · Hold longer",
+        REGIME_STRONG_DOWNTREND:  "SHORT entries only · Wider TP targets · Hold longer",
+        REGIME_CHOPPY_RANGING:    "NO new entries · Manage open positions closely",
+        REGIME_VOLATILE_BREAKOUT: "Reduce position size 50% · Tighter SL (0.8× ATR) · Quick exits",
+        REGIME_MEAN_REVERTING:    "Smaller TP targets (1:1 only) · Quick exits · No trailing",
+        REGIME_UNKNOWN:           "Insufficient data — bot uses default settings",
+    }.get(regime, "Default settings")
+
+
+def regime_allows_direction(regime: str, direction: str) -> bool:
+    """Check if the current regime allows this trade direction."""
+    if regime == REGIME_STRONG_UPTREND    and direction == "SHORT": return False
+    if regime == REGIME_STRONG_DOWNTREND  and direction == "LONG":  return False
+    if regime == REGIME_CHOPPY_RANGING:                              return False
+    return True
+
+
+async def check_regime_change(symbol: str, new_regime: dict, bot) -> None:
+    """Alert owner if regime has shifted since last check."""
+    old = regime_last.get(symbol, REGIME_UNKNOWN)
+    new = new_regime["regime"]
+    if old != new and old != REGIME_UNKNOWN:
+        emoji_old = regime_emoji(old)
+        emoji_new = regime_emoji(new)
+        await alert(bot,
+            f"🔀 <b>REGIME SHIFT — {symbol}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"Was  : {emoji_old} {regime_label(old)}\n"
+            f"Now  : {emoji_new} <b>{regime_label(new)}</b> "
+            f"({new_regime['confidence']}% confidence)\n\n"
+            f"<b>Bot behaviour changes to:</b>\n"
+            f"{regime_action(new)}\n\n"
+            f"<b>Key indicators:</b>\n"
+            f"ADX: {new_regime['indicators'].get('adx','?')} · "
+            f"ATR%: {new_regime['indicators'].get('atr_pct','?')} · "
+            f"BB width: {new_regime['indicators'].get('bb_width','?')}\n"
+            f"EMA50 slope: {new_regime['indicators'].get('ema50_slope','?')} · "
+            f"RSI: {new_regime['indicators'].get('rsi','?')}"
+        )
+    regime_last[symbol] = new
+
+# =============================================================================
+#  END OF REGIME DETECTOR MODULE
+# =============================================================================
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  MAIN MONITOR LOOP — per symbol, with execution guard
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1122,8 +1680,13 @@ async def _monitor_symbol_inner(symbol: str, bot, job_data: dict) -> None:
     iso_week = now.strftime("%Y-W%W")
 
     if last_reset_day != today:
-        daily_loss    = 0.0
+        daily_loss     = 0.0
         last_reset_day = today
+        # Auto-reset consecutive losses every new day.
+        # A stop loss from yesterday should not block today's entries.
+        if consec_losses > 0:
+            logger.info(f"[CIRCUIT] Auto-reset consec_losses {consec_losses}→0 (new day)")
+            consec_losses = 0
     if last_reset_week != iso_week:
         weekly_loss    = 0.0
         last_reset_week = iso_week
@@ -1137,11 +1700,21 @@ async def _monitor_symbol_inner(symbol: str, bot, job_data: dict) -> None:
     )
 
     if paused_circuit and not job_data.get("circuit_alerted"):
+        reasons = []
+        if daily_loss   <= -0.04 * balance: reasons.append(f"Daily loss {daily_loss:.2f} USDT (limit 4%)")
+        if weekly_loss  <= -0.06 * balance: reasons.append(f"Weekly loss {weekly_loss:.2f} USDT (limit 6%)")
+        if consec_losses >= 3:              reasons.append(f"{consec_losses} consecutive losses")
+        reason_str = " | ".join(reasons)
         await alert(bot,
             f"⚠️ <b>CIRCUIT BREAKER — {symbol}</b>\n"
-            f"Daily loss: {daily_loss:.2f} USDT | Weekly loss: {weekly_loss:.2f} USDT\n"
-            f"Consecutive losses: {consec_losses}\n"
-            f"No new entries until conditions reset. Existing positions still managed.")
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"Triggered by: {reason_str}\n"
+            f"No new entries until conditions reset.\n"
+            f"Existing positions still managed normally.\n\n"
+            f"<b>How to resume:</b>\n"
+            f"• Consecutive losses reset automatically each new day\n"
+            f"• Or use /resume to reset manually right now\n"
+            f"• Daily/weekly loss limits reset at midnight UTC")
         job_data["circuit_alerted"] = True
     elif not paused_circuit:
         job_data["circuit_alerted"] = False
@@ -1168,21 +1741,53 @@ async def _monitor_symbol_inner(symbol: str, bot, job_data: dict) -> None:
 
     price = float(df_1d["close"].iloc[-1])
 
-    # Check LONG and SHORT in a single thread call
+    # ── Detect market regime ─────────────────────────────────────────────────
+    regime_result  = await detect_regime(symbol, df_1d, df_4h)
+    await check_regime_change(symbol, regime_result, bot)
+    current_regime = regime_result["regime"]
+    regime_conf    = regime_result["confidence"]
+    logger.info(f"[{symbol}] Regime: {regime_label(current_regime)} ({regime_conf}%)")
+
+    # CHOPPY regime — skip new entries entirely
+    if current_regime == REGIME_CHOPPY_RANGING:
+        logger.info(f"[{symbol}] Regime CHOPPY ({regime_conf}%) — skipping entry scan")
+        await _maybe_send_status_report(symbol, bot, job_data, balance,
+                                        df_1d=df_1d, df_4h=df_4h, price=price,
+                                        regime=regime_result)
+        return
+
+    # Check LONG and SHORT — regime filters allowed directions
     for direction in ("LONG", "SHORT"):
+        if not regime_allows_direction(current_regime, direction):
+            logger.debug(f"[{symbol}] Regime {current_regime} blocks {direction}")
+            continue
         indicators = await asyncio.to_thread(
             _compute_indicators, df_1d, df_4h, df_1h, direction)
         if indicators["should_enter"]:
-            logger.info(f"[{symbol}] {direction} entry confirmed (score {indicators['score']})")
+            indicators["regime"]            = current_regime
+            indicators["regime_confidence"] = regime_conf
+            logger.info(f"[{symbol}] {direction} confirmed (score {indicators['score']}) "
+                        f"regime={current_regime}")
             await open_trade(symbol, direction, indicators, bot)
             return
 
-    # Send 30-min status report even when flat
-    await _maybe_send_status_report(symbol, bot, job_data, balance, df_1d=df_1d, df_4h=df_4h, price=price)
+    # No signal found this cycle — log why for debugging
+    logger.info(f"[{symbol}] No entry signal this cycle. "
+                f"Regime: {regime_label(current_regime)} ({regime_conf}%) | "
+                f"Price: {price:.4f} | "
+                f"paused: {bot_paused} | circuit: {paused_circuit} | "
+                f"consec_losses: {consec_losses}")
+
+    # 30-min report when flat
+    await _maybe_send_status_report(symbol, bot, job_data, balance,
+                                    df_1d=df_1d, df_4h=df_4h, price=price,
+                                    regime=regime_result)
+
 
 async def _maybe_send_status_report(
     symbol: str, bot, job_data: dict, balance: float,
-    df_1d=None, df_4h=None, price: float = 0.0
+    df_1d=None, df_4h=None, price: float = 0.0,
+    regime: dict = None
 ) -> None:
     """Send a 30-minute status update for a symbol."""
     now = time.time()
@@ -1239,12 +1844,23 @@ async def _maybe_send_status_report(
         except Exception:
             pass
 
+    # Regime line
+    regime_line = ""
+    if regime:
+        re = regime.get("regime", REGIME_UNKNOWN)
+        rc = regime.get("confidence", 0)
+        regime_line = (
+            f"\n{regime_emoji(re)} <b>Regime</b>: {regime_label(re)} ({rc}%)\n"
+            f"   Action: {regime_action(re)}"
+        )
+
     await alert(bot,
         f"📋 <b>30-min Report — {symbol}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"Balance: <code>{balance:.2f} USDT</code>  |  "
         f"Paused: {'🔴 YES' if bot_paused else '🟢 NO'}\n"
         f"Consec losses: {consec_losses}  |  Daily loss: {daily_loss:.2f}\n"
+        f"{regime_line}\n"
         f"\n{trade_info}"
         f"{ind_text}\n\n"
         f"⚙️ Strategy: Daily+4H+1H  |  10x lev  |  20% balance\n"
@@ -1380,14 +1996,30 @@ async def cmd_remove_symbol(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
 @public_command
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     balance = await get_balance()
+    # Check circuit breaker
+    cb_daily  = daily_loss  <= -0.04 * balance if balance > 0 else False
+    cb_weekly = weekly_loss <= -0.06 * balance if balance > 0 else False
+    cb_losses = consec_losses >= 3
+    circuit_on = cb_daily or cb_weekly or cb_losses
+
+    if circuit_on:
+        cb_reasons = []
+        if cb_daily:  cb_reasons.append(f"daily loss {daily_loss:.2f}")
+        if cb_weekly: cb_reasons.append(f"weekly loss {weekly_loss:.2f}")
+        if cb_losses: cb_reasons.append(f"{consec_losses} consec losses")
+        cb_str = f"🔴 ACTIVE ({', '.join(cb_reasons)}) — use /resume to reset"
+    else:
+        cb_str = "🟢 clear"
+
     lines   = [
         "📊 <b>Bot Status</b>",
         "━━━━━━━━━━━━━━━━━━━━",
-        f"Balance      : <code>{balance:.2f} USDT</code>",
-        f"Paused       : {'🔴 YES' if bot_paused else '🟢 NO'}",
-        f"Consec losses: {consec_losses}",
-        f"Daily loss   : {daily_loss:.2f} USDT",
-        f"Weekly loss  : {weekly_loss:.2f} USDT",
+        f"Balance        : <code>{balance:.2f} USDT</code>",
+        f"Paused         : {'🔴 YES — use /resume' if bot_paused else '🟢 NO'}",
+        f"Circuit breaker: {cb_str}",
+        f"Consec losses  : {consec_losses} (resets each new day automatically)",
+        f"Daily loss     : {daily_loss:.2f} USDT (limit: 4% = {balance*0.04:.2f})",
+        f"Weekly loss    : {weekly_loss:.2f} USDT (limit: 6% = {balance*0.06:.2f})",
         f"",
         f"<b>Watching:</b> {', '.join(monitored_symbols) or 'None'}",
         "",
@@ -1476,11 +2108,24 @@ async def cmd_pause(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 @owner_only
 async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    global bot_paused, consec_losses
+    global bot_paused, consec_losses, daily_loss, weekly_loss
     bot_paused    = False
     consec_losses = 0
+    daily_loss    = 0.0
+    weekly_loss   = 0.0
+    # Reset circuit_alerted flag on all active monitor jobs so alerts fire fresh
+    if ctx.job_queue:
+        for job in ctx.job_queue.jobs():
+            if job.data and isinstance(job.data, dict):
+                job.data["circuit_alerted"] = False
     save_state()
-    await update.message.reply_text("▶️ <b>Bot resumed.</b> Monitoring for entries.", parse_mode="HTML")
+    await update.message.reply_text(
+        "▶️ <b>Bot resumed.</b>\n"
+        "Consecutive losses: reset to 0\n"
+        "Daily/weekly loss counters: reset\n"
+        "Circuit breaker: cleared\n"
+        "Bot is now actively scanning for entries.",
+        parse_mode="HTML")
 
 @public_command
 async def cmd_balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2745,6 +3390,133 @@ async def cmd_backup(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
+
+@public_command
+async def cmd_regime(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show current market regime for a symbol."""
+    # Accept /regime BTCUSDT or use first monitored symbol
+    symbol = ctx.args[0].upper() if ctx.args else (monitored_symbols[0] if monitored_symbols else None)
+    if not symbol:
+        await update.message.reply_text("Usage: /regime BTCUSDT\nOr add a symbol first with /add_symbol")
+        return
+
+    await update.message.reply_text(f"Analysing regime for {symbol}...")
+
+    df_1d, df_4h = await asyncio.gather(
+        get_klines(symbol, "D",   300),
+        get_klines(symbol, "240", 300),
+    )
+    if df_1d is None or df_4h is None:
+        await update.message.reply_text(f"Failed to fetch candles for {symbol}.")
+        return
+
+    r = await detect_regime(symbol, df_1d, df_4h, force=True)
+    reg  = r["regime"]
+    conf = r["confidence"]
+    ind  = r["indicators"]
+    scores = r.get("scores", {})
+    mx     = r.get("max_possible", {})
+
+    # Build score bars
+    score_lines = []
+    order = [REGIME_STRONG_UPTREND, REGIME_STRONG_DOWNTREND,
+             REGIME_CHOPPY_RANGING, REGIME_VOLATILE_BREAKOUT, REGIME_MEAN_REVERTING]
+    for regime_key in order:
+        sc = scores.get(regime_key, 0)
+        mp = mx.get(regime_key, 1)
+        pct = int(sc / mp * 100) if mp else 0
+        bar = "█" * (pct // 10) + "░" * (10 - pct // 10)
+        star = " ◄" if regime_key == reg else ""
+        score_lines.append(
+            f"{regime_emoji(regime_key)} {regime_label(regime_key):<22} {bar} {pct}%{star}"
+        )
+
+    # Build leading signals summary
+    leading_lines = []
+    # BB Squeeze
+    if ind.get("squeeze_released"):
+        leading_lines.append("🔔 BB Squeeze RELEASED — breakout starting NOW")
+    elif ind.get("bb_at_20bar_low"):
+        leading_lines.append("⚠️ BB at 20-bar low — squeeze building, breakout imminent")
+    elif ind.get("squeeze_active"):
+        leading_lines.append("⏳ BB Squeeze ACTIVE — compression ongoing, no direction yet")
+    # Price structure
+    if ind.get("strong_hh"):
+        leading_lines.append("📶 4 consecutive higher closes — uptrend forming (leads ADX by ~5 days)")
+    elif ind.get("hh_hl"):
+        leading_lines.append("📈 3 consecutive higher closes — early uptrend signal")
+    if ind.get("strong_ll"):
+        leading_lines.append("📉 4 consecutive lower closes — downtrend forming (leads ADX by ~5 days)")
+    elif ind.get("lh_ll"):
+        leading_lines.append("📉 3 consecutive lower closes — early downtrend signal")
+    # EMA slope acceleration
+    if ind.get("slope_turning_bull"):
+        leading_lines.append("↗️ EMA50 slope accelerating UP — trend turning bullish before EMA crosses")
+    if ind.get("slope_turning_bear"):
+        leading_lines.append("↘️ EMA50 slope accelerating DOWN — trend turning bearish before EMA crosses")
+    # Volume-price
+    if ind.get("vol_confirms_bull"):
+        leading_lines.append("💚 Volume + rising price — institutional buying confirmed")
+    if ind.get("vol_confirms_bear"):
+        leading_lines.append("🔴 Volume + falling price — institutional selling confirmed")
+    if ind.get("vol_chop_signal"):
+        leading_lines.append("🔀 High volume, tiny price move — absorption, market ranging")
+
+    leading_text = ("\n".join(leading_lines)) if leading_lines else "No leading signals firing"
+    accel_str = f"{ind.get('slope_accel',0):+.4f}"
+
+    await update.message.reply_text(
+        f"{regime_emoji(reg)} <b>Market Regime — {symbol}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Regime     : <b>{regime_label(reg)}</b>\n"
+        f"Confidence : <b>{conf}%</b>\n\n"
+        f"<b>Regime scores:</b>\n"
+        f"<code>{''.join([l + chr(10) for l in score_lines])}</code>\n"
+        f"<b>Bot action:</b>\n{regime_action(reg)}\n\n"
+        f"<b>Leading indicators (fire first):</b>\n"
+        f"{leading_text}\n\n"
+        f"<b>Lagging confirmators:</b>\n"
+        f"ADX(14)     : <code>{ind.get('adx','?')}</code> "
+        f"({'trending' if ind.get('adx',0) > 25 else 'weak trend' if ind.get('adx',0) > 20 else 'ranging'})\n"
+        f"EMA50 slope : <code>{ind.get('ema50_slope','?')}</code> "
+        f"| accel: <code>{accel_str}</code>\n"
+        f"ATR%        : <code>{ind.get('atr_pct','?')}</code> "
+        f"| BB width: <code>{ind.get('bb_width','?')}</code>\n"
+        f"RSI(14)     : <code>{ind.get('rsi','?')}</code> "
+        f"| Vol ratio: <code>{ind.get('vol_ratio','?')}x</code>\n"
+        f"Price 3d    : <code>{ind.get('price_chg_3d','?')}%</code> "
+        f"| Hist vol: <code>{ind.get('hist_vol','?')}%</code>",
+        parse_mode="HTML"
+    )
+
+@public_command
+async def cmd_regime_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show current regime for all monitored symbols."""
+    all_syms = list(set(monitored_symbols + meme_symbols))
+    if not all_syms:
+        await update.message.reply_text("No symbols monitored. Use /add_symbol or /add_meme first.")
+        return
+
+    await update.message.reply_text(f"Scanning regimes for {len(all_syms)} symbol(s)...")
+
+    lines = ["<b>Market Regime Summary</b>", "━━━━━━━━━━━━━━━━━━━━"]
+    for symbol in sorted(all_syms):
+        df_1d, df_4h = await asyncio.gather(
+            get_klines(symbol, "D",   300),
+            get_klines(symbol, "240", 300),
+        )
+        if df_1d is None or df_4h is None:
+            lines.append(f"⚠️ {symbol}: failed to fetch candles")
+            continue
+        r    = await detect_regime(symbol, df_1d, df_4h, force=True)
+        reg  = r["regime"]
+        conf = r["confidence"]
+        tag  = "📊" if symbol in monitored_symbols else "⚡"
+        lines.append(
+            f"{tag} <b>{symbol}</b>: {regime_emoji(reg)} {regime_label(reg)} ({conf}%)")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
 async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error(f"Telegram error: {ctx.error}")
     try:
@@ -2817,6 +3589,8 @@ async def main() -> None:
     app.add_handler(CommandHandler("news_scan",      cmd_news_scan))
     app.add_handler(CommandHandler("history",         cmd_history))
     app.add_handler(CommandHandler("backup",          cmd_backup))
+    app.add_handler(CommandHandler("regime",          cmd_regime))
+    app.add_handler(CommandHandler("regime_all",      cmd_regime_all))
     app.add_error_handler(error_handler)
 
     # Recurring jobs
