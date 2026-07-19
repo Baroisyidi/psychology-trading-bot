@@ -114,6 +114,16 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  REGIME CONSTANTS — defined early so all functions can reference them
+# ─────────────────────────────────────────────────────────────────────────────
+REGIME_STRONG_UPTREND    = "STRONG_UPTREND"
+REGIME_STRONG_DOWNTREND  = "STRONG_DOWNTREND"
+REGIME_CHOPPY_RANGING    = "CHOPPY_RANGING"
+REGIME_VOLATILE_BREAKOUT = "VOLATILE_BREAKOUT"
+REGIME_MEAN_REVERTING    = "MEAN_REVERTING"
+REGIME_UNKNOWN           = "UNKNOWN"
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  BYBIT CLIENT — Demo Trading endpoint
 # ─────────────────────────────────────────────────────────────────────────────
 bybit_session = HTTP(
@@ -1276,13 +1286,7 @@ async def check_reversal_after_exit(symbol: str, old_direction: str, bot) -> Non
 #   MEAN_REVERTING   — oscillating, smaller TPs, quick exits
 # =============================================================================
 
-# ── Regime constants ──────────────────────────────────────────────────────────
-REGIME_STRONG_UPTREND    = "STRONG_UPTREND"
-REGIME_STRONG_DOWNTREND  = "STRONG_DOWNTREND"
-REGIME_CHOPPY_RANGING    = "CHOPPY_RANGING"
-REGIME_VOLATILE_BREAKOUT = "VOLATILE_BREAKOUT"
-REGIME_MEAN_REVERTING    = "MEAN_REVERTING"
-REGIME_UNKNOWN           = "UNKNOWN"
+# Regime constants moved to top of file
 
 # Cache: symbol -> (regime, confidence, timestamp, detail_dict)
 regime_cache: dict[str, tuple] = {}
