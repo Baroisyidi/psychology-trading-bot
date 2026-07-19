@@ -1339,9 +1339,9 @@ def _sync_detect_regime(symbol: str,
         # ── Indicator 3: Bollinger Band width (squeeze = range, expand = trend)
         bb = ta.bbands(close, length=20, std=2.0)
         if bb is not None:
-            bb_upper = float(bb["BBU_20_2.0"].iloc[-1])
-            bb_lower = float(bb["BBL_20_2.0"].iloc[-1])
-            bb_mid   = float(bb["BBM_20_2.0"].iloc[-1])
+            bb_upper = float(bb["BBU_20_2.0_2.0"].iloc[-1])
+            bb_lower = float(bb["BBL_20_2.0_2.0"].iloc[-1])
+            bb_mid   = float(bb["BBM_20_2.0_2.0"].iloc[-1])
             bb_width = (bb_upper - bb_lower) / bb_mid * 100 if bb_mid > 0 else 2.0
         else:
             bb_upper = bb_lower = bb_mid = price
