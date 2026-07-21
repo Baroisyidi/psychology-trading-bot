@@ -595,6 +595,31 @@ def _sync_get_open_side(symbol: str) -> Optional[str]:
         logger.error(f"_sync_get_open_side({symbol}): {e}")
         return None
 
+def _sync_get_position_size(symbol: str) -> float:
+    """Return current open position size on Bybit. 0.0 means no position."""
+    try:
+        resp = bybit_session.get_positions(category="linear", symbol=symbol)
+        for pos in resp["result"]["list"]:
+            size = float(pos.get("size", 0))
+            if size > 0:
+                return size
+        return 0.0
+    except Exception as e:
+        logger.error(f"_sync_get_position_size({symbol}): {e}")
+        return -1.0   # -1 = API error (don't clear state on API failure)
+
+def _sync_get_position_pnl(symbol: str) -> float:
+    """Return unrealised PnL of open position. 0.0 if none."""
+    try:
+        resp = bybit_session.get_positions(category="linear", symbol=symbol)
+        for pos in resp["result"]["list"]:
+            if float(pos.get("size", 0)) > 0:
+                return float(pos.get("unrealisedPnl", 0))
+        return 0.0
+    except Exception as e:
+        logger.error(f"_sync_get_position_pnl({symbol}): {e}")
+        return 0.0
+
 def _sync_close_full(symbol: str, direction: str) -> None:
     try:
         close_side = "Sell" if direction == "LONG" else "Buy"
@@ -1027,6 +1052,55 @@ async def manage_position(pos: dict, bot) -> None:
     symbol    = pos["symbol"]
     direction = pos["direction"]
 
+    # ── CRITICAL: Verify position still exists on Bybit FIRST ────────────────
+    # If Bybit closed it via SL/TP while bot was offline or missed the trigger,
+    # the bot's internal state will be stale. Sync it here before doing anything.
+    actual_size = await asyncio.to_thread(_sync_get_position_size, symbol)
+
+    if actual_size == 0.0:
+        # Position is GONE on Bybit — closed by SL, TP, or manually
+        # Calculate estimated PnL from last known price vs entry
+        last_price  = pos.get("_last_price", pos.get("entry_price", 0))
+        entry_price = pos.get("entry_price", 0)
+        qty         = pos.get("original_qty", 0)
+        if direction == "LONG":
+            est_pnl = (last_price - entry_price) * qty
+        else:
+            est_pnl = (entry_price - last_price) * qty
+
+        # Determine likely exit reason
+        sl  = pos.get("sl_price", 0)
+        tp1 = pos.get("tp1_price", 0)
+        if direction == "LONG":
+            exit_reason = "SL" if last_price <= sl * 1.005 else "TP1" if last_price >= tp1 * 0.995 else "BYBIT_CLOSED"
+        else:
+            exit_reason = "SL" if last_price >= sl * 0.995 else "TP1" if last_price <= tp1 * 1.005 else "BYBIT_CLOSED"
+
+        logger.warning(f"[{symbol}] Position gone on Bybit! "
+                       f"Clearing internal state. Est PnL: {est_pnl:.2f} exit={exit_reason}")
+
+        await alert(bot,
+            "POSITION SYNC — " + symbol + " " + direction + "\n"
+            "Bybit shows NO open position — closed externally.\n"
+            f"Entry     : {entry_price:.4f}\n"
+            f"Last price: {last_price:.4f}\n"
+            f"Est. PnL  : {est_pnl:+.2f} USDT\n"
+            f"Likely reason: {exit_reason}\n\n"
+            f"Bot state cleared. Watching for next signal on {symbol}.")
+        if est_pnl < 0:
+            consec_losses += 1
+            daily_loss    += est_pnl
+            weekly_loss   += est_pnl
+        _record_trade(pos, last_price, est_pnl, exit_reason, bot_type="psych")
+        _close_pos(symbol, est_pnl)
+        return
+
+    elif actual_size < 0:
+        # API error — don't clear state, try again next cycle
+        logger.warning(f"[{symbol}] Could not verify position size (API error). Skipping cycle.")
+        return
+
+    # Position confirmed open on Bybit — proceed with normal management
     # Fetch price, daily candles, 4H candles concurrently in background threads
     price, df_1d, df_4h = await asyncio.gather(
         asyncio.to_thread(_sync_get_price, symbol),
@@ -1038,6 +1112,7 @@ async def manage_position(pos: dict, bot) -> None:
         return
 
     current_price = price
+    pos["_last_price"] = current_price   # track for sync recovery
 
     # ── Live regime re-check ─────────────────────────────────────────────────
     # Regime can shift WHILE a trade is open. Re-evaluate every cycle.
@@ -2445,6 +2520,41 @@ async def meme_manage_position(pos: dict, bot) -> None:
     symbol    = pos["symbol"]
     direction = pos["direction"]
 
+    # ── Verify position still exists on Bybit ────────────────────────────────
+    actual_size = await asyncio.to_thread(_sync_get_position_size, symbol)
+
+    if actual_size == 0.0:
+        # Gone on Bybit — get last known price for PnL estimate
+        last_price  = pos.get("_last_price", pos.get("entry_price", 0))
+        entry_price = pos.get("entry_price", 0)
+        qty         = pos.get("original_qty", 0)
+        lev         = pos.get("leverage", 5)
+        if direction == "LONG":
+            est_pnl = (last_price - entry_price) * qty * lev
+        else:
+            est_pnl = (entry_price - last_price) * qty * lev
+
+        sl  = pos.get("sl_price", 0)
+        tp1 = pos.get("tp1_price", 0)
+        if direction == "LONG":
+            reason = "SL" if last_price <= sl * 1.005 else "TP1" if last_price >= tp1 * 0.995 else "BYBIT_CLOSED"
+        else:
+            reason = "SL" if last_price >= sl * 0.995 else "TP1" if last_price <= tp1 * 1.005 else "BYBIT_CLOSED"
+
+        logger.warning(f"[MEME][{symbol}] Gone on Bybit — clearing. Est PnL: {est_pnl:.2f} reason={reason}")
+        await alert(bot,
+            "[MEME] POSITION SYNC " + symbol + " " + direction + "\n"
+            "Bybit shows NO open position — closed externally.\n"
+            f"Est. PnL: {est_pnl:+.2f} USDT | Reason: {reason}\n"
+            "Bot state cleared. Watching for next signal.")
+        meme_positions.pop(symbol, None)
+        save_state()
+        return
+
+    elif actual_size < 0:
+        logger.warning(f"[MEME][{symbol}] API error verifying position. Skipping.")
+        return
+
     price, df_5m, df_3m = await asyncio.gather(
         asyncio.to_thread(_sync_get_price, symbol),
         asyncio.to_thread(_sync_get_klines, symbol, "5",  100),
@@ -2453,6 +2563,8 @@ async def meme_manage_position(pos: dict, bot) -> None:
 
     if not price or df_5m is None:
         return
+
+    pos["_last_price"] = price   # track for sync recovery
 
     def est_pnl():
         diff = (price - pos["entry_price"]) if direction == "LONG" \
