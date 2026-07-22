@@ -871,9 +871,14 @@ def _calc_tps(entry: float, sl: float, direction: str):
         return round(entry - risk * 1.5, 6), round(entry - risk * 3.0, 6)
 
 def _est_pnl(pos: dict, price: float) -> float:
+    """
+    Estimate unrealised PnL for an open position.
+    qty is already the full contract size — DO NOT multiply by leverage again.
+    PnL = price_diff × qty (same formula Bybit uses for linear contracts).
+    """
     diff = (price - pos["entry_price"]) if pos["direction"] == "LONG" \
            else (pos["entry_price"] - price)
-    return diff * pos["remaining_qty"] * LEVERAGE
+    return diff * pos["remaining_qty"]
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  TELEGRAM ALERT
@@ -1893,9 +1898,12 @@ async def _maybe_send_status_report(
 
     if pos:
         current_price = await get_price(symbol)
-        pnl = _est_pnl(pos, current_price)
+        # Use real Bybit unrealised PnL — avoids double-leverage error
+        real_pnl = await asyncio.to_thread(_sync_get_position_pnl, symbol)
+        pnl = real_pnl if real_pnl != 0.0 else _est_pnl(pos, current_price)
         days = (time.time() - pos["entry_time"]) / 86400
         emoji = "🟢" if pos["direction"] == "LONG" else "🔴"
+        pnl_label = "PnL (Bybit)" if real_pnl != 0.0 else "Est PnL"
         trade_info = (
             f"{emoji} <b>Open {pos['direction']} position</b>\n"
             f"   Entry  : <code>{pos['entry_price']:.4f}</code>\n"
@@ -1903,7 +1911,7 @@ async def _maybe_send_status_report(
             f"   SL     : <code>{pos['sl_price']:.4f}</code>\n"
             f"   TP1    : {'✅' if pos['tp1_hit'] else '⬜'} <code>{pos['tp1_price']:.4f}</code>\n"
             f"   TP2    : {'✅' if pos['tp2_hit'] else '⬜'} <code>{pos['tp2_price']:.4f}</code>\n"
-            f"   Est PnL: {pnl:+.2f} USDT  |  Open: {days:.1f}d\n"
+            f"   {pnl_label}: {pnl:+.2f} USDT  |  Open: {days:.1f}d\n"
             f"   Score  : {pos['score']}/8"
         )
     else:
@@ -2120,17 +2128,19 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if symbol_positions:
         lines.append("<b>Open Positions:</b>")
         for sym, pos in symbol_positions.items():
-            price = await get_price(sym)
-            pnl   = _est_pnl(pos, price)
-            days  = (time.time() - pos["entry_time"]) / 86400
-            e     = "🟢" if pos["direction"] == "LONG" else "🔴"
+            price    = await get_price(sym)
+            real_pnl = await asyncio.to_thread(_sync_get_position_pnl, sym)
+            pnl      = real_pnl if real_pnl != 0.0 else _est_pnl(pos, price)
+            days     = (time.time() - pos["entry_time"]) / 86400
+            e        = "🟢" if pos["direction"] == "LONG" else "🔴"
+            pnl_src  = "Bybit" if real_pnl != 0.0 else "Est"
             lines.append(
                 f"{e} <b>{sym}</b> {pos['direction']}\n"
                 f"   Entry:{pos['entry_price']:.4f}  Now:{price:.4f}\n"
                 f"   SL:{pos['sl_price']:.4f}\n"
                 f"   TP1:{'✅' if pos['tp1_hit'] else '⬜'} {pos['tp1_price']:.4f}  "
                 f"TP2:{'✅' if pos['tp2_hit'] else '⬜'} {pos['tp2_price']:.4f}\n"
-                f"   PnL:{pnl:+.2f} USDT  Open:{days:.1f}d  Score:{pos['score']}/8"
+                f"   PnL({pnl_src}):{pnl:+.2f} USDT  Open:{days:.1f}d  Score:{pos['score']}/8"
             )
     else:
         lines.append("No open positions.")
@@ -2530,9 +2540,9 @@ async def meme_manage_position(pos: dict, bot) -> None:
         qty         = pos.get("original_qty", 0)
         lev         = pos.get("leverage", 5)
         if direction == "LONG":
-            est_pnl = (last_price - entry_price) * qty * lev
+            est_pnl = (last_price - entry_price) * qty
         else:
-            est_pnl = (entry_price - last_price) * qty * lev
+            est_pnl = (entry_price - last_price) * qty
 
         sl  = pos.get("sl_price", 0)
         tp1 = pos.get("tp1_price", 0)
@@ -2567,9 +2577,10 @@ async def meme_manage_position(pos: dict, bot) -> None:
     pos["_last_price"] = price   # track for sync recovery
 
     def est_pnl():
+        # qty is already the full contract size — no leverage multiplier needed
         diff = (price - pos["entry_price"]) if direction == "LONG" \
                else (pos["entry_price"] - price)
-        return diff * pos["remaining_qty"] * pos["leverage"]
+        return diff * pos["remaining_qty"]
 
     # Dead trade: 30-minute timeout
     if not pos["tp1_hit"]:
