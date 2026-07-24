@@ -56,12 +56,16 @@ TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN")
 BYBIT_KEY          = os.getenv("BYBIT_API_KEY")
 BYBIT_SECRET       = os.getenv("BYBIT_API_SECRET")
 CHAT_ID_STR        = os.getenv("CHAT_ID")
-# Render persistent disk mounts at /var/data by default.
-# If you add a Render Disk (Dashboard → your service → Disks → Add Disk,
-# mount path: /var/data), state survives redeploys automatically.
-# Without a disk: state is lost on redeploy (free tier limitation).
-_DEFAULT_STATE_DIR = "/var/data" if os.path.isdir("/var/data") else "/opt/render/project/src"
-STATE_FILE         = os.getenv("STATE_FILE", f"{_DEFAULT_STATE_DIR}/bot_state.json")
+# STATE FILE PATH — always prefer /var/data (Render persistent disk).
+# If /var/data exists (disk mounted), use it regardless of STATE_FILE env var.
+# The env var STATE_FILE is IGNORED if /var/data is mounted — this prevents
+# accidentally saving to /opt/render/project/src which is wiped on redeploy.
+if os.path.isdir("/var/data"):
+    STATE_FILE = "/var/data/bot_state.json"
+else:
+    # No persistent disk — fall back to env var or project dir
+    STATE_FILE = os.getenv("STATE_FILE", "/opt/render/project/src/bot_state.json")
+    print(f"[STATE] WARNING: /var/data not found — using {STATE_FILE} (lost on redeploy)")
 CRYPTOPANIC_TOKEN  = os.getenv("CRYPTOPANIC_TOKEN", "")   # Free at cryptopanic.com/developers/api/keys
 
 if not all([TELEGRAM_TOKEN, BYBIT_KEY, BYBIT_SECRET, CHAT_ID_STR]):
