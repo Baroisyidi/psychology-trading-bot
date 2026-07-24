@@ -3658,6 +3658,503 @@ async def cmd_regime_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
 
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
+
+# =============================================================================
+#  BACKTEST ENGINE
+#  Runs PsychologyBot strategy on real historical candle data from Bybit.
+#  Uses actual 4H and 1H candles — no approximations for F7 and F8.
+#
+#  Flow:
+#  1. Fetch paginated Daily + 4H + 1H candles for the full period
+#  2. Walk through each Daily candle as a potential signal bar
+#  3. For each signal day: check F1-F6 on Daily/4H data up to that point
+#  4. If F1-F6 pass: fetch actual 4H candles for that week → check F7
+#  5. If F7 passes: check actual 1H candles for that day → check F8
+#  6. If all pass: simulate trade with real SL/TP/EMA-exit logic
+#  7. Collect results and send Telegram report
+# =============================================================================
+
+def _sync_fetch_paginated_klines(symbol: str, interval: str,
+                                  days_back: int) -> Optional[pd.DataFrame]:
+    """
+    Fetch up to `days_back` days of candles by paginating Bybit API.
+    Bybit limit = 1000 candles per request. Uses `end` param to page back.
+    interval: "D"=Daily, "240"=4H, "60"=1H, "15"=15m
+    """
+    try:
+        # Calculate how many candles we need
+        candles_per_day = {
+            "D": 1, "W": 0.14, "240": 6, "60": 24, "15": 96, "5": 288, "3": 480
+        }
+        cpd = candles_per_day.get(interval, 24)
+        total_needed = int(days_back * cpd) + 50   # buffer
+        
+        all_rows = []
+        end_time = None   # start from now, page backwards
+        batch_size = min(1000, total_needed)
+        max_requests = 10  # safety cap
+        
+        for _ in range(max_requests):
+            params = {
+                "category": "linear",
+                "symbol":   symbol,
+                "interval": interval,
+                "limit":    batch_size,
+            }
+            if end_time:
+                params["end"] = str(end_time)
+            
+            resp = bybit_session.get_kline(**params)
+            raw  = resp["result"]["list"]
+            if not raw:
+                break
+            
+            all_rows.extend(raw)
+            
+            # Check if we have enough
+            if len(all_rows) >= total_needed:
+                break
+            
+            # Page back: oldest timestamp in this batch - 1ms
+            oldest_ts = min(int(r[0]) for r in raw)
+            if end_time and oldest_ts >= end_time:
+                break   # no more data
+            end_time = oldest_ts - 1
+            time.sleep(0.1)  # be respectful to API rate limits
+        
+        if not all_rows:
+            return None
+        
+        df = pd.DataFrame(all_rows, columns=[
+            "timestamp","open","high","low","close","volume","turnover"])
+        for col in ["open","high","low","close","volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df["timestamp"] = df["timestamp"].astype("int64")
+        df.sort_values("timestamp", inplace=True)
+        df.reset_index(drop=True, inplace=True)
+        
+        # Keep only candles within the requested period
+        cutoff_ms = (int(time.time()) - days_back * 86400) * 1000
+        df = df[df["timestamp"] >= cutoff_ms].reset_index(drop=True)
+        
+        return df
+    except Exception as e:
+        logger.error(f"_sync_fetch_paginated_klines({symbol},{interval}): {e}", exc_info=True)
+        return None
+
+
+def _sync_run_backtest(symbol: str, days: int, start_balance: float = 10000.0) -> dict:
+    """
+    Full backtest engine. Runs in a background thread.
+    Returns a results dict with all trades and summary stats.
+    """
+    result = {
+        "symbol": symbol, "days": days, "error": None,
+        "trades": [], "balance_curve": [],
+        "start_balance": start_balance,
+    }
+    
+    try:
+        logger.info(f"[BACKTEST] Starting {symbol} {days}d backtest...")
+        
+        # ── Step 1: Fetch all candle data ────────────────────────────────────
+        # Add extra days for EMA warmup (200-day EMA needs 200+ candles)
+        warmup = 220
+        total_days = days + warmup
+        
+        df_1d = _sync_fetch_paginated_klines(symbol, "D",   total_days)
+        df_4h = _sync_fetch_paginated_klines(symbol, "240", total_days)
+        df_1h = _sync_fetch_paginated_klines(symbol, "60",  min(days, 180))  # 180d of 1H max
+        
+        if df_1d is None or df_4h is None or df_1h is None:
+            result["error"] = "Failed to fetch candle data from Bybit"
+            return result
+        
+        logger.info(f"[BACKTEST] Fetched: {len(df_1d)}d / {len(df_4h)}x4H / {len(df_1h)}x1H candles")
+        
+        # ── Step 2: Define the backtest window ───────────────────────────────
+        cutoff_ms = (int(time.time()) - days * 86400) * 1000
+        backtest_days = df_1d[df_1d["timestamp"] >= cutoff_ms].copy()
+        
+        if len(backtest_days) < 10:
+            result["error"] = f"Only {len(backtest_days)} daily candles in period — need at least 10"
+            return result
+        
+        # ── Step 3: Walk through each Daily candle ───────────────────────────
+        balance = start_balance
+        open_trade = None      # currently open position
+        result["balance_curve"].append({"ts": int(backtest_days.iloc[0]["timestamp"]), "bal": balance})
+        
+        all_daily_idx = list(df_1d.index)
+        
+        for bt_idx, (_, day_row) in enumerate(backtest_days.iterrows()):
+            day_ts   = int(day_row["timestamp"])
+            day_close = float(day_row["close"])
+            day_high  = float(day_row["high"])
+            day_low   = float(day_row["low"])
+            
+            # Find this day in the full df_1d (for indicator calculation)
+            full_idx = df_1d.index[df_1d["timestamp"] == day_ts].tolist()
+            if not full_idx:
+                continue
+            full_i = full_idx[0]
+            
+            # Need at least 220 candles of history for EMA-200
+            if full_i < 220:
+                continue
+            
+            # ── Manage open trade ─────────────────────────────────────────────
+            if open_trade:
+                t = open_trade
+                entry   = t["entry"]
+                sl      = t["sl"]
+                tp1     = t["tp1"]
+                tp2     = t["tp2"]
+                dir_    = t["direction"]
+                
+                # Check SL hit (using day's range)
+                sl_hit = (dir_ == "LONG"  and day_low  <= sl) or                          (dir_ == "SHORT" and day_high >= sl)
+                
+                # Check TP1 hit
+                tp1_hit = (dir_ == "LONG"  and day_high >= tp1) or                           (dir_ == "SHORT" and day_low  <= tp1)
+                
+                # Check TP2 hit
+                tp2_hit = (dir_ == "LONG"  and day_high >= tp2) or                           (dir_ == "SHORT" and day_low  <= tp2)
+                
+                # Check EMA exit (using completed daily candles up to yesterday)
+                df_for_exit = df_1d.iloc[:full_i]
+                ema_exit = _check_ema_exit(df_for_exit, dir_)
+                
+                # Dead trade: 7 days
+                trade_age = bt_idx - t["entry_bt_idx"]
+                dead = trade_age >= 7 and not t.get("tp1_hit")
+                
+                closed = False
+                qty    = t["qty"]
+                
+                if sl_hit and not t.get("tp1_hit"):
+                    # Full SL
+                    pnl = (sl - entry) * qty if dir_ == "LONG" else (entry - sl) * qty
+                    t.update({"exit_price": sl, "exit_reason": "SL",
+                              "exit_day": day_ts, "pnl": round(pnl, 2)})
+                    balance += pnl
+                    closed = True
+                    
+                elif not t.get("tp1_hit") and tp1_hit:
+                    # TP1: close 40%, move SL to breakeven
+                    close_qty = qty * 0.4
+                    pnl_tp1   = (tp1 - entry) * close_qty if dir_ == "LONG" else (entry - tp1) * close_qty
+                    t["qty"]  = qty * 0.6
+                    t["sl"]   = entry   # breakeven
+                    t["tp1_hit"] = True
+                    t["pnl_partial"] = round(pnl_tp1, 2)
+                    balance += pnl_tp1
+                    
+                elif t.get("tp1_hit") and not t.get("tp2_hit") and tp2_hit:
+                    # TP2: close 40% of original (67% of remaining)
+                    close_qty = qty * 0.4    # original qty reference
+                    rem_qty   = t["qty"]
+                    close_now = rem_qty * (2/3)
+                    pnl_tp2   = (tp2 - entry) * close_now if dir_ == "LONG" else (entry - tp2) * close_now
+                    t["qty"]  = rem_qty - close_now
+                    t["tp2_hit"] = True
+                    t["pnl_partial"] = t.get("pnl_partial", 0) + round(pnl_tp2, 2)
+                    balance += pnl_tp2
+                    
+                elif t.get("tp2_hit") and t["qty"] > 0:
+                    # Trail last 20% on 4H lows/highs — use day low/high as proxy
+                    new_sl = day_low  if dir_ == "LONG"  else day_high
+                    if dir_ == "LONG"  and new_sl > t["sl"]: t["sl"] = new_sl
+                    if dir_ == "SHORT" and new_sl < t["sl"]: t["sl"] = new_sl
+                    # Check if trailing SL hit
+                    if (dir_ == "LONG"  and day_low  <= t["sl"]) or                        (dir_ == "SHORT" and day_high >= t["sl"]):
+                        pnl_trail = (t["sl"] - entry) * t["qty"] if dir_ == "LONG"                                     else (entry - t["sl"]) * t["qty"]
+                        total_pnl = t.get("pnl_partial", 0) + round(pnl_trail, 2)
+                        t.update({"exit_price": t["sl"], "exit_reason": "TP2_TRAIL",
+                                  "exit_day": day_ts, "pnl": total_pnl})
+                        balance += pnl_trail
+                        closed = True
+                
+                if not closed and (ema_exit or dead):
+                    # Close at day's close price
+                    rem = t["qty"]
+                    exit_p = day_close
+                    pnl_rem = (exit_p - entry) * rem if dir_ == "LONG" else (entry - exit_p) * rem
+                    total_pnl = t.get("pnl_partial", 0) + round(pnl_rem, 2)
+                    reason = "DEAD" if dead else "EMA_EXIT"
+                    t.update({"exit_price": exit_p, "exit_reason": reason,
+                              "exit_day": day_ts, "pnl": total_pnl})
+                    balance += pnl_rem
+                    closed = True
+                
+                if closed:
+                    result["trades"].append(t)
+                    open_trade = None
+                    result["balance_curve"].append({"ts": day_ts, "bal": round(balance, 2)})
+                
+                # Don't look for new entries while in a trade
+                continue
+            
+            # ── Look for new entry ────────────────────────────────────────────
+            # Build lookback windows up to this candle
+            df_1d_window = df_1d.iloc[:full_i + 1]
+            
+            # 4H candles up to this day's end
+            day_end_ms = day_ts + 86400000
+            df_4h_window = df_4h[df_4h["timestamp"] < day_end_ms].tail(300)
+            
+            if len(df_4h_window) < 50:
+                continue
+            
+            # 1H candles for this specific day
+            day_start_ms = day_ts
+            df_1h_day = df_1h[
+                (df_1h["timestamp"] >= day_start_ms) &
+                (df_1h["timestamp"] <  day_end_ms)
+            ]
+            
+            if len(df_1h_day) < 3:
+                continue
+            
+            # Check both directions
+            for direction in ("LONG", "SHORT"):
+                
+                # Run full indicator check — reuses the exact same _compute_indicators
+                # that the live bot uses. 100% same logic.
+                try:
+                    ind = _compute_indicators(df_1d_window, df_4h_window, df_1h_day, direction)
+                except Exception as e:
+                    logger.debug(f"[BACKTEST] indicator error day {bt_idx} {direction}: {e}")
+                    continue
+                
+                if not ind["should_enter"]:
+                    continue
+                
+                # Entry found — simulate the trade
+                entry_price = day_close   # enter at day's close
+                e100_4h     = ind["e100_4h"]
+                sl  = _calc_sl(entry_price, direction, e100_4h)
+                tp1, tp2 = _calc_tps(entry_price, sl, direction)
+                
+                # Position sizing
+                risk_amount = balance * POSITION_PCT
+                qty = risk_amount * LEVERAGE / entry_price
+                
+                trade = {
+                    "symbol":       symbol,
+                    "direction":    direction,
+                    "entry":        round(entry_price, 6),
+                    "entry_day":    day_ts,
+                    "entry_bt_idx": bt_idx,
+                    "sl":           round(sl, 6),
+                    "tp1":          round(tp1, 6),
+                    "tp2":          round(tp2, 6),
+                    "qty":          qty,
+                    "orig_qty":     qty,
+                    "score":        ind["score"],
+                    "passed":       ind["passed"],
+                    "tp1_hit":      False,
+                    "tp2_hit":      False,
+                    "pnl_partial":  0.0,
+                    # Will be filled on close:
+                    "exit_price":   None,
+                    "exit_reason":  None,
+                    "exit_day":     None,
+                    "pnl":          0.0,
+                }
+                open_trade = trade
+                break   # one trade per day max
+        
+        # Close any still-open trade at the last candle's close
+        if open_trade:
+            t = open_trade
+            last_close = float(backtest_days.iloc[-1]["close"])
+            rem = t["qty"]
+            pnl_rem = (last_close - t["entry"]) * rem if t["direction"] == "LONG"                       else (t["entry"] - last_close) * rem
+            total_pnl = t.get("pnl_partial", 0) + round(pnl_rem, 2)
+            t.update({"exit_price": last_close, "exit_reason": "PERIOD_END",
+                      "pnl": total_pnl})
+            balance += pnl_rem
+            result["trades"].append(t)
+        
+        result["final_balance"] = round(balance, 2)
+        result["balance_curve"].append({"ts": int(backtest_days.iloc[-1]["timestamp"]),
+                                        "bal": round(balance, 2)})
+        
+        logger.info(f"[BACKTEST] Done: {len(result['trades'])} trades, "
+                    f"final balance ${balance:.2f}")
+    
+    except Exception as e:
+        logger.error(f"[BACKTEST] _sync_run_backtest failed: {e}", exc_info=True)
+        result["error"] = str(e)
+    
+    return result
+
+
+def _format_backtest_results(r: dict) -> list[str]:
+    """
+    Format backtest results into Telegram messages.
+    Returns list of strings (split to stay under 4096 char limit).
+    """
+    from datetime import datetime, timezone
+    
+    if r.get("error"):
+        return [f"❌ Backtest failed: {r['error']}"]
+    
+    trades  = r["trades"]
+    sym     = r["symbol"]
+    days    = r["days"]
+    start   = r["start_balance"]
+    final   = r.get("final_balance", start)
+    pnl     = final - start
+    ret_pct = (pnl / start * 100)
+    
+    if not trades:
+        return [
+            f"📊 <b>Backtest — {sym} ({days}d)</b>\n"
+            f"No trades found in this period.\n"
+            f"Market may have been choppy or EMA stack not aligned."
+        ]
+    
+    wins   = [t for t in trades if t["pnl"] > 0]
+    losses = [t for t in trades if t["pnl"] <= 0]
+    win_rate = len(wins)/len(trades)*100 if trades else 0
+    
+    avg_win  = sum(t["pnl"] for t in wins)  / len(wins)  if wins   else 0
+    avg_loss = sum(t["pnl"] for t in losses)/ len(losses) if losses else 0
+    
+    best  = max(trades, key=lambda t: t["pnl"])
+    worst = min(trades, key=lambda t: t["pnl"])
+    
+    # Exit reason breakdown
+    reasons = {}
+    for t in trades:
+        r_key = t.get("exit_reason","?")
+        reasons[r_key] = reasons.get(r_key, 0) + 1
+    reason_str = "  ".join(f"{k}:{v}" for k,v in sorted(reasons.items()))
+    
+    def ts_to_date(ts):
+        try:
+            return datetime.fromtimestamp(ts/1000, tz=timezone.utc).strftime("%b %d")
+        except:
+            return "?"
+    
+    # Message 1: Summary
+    msg1 = (
+        f"📊 <b>Backtest Results — {sym}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Period       : Last {days} days\n"
+        f"Start balance: ${start:,.2f}\n"
+        f"Final balance: <b>${final:,.2f}</b>\n"
+        f"Total PnL    : <b>{pnl:+,.2f} USDT ({ret_pct:+.1f}%)</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Total trades : {len(trades)}\n"
+        f"Win rate     : {win_rate:.1f}% ({len(wins)}W / {len(losses)}L)\n"
+        f"Avg win      : +{avg_win:.2f} USDT\n"
+        f"Avg loss     : {avg_loss:.2f} USDT\n"
+        f"Best trade   : +{best['pnl']:.2f} ({best['direction']} {ts_to_date(best['entry_day'])})\n"
+        f"Worst trade  : {worst['pnl']:.2f} ({worst['direction']} {ts_to_date(worst['entry_day'])})\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Exit reasons : {reason_str}\n"
+        f"\n"
+        f"<b>Strategy used (live bot rules):</b>\n"
+        f"F5 EMA stack + F8 1H candle (mandatory)\n"
+        f"F7 4H EMA50/100 pullback (real 4H data)\n"
+        f"F1 ADX, F2 Ichimoku, F3 RSI, F4 Supertrend, F6 MACD\n"
+        f"SL: 4H EMA100 −2% | TP1: 1:1.5 | TP2: 1:3 | Trail last 20%\n"
+        f"10x leverage | 20% position | $10,000 starting"
+    )
+    
+    # Message 2: Individual trades (up to 20)
+    trade_lines = [f"\n📋 <b>Trade Log — {sym}</b>\n━━━━━━━━━━━━━━━━━━━━"]
+    for i, t in enumerate(trades[:20]):
+        emoji = "🟢" if t["pnl"] > 0 else "🔴"
+        entry_d = ts_to_date(t["entry_day"])
+        exit_d  = ts_to_date(t["exit_day"]) if t["exit_day"] else "Open"
+        trade_lines.append(
+            f"{emoji} #{i+1} {t['direction']} {entry_d}→{exit_d} "
+            f"@ {t['entry']:.4f} | {t.get('exit_reason','?')} | "
+            f"Score:{t['score']}/8 | PnL:{t['pnl']:+.2f}"
+        )
+    
+    if len(trades) > 20:
+        trade_lines.append(f"... and {len(trades)-20} more trades")
+    
+    msg2 = "\n".join(trade_lines)
+    
+    return [msg1, msg2]
+
+
+@public_command
+async def cmd_backtest(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Run a historical backtest for any symbol.
+    Usage: /backtest BTCUSDT 6m
+    Periods: 1m=30d  3m=90d  6m=180d  1y=365d  2y=730d
+    """
+    # Parse args
+    args = ctx.args
+    if len(args) < 2:
+        await update.message.reply_text(
+            "📊 <b>Backtest command</b>\n"
+            "Usage: <code>/backtest SYMBOL PERIOD</code>\n\n"
+            "Examples:\n"
+            "  <code>/backtest BTCUSDT 6m</code>\n"
+            "  <code>/backtest ETHUSDT 3m</code>\n"
+            "  <code>/backtest SOLUSDT 1y</code>\n\n"
+            "Periods: 1m (30d) · 3m (90d) · 6m (180d) · 1y (365d) · 2y (730d)\n\n"
+            "⏱ Takes 15-30 seconds (fetching real 4H+1H candles from Bybit)",
+            parse_mode="HTML"
+        )
+        return
+    
+    symbol = args[0].upper()
+    if not symbol.endswith("USDT"):
+        symbol += "USDT"
+    
+    period_map = {"1m":30, "3m":90, "6m":180, "1y":365, "2y":730}
+    period_str = args[1].lower()
+    days = period_map.get(period_str)
+    if not days:
+        await update.message.reply_text(
+            f"Unknown period '{period_str}'. Use: 1m, 3m, 6m, 1y, 2y")
+        return
+    
+    start_balance = 10000.0
+    if len(args) >= 3:
+        try:
+            start_balance = float(args[2])
+        except ValueError:
+            pass
+    
+    await update.message.reply_text(
+        f"⏳ <b>Running backtest...</b>\n"
+        f"Symbol  : {symbol}\n"
+        f"Period  : {period_str} ({days} days)\n"
+        f"Capital : ${start_balance:,.0f}\n\n"
+        f"Fetching real 4H and 1H candle data from Bybit...\n"
+        f"This takes 15-30 seconds.",
+        parse_mode="HTML"
+    )
+    
+    # Run backtest in background thread — never blocks event loop
+    try:
+        result = await asyncio.to_thread(
+            _sync_run_backtest, symbol, days, start_balance)
+        
+        messages = _format_backtest_results(result)
+        for msg in messages:
+            await update.message.reply_text(msg, parse_mode="HTML")
+    
+    except Exception as e:
+        logger.error(f"[BACKTEST] cmd_backtest error: {e}", exc_info=True)
+        await update.message.reply_text(
+            f"❌ Backtest error: {e}\nCheck Render logs for details.")
+
+# =============================================================================
+#  END OF BACKTEST ENGINE
+# =============================================================================
+
 async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error(f"Telegram error: {ctx.error}")
     try:
@@ -3754,6 +4251,7 @@ async def main() -> None:
     app.add_handler(CommandHandler("backup",          cmd_backup))
     app.add_handler(CommandHandler("regime",          cmd_regime))
     app.add_handler(CommandHandler("regime_all",      cmd_regime_all))
+    app.add_handler(CommandHandler("backtest",         cmd_backtest))
     app.add_error_handler(error_handler)
 
     # Recurring jobs
