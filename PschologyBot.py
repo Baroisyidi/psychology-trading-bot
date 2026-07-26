@@ -1994,55 +1994,123 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
 @public_command
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     is_owner = update.effective_chat.id == CHAT_ID
+
+    # ── Message 1: Welcome + Core commands ────────────────────────────────
     await update.message.reply_text(
         "🤖 <b>PsychologyBot v3 — Ready!</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "<b>Commands:</b>\n"
-        "• /start               — Show this message (public)\n"
-        "• /status              — Open positions &amp; scores (public)\n"
-        "• /scan                — Live indicator scan (public)\n"
-        "• /balance             — Show USDT balance (public)\n"
-        "• /history             — Trade history (public)\n"
-        "• /memebot             — MemeBot info (public)\n"
-        "• /meme_status         — MemeBot positions (public)\n"
-        "• /news_status         — NewsBot status (public)\n\n"
-        "• /add_symbol &lt;SYM&gt;     — Monitor a coin 🔒 owner\n"
-        "• /remove_symbol &lt;SYM&gt;  — Stop monitoring 🔒 owner\n"
-        "• /pause / /resume     — Pause bot 🔒 owner\n"
-        "• /add_meme &lt;SYM&gt;       — Add meme coin 🔒 owner\n\n"
-        "<b>Entry Filters (5/8 required — conditions 5 &amp; 8 mandatory):</b>\n"
-        "• 1. ADX &gt; 20 (trending market)\n"
-        "• 2. Price above/below Ichimoku Cloud (Daily)\n"
-        "• 3. RSI not extreme (not &gt;70 long / not &lt;30 short) (4H)\n"
-        "• 4. Supertrend green=LONG / red=SHORT (4H)\n"
-        "• 5. ✅ MANDATORY: EMA 20&gt;50&gt;100&gt;200 stack (Daily)\n"
-        "• 6. MACD histogram green=LONG / red=SHORT (Daily)\n"
-        "• 7. Price pulled back to 4H EMA 50 or 100\n"
-        "• 8. ✅ MANDATORY: Bullish/Bearish 1H candle trigger\n\n"
-        "<b>Stop Loss (Tiered):</b>\n"
-        "• Tier 1: Below 4H EMA 100 − 2% (long) / above + 2% (short)\n"
-        "• Tier 2: After TP1 hit → SL moves to entry (breakeven)\n"
-        "• Tier 3: After TP2 hit → Trailing below each 4H candle low\n\n"
-        "<b>Take Profit:</b>\n"
-        "• TP1: 1:1.5 RR → close 40% → SL to breakeven\n"
-        "• TP2: 1:3 RR   → close 40% → start trailing\n"
-        "• TP3: Trailing last 20% until trend ends\n\n"
-        "<b>Exit Rules:</b>\n"
-        "• Exit immediately when Daily EMA structure inverts\n"
-        "• Dead trade: close if TP1 not hit after 7 days\n\n"
-        "<b>Reversal Rules:</b>\n"
-        "• After exit, if opposite trade scores 5/8 → reverse\n"
-        "• If not → go FLAT and wait for next valid setup\n\n"
-        "<b>Infrastructure:</b>\n"
-        "• WebSocket real-time prices (REST fallback)\n"
-        "• All Bybit/pandas in background threads (never freezes)\n"
-        "• 30-min status reports per symbol\n"
-        "• State persistence for crash recovery\n"
-        "• Public bot — anyone can check status and scan signals\n"
-        "• Trading controls are owner-only for security\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Multi-symbol algorithmic trading bot on Bybit — "
+        "PsychologyBot (trend-following) + MemeBot (momentum) + NewsBot (alerts).\n"
+        "Public bot — anyone can check status &amp; run analysis. "
+        "Trading controls are owner-only.\n\n"
+
+        "<b>📊 MONITORING &amp; STATUS</b>\n"
+        "/start — This message\n"
+        "/status — Open positions, balance, circuit breaker state\n"
+        "/scan — Run live 8-filter scan on all monitored symbols now\n"
+        "/balance — Current USDT balance on Bybit\n"
+        "/history [days] — Closed trade log (60-day rolling window)\n"
+        "/backup — Show monitored symbols + restore commands\n\n"
+
+        "<b>🔄 MARKET REGIME</b>\n"
+        "/regime SYMBOL — Full regime breakdown for one coin\n"
+        "/regime_all — Regime summary for all monitored symbols\n\n"
+
+        "<b>🔍 COIN ANALYSIS</b>\n"
+        "/screen [period] — Rank monitored coins by alpha vs BTC\n"
+        "/health SYMBOL — 0-100 health score (5-factor breakdown)\n"
+        "/uptrendcoins [period] — Top 15 Bybit coins beating BTC\n"
+        "/downtrendcoins [period] — Top 15 Bybit coins lagging BTC\n"
+        "/cycle SYMBOL — Full cycle analysis (halving/RSI/EMA/BB)\n\n"
+
+        "<b>📈 BACKTESTING</b>\n"
+        "/backtest SYMBOL PERIOD [capital] — Real 4H+1H historical test\n"
+        "   e.g. /backtest BTCUSDT 6m\n\n"
+
+        "<i>Use /help for MemeBot, NewsBot, and owner-only commands ➜</i>",
+        parse_mode="HTML",
+    )
+
+    # ── Message 2: MemeBot, NewsBot, Owner commands ───────────────────────
+    await update.message.reply_text(
+        "<b>⚡ MEMEBOT (fast momentum, 5m/3m)</b>\n"
+        "/memebot — MemeBot overview\n"
+        "/meme_status — Open meme positions\n"
+        "/scan_meme — Live scan on meme symbols\n\n"
+
+        "<b>📰 NEWSBOT (CryptoPanic alerts, score ≥6)</b>\n"
+        "/news_status — NewsBot status\n"
+        "/news_scan — Manual news scan now\n\n"
+
+        "<b>🔒 OWNER-ONLY — Trading Controls</b>\n"
+        "/add_symbol SYM — Start monitoring a coin (PsychologyBot)\n"
+        "/remove_symbol SYM — Stop monitoring a coin\n"
+        "/add_meme SYM — Start monitoring a coin (MemeBot)\n"
+        "/remove_meme SYM — Stop monitoring a meme coin\n"
+        "/pause — Pause all new entries\n"
+        "/resume — Resume + reset circuit breaker\n"
+        "/meme_pause / /meme_resume — Same for MemeBot\n"
+        "/news_pause / /news_resume — Same for NewsBot\n\n"
+
         "<b>Examples:</b>\n"
         "<code>/add_symbol BTCUSDT</code>\n"
-        "<code>/add_symbol ETHUSDT</code>",
+        "<code>/health SOLUSDT</code>\n"
+        "<code>/cycle ETHUSDT</code>\n"
+        "<code>/backtest AVAXUSDT 3m</code>\n\n"
+
+        "<i>Use /help for full strategy rules (filters, SL/TP, exits) ➜</i>",
+        parse_mode="HTML",
+    )
+
+
+@public_command
+async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Detailed strategy rules — entry filters, SL/TP tiers, exit logic."""
+    await update.message.reply_text(
+        "<b>📋 Strategy Rules — PsychologyBot</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+
+        "<b>Entry Filters (5/8 required — #5 &amp; #8 mandatory):</b>\n"
+        "1. ADX &gt; 20 (trending market)\n"
+        "2. Price above/below Ichimoku Cloud (Daily)\n"
+        "3. RSI not extreme (not &gt;70 long / not &lt;30 short) (4H)\n"
+        "4. Supertrend green=LONG / red=SHORT (4H)\n"
+        "5. ✅ MANDATORY: EMA 20&gt;50&gt;100&gt;200 stack (Daily)\n"
+        "6. MACD histogram green=LONG / red=SHORT (Daily)\n"
+        "7. Price pulled back to 4H EMA 50 or 100\n"
+        "8. ✅ MANDATORY: Bullish/Bearish 1H candle trigger\n\n"
+
+        "<b>Market Regime Gate (on top of filters):</b>\n"
+        "📈 Strong Uptrend → LONG only\n"
+        "📉 Strong Downtrend → SHORT only\n"
+        "↔️ Choppy/Ranging → ALL entries blocked\n"
+        "💥 Volatile Breakout → Position halved, 5x lev cap, tight SL\n"
+        "🔄 Mean Reverting → TP1 closes 100%, no trailing\n\n"
+
+        "<b>Stop Loss (Tiered):</b>\n"
+        "Tier 1: 4H EMA100 −2% (long) / +2% (short) — or 0.8×ATR in Volatile Breakout\n"
+        "Tier 2: After TP1 hit → SL moves to entry (breakeven)\n"
+        "Tier 3: After TP2 hit → Trailing below/above each 4H candle\n\n"
+
+        "<b>Take Profit:</b>\n"
+        "TP1: 1:1.5 RR → close 40% → SL to breakeven\n"
+        "TP2: 1:3 RR → close 40% → start trailing\n"
+        "TP3: Trailing last 20% until trend ends\n\n"
+
+        "<b>Exit Rules:</b>\n"
+        "Exit immediately when Daily EMA structure inverts\n"
+        "Dead trade: close if TP1 not hit after 7 days (3 days in Choppy/Mean Reverting)\n\n"
+
+        "<b>Position Sizing:</b>\n"
+        "PsychologyBot: 20% balance, up to 10x leverage\n"
+        "MemeBot: 8% balance, up to 5x leverage, max 2 open positions\n\n"
+
+        "<b>Infrastructure:</b>\n"
+        "WebSocket real-time prices + REST fallback\n"
+        "All Bybit/pandas calls run in background threads (never freezes)\n"
+        "30-min status reports per symbol\n"
+        "State persists across redeploys via /var/data persistent disk\n"
+        "Position sync check every 10s — catches SL/TP hits even if bot was offline",
         parse_mode="HTML",
     )
 
@@ -4680,6 +4748,349 @@ async def cmd_downtrendcoins(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
 #  END OF SCREENER MODULE
 # =============================================================================
 
+
+# =============================================================================
+#  CYCLE DETECTION ENGINE
+#  Combines 4 independent, complementary cycle indicators:
+#  1. Bitcoin Halving Clock — macro 4-year cycle position (BTC-anchored)
+#  2. Weekly RSI Cycle — bottom/top oscillation history and average period
+#  3. EMA 50/200 Crossover Cycle — golden/death cross history and average period
+#  4. BB Width Squeeze Cycle — accumulation/expansion rhythm
+#
+#  Each indicator independently estimates "where in the cycle" a coin sits.
+#  Combining all 4 catches what any single one would miss:
+#  - Halving clock = macro timing (works for BTC, lags for alts)
+#  - RSI cycle = momentum extremes (works for any coin, no BTC anchor needed)
+#  - EMA crossover = trend cycle (confirms direction changes historically)
+#  - BB squeeze = volatility cycle (predicts WHEN next move starts, not direction)
+# =============================================================================
+
+# Bitcoin halving dates (past + estimated future)
+BTC_HALVING_DATES = [
+    "2012-11-28", "2016-07-09", "2020-05-11", "2024-04-20", "2028-04-01",
+]
+
+def _sync_halving_clock() -> dict:
+    """Return days since/until nearest halvings and cycle phase label."""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    halvings = [datetime.strptime(d, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                for d in BTC_HALVING_DATES]
+
+    last_halving = max([h for h in halvings if h <= now], default=halvings[0])
+    next_halving = min([h for h in halvings if h > now], default=halvings[-1])
+
+    days_since = (now - last_halving).days
+    days_until = (next_halving - now).days
+    cycle_pct  = days_since / ((next_halving - last_halving).days) * 100
+
+    # Historical phase pattern (based on 2016, 2020, 2024 cycles)
+    if days_since < 180:
+        phase = "🌱 Post-halving accumulation"
+    elif days_since < 550:
+        phase = "📈 Bull run building"
+    elif days_since < 730:
+        phase = "🚀 Cycle peak zone (historically)"
+    elif days_since < 900:
+        phase = "📉 Post-peak correction"
+    else:
+        phase = "🔴 Bear market / late cycle"
+
+    return {
+        "days_since_halving": days_since,
+        "days_until_halving":  days_until,
+        "cycle_pct": round(cycle_pct, 1),
+        "phase": phase,
+        "last_halving": last_halving.strftime("%Y-%m-%d"),
+        "next_halving": next_halving.strftime("%Y-%m-%d"),
+    }
+
+
+def _sync_rsi_cycle(symbol: str) -> dict:
+    """
+    Analyse Weekly RSI cycle: find historical RSI<30 (bottom) and RSI>70 (top)
+    events, compute average cycle length, and current position in cycle.
+    """
+    try:
+        # Fetch enough daily data to build weekly candles (need ~3 years)
+        df = _sync_get_klines(symbol, "D", 1000)
+        if df is None or len(df) < 200:
+            return {"error": "Insufficient data"}
+
+        # Resample to weekly using every 7th candle (approximation, fast)
+        df = df.reset_index(drop=True)
+        weekly_close = df["close"].iloc[::7].reset_index(drop=True)
+        weekly_ts    = df["timestamp"].iloc[::7].reset_index(drop=True)
+
+        if len(weekly_close) < 20:
+            return {"error": "Insufficient weekly data"}
+
+        rsi = ta.rsi(weekly_close, length=14)
+        if rsi is None:
+            return {"error": "RSI calc failed"}
+
+        # Find bottom events (RSI crosses below 30) and top events (crosses above 70)
+        bottoms, tops = [], []
+        for i in range(1, len(rsi)):
+            if pd.notna(rsi.iloc[i]) and pd.notna(rsi.iloc[i-1]):
+                if rsi.iloc[i] < 30 and rsi.iloc[i-1] >= 30:
+                    bottoms.append(i)
+                if rsi.iloc[i] > 70 and rsi.iloc[i-1] <= 70:
+                    tops.append(i)
+
+        current_rsi = float(rsi.iloc[-1]) if pd.notna(rsi.iloc[-1]) else 50.0
+
+        # Average cycle length (bottom to bottom, in weeks)
+        avg_cycle_weeks = None
+        if len(bottoms) >= 2:
+            intervals = [bottoms[i] - bottoms[i-1] for i in range(1, len(bottoms))]
+            avg_cycle_weeks = sum(intervals) / len(intervals)
+
+        # Weeks since last bottom/top event
+        weeks_since_bottom = (len(rsi) - 1 - bottoms[-1]) if bottoms else None
+        weeks_since_top    = (len(rsi) - 1 - tops[-1]) if tops else None
+
+        # Determine current cycle position
+        if current_rsi < 30:
+            position = "🟢 AT CYCLE BOTTOM (RSI<30) — historically a buy zone"
+        elif current_rsi > 70:
+            position = "🔴 AT CYCLE TOP (RSI>70) — historically a sell zone"
+        elif avg_cycle_weeks and weeks_since_bottom is not None:
+            pct_through = min(100, weeks_since_bottom / avg_cycle_weeks * 100)
+            if pct_through < 30:
+                position = f"🌱 Early cycle ({pct_through:.0f}% through since last bottom)"
+            elif pct_through < 70:
+                position = f"📈 Mid cycle ({pct_through:.0f}% through since last bottom)"
+            else:
+                position = f"⚠️ Late cycle ({pct_through:.0f}% through — watch for top)"
+        else:
+            position = "❓ Insufficient history for position estimate"
+
+        return {
+            "current_rsi": round(current_rsi, 1),
+            "avg_cycle_weeks": round(avg_cycle_weeks, 1) if avg_cycle_weeks else None,
+            "weeks_since_bottom": weeks_since_bottom,
+            "weeks_since_top": weeks_since_top,
+            "num_bottoms_found": len(bottoms),
+            "num_tops_found": len(tops),
+            "position": position,
+        }
+    except Exception as e:
+        logger.error(f"_sync_rsi_cycle({symbol}): {e}", exc_info=True)
+        return {"error": str(e)}
+
+
+def _sync_ema_crossover_cycle(symbol: str) -> dict:
+    """
+    Find historical golden cross (EMA50>EMA200) and death cross events.
+    Compute average cycle length and current position.
+    """
+    try:
+        df = _sync_get_klines(symbol, "D", 1000)
+        if df is None or len(df) < 210:
+            return {"error": "Insufficient data"}
+
+        close = df["close"].astype(float)
+        ema50  = close.ewm(span=50,  adjust=False).mean()
+        ema200 = close.ewm(span=200, adjust=False).mean()
+
+        golden_crosses, death_crosses = [], []
+        for i in range(1, len(close)):
+            if ema50.iloc[i] > ema200.iloc[i] and ema50.iloc[i-1] <= ema200.iloc[i-1]:
+                golden_crosses.append(i)
+            if ema50.iloc[i] < ema200.iloc[i] and ema50.iloc[i-1] >= ema200.iloc[i-1]:
+                death_crosses.append(i)
+
+        currently_bullish = float(ema50.iloc[-1]) > float(ema200.iloc[-1])
+
+        # Average full cycle: golden-to-golden (days)
+        avg_cycle_days = None
+        if len(golden_crosses) >= 2:
+            intervals = [golden_crosses[i] - golden_crosses[i-1] for i in range(1, len(golden_crosses))]
+            avg_cycle_days = sum(intervals) / len(intervals)
+
+        last_cross_idx = max(
+            golden_crosses[-1] if golden_crosses else -1,
+            death_crosses[-1]  if death_crosses  else -1
+        )
+        days_since_cross = (len(close) - 1 - last_cross_idx) if last_cross_idx >= 0 else None
+        last_cross_type  = "Golden" if (golden_crosses and last_cross_idx == golden_crosses[-1]) else "Death"
+
+        return {
+            "currently_bullish": currently_bullish,
+            "avg_cycle_days": round(avg_cycle_days, 0) if avg_cycle_days else None,
+            "days_since_last_cross": days_since_cross,
+            "last_cross_type": last_cross_type,
+            "num_golden_crosses": len(golden_crosses),
+            "num_death_crosses": len(death_crosses),
+        }
+    except Exception as e:
+        logger.error(f"_sync_ema_crossover_cycle({symbol}): {e}", exc_info=True)
+        return {"error": str(e)}
+
+
+def _sync_bb_squeeze_cycle(symbol: str) -> dict:
+    """
+    Find historical BB squeeze events (width at local minimum) and measure
+    the average time between squeezes — the volatility cycle rhythm.
+    """
+    try:
+        df = _sync_get_klines(symbol, "D", 500)
+        if df is None or len(df) < 60:
+            return {"error": "Insufficient data"}
+
+        close = df["close"].astype(float)
+        bb = ta.bbands(close, length=20, std=2.0)
+        if bb is None:
+            return {"error": "BB calc failed"}
+
+        bb_upper = bb["BBU_20_2.0_2.0"]
+        bb_lower = bb["BBL_20_2.0_2.0"]
+        bb_mid   = bb["BBM_20_2.0_2.0"]
+        bb_width = (bb_upper - bb_lower) / bb_mid * 100
+
+        # Find squeeze events: width is a local minimum over a 20-bar window
+        squeezes = []
+        for i in range(20, len(bb_width) - 5):
+            window = bb_width.iloc[i-20:i+5]
+            if pd.notna(bb_width.iloc[i]) and bb_width.iloc[i] == window.min() and bb_width.iloc[i] < window.mean() * 0.6:
+                squeezes.append(i)
+
+        # Dedupe squeezes that are too close together (<10 bars apart)
+        deduped = []
+        for s in squeezes:
+            if not deduped or s - deduped[-1] > 10:
+                deduped.append(s)
+
+        avg_squeeze_interval = None
+        if len(deduped) >= 2:
+            intervals = [deduped[i] - deduped[i-1] for i in range(1, len(deduped))]
+            avg_squeeze_interval = sum(intervals) / len(intervals)
+
+        days_since_last_squeeze = (len(bb_width) - 1 - deduped[-1]) if deduped else None
+        current_width = float(bb_width.iloc[-1]) if pd.notna(bb_width.iloc[-1]) else None
+        avg_width     = float(bb_width.tail(200).mean())
+        is_squeezing  = current_width < avg_width * 0.7 if current_width else False
+
+        return {
+            "current_width": round(current_width, 2) if current_width else None,
+            "avg_width_200d": round(avg_width, 2),
+            "is_squeezing_now": is_squeezing,
+            "avg_squeeze_interval_days": round(avg_squeeze_interval, 0) if avg_squeeze_interval else None,
+            "days_since_last_squeeze": days_since_last_squeeze,
+            "num_squeezes_found": len(deduped),
+        }
+    except Exception as e:
+        logger.error(f"_sync_bb_squeeze_cycle({symbol}): {e}", exc_info=True)
+        return {"error": str(e)}
+
+
+def _sync_full_cycle_analysis(symbol: str) -> dict:
+    """Combine all 4 cycle indicators into one comprehensive report."""
+    halving = _sync_halving_clock()
+    rsi_cyc = _sync_rsi_cycle(symbol)
+    ema_cyc = _sync_ema_crossover_cycle(symbol)
+    bb_cyc  = _sync_bb_squeeze_cycle(symbol)
+
+    return {
+        "symbol":  symbol,
+        "halving": halving,
+        "rsi":     rsi_cyc,
+        "ema":     ema_cyc,
+        "bb":      bb_cyc,
+    }
+
+
+@public_command
+async def cmd_cycle(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Full cycle analysis for any coin — combines 4 independent cycle indicators.
+    Usage: /cycle BTCUSDT
+    """
+    symbol = ctx.args[0].upper() if ctx.args else None
+    if not symbol:
+        await update.message.reply_text(
+            "Usage: /cycle SYMBOL\n"
+            "Example: /cycle BTCUSDT\n\n"
+            "Combines 4 cycle indicators: BTC halving clock, "
+            "Weekly RSI cycle, EMA 50/200 crossover cycle, BB squeeze cycle.")
+        return
+
+    if not symbol.endswith("USDT"):
+        symbol += "USDT"
+
+    await update.message.reply_text(
+        f"⏳ Analysing full cycle for {symbol}...\n"
+        f"Checking halving clock, RSI cycle, EMA crossovers, BB squeeze rhythm.\n"
+        f"Takes about 10-15 seconds.")
+
+    result = await asyncio.to_thread(_sync_full_cycle_analysis, symbol)
+
+    h = result["halving"]
+    r = result["rsi"]
+    e = result["ema"]
+    b = result["bb"]
+
+    lines = [
+        f"🔄 <b>Cycle Analysis — {symbol}</b>",
+        f"━━━━━━━━━━━━━━━━━━━━",
+        f"",
+        f"<b>1) Bitcoin Halving Clock (macro cycle)</b>",
+        f"   Phase: {h['phase']}",
+        f"   Days since last halving: {h['days_since_halving']} ({h['last_halving']})",
+        f"   Days until next halving: {h['days_until_halving']} ({h['next_halving']})",
+        f"   Cycle position: {h['cycle_pct']}% through 4-year cycle",
+        f"",
+    ]
+
+    if r.get("error"):
+        lines.append(f"<b>2) Weekly RSI Cycle</b>\n   ⚠️ {r['error']}\n")
+    else:
+        lines.extend([
+            f"<b>2) Weekly RSI Cycle</b>",
+            f"   Current RSI: {r['current_rsi']}",
+            f"   Position: {r['position']}",
+            f"   Avg cycle length: {r['avg_cycle_weeks']} weeks "
+            f"(from {r['num_bottoms_found']} historical bottoms)" if r.get("avg_cycle_weeks") else "   Avg cycle length: insufficient history",
+            f"",
+        ])
+
+    if e.get("error"):
+        lines.append(f"<b>3) EMA 50/200 Crossover Cycle</b>\n   ⚠️ {e['error']}\n")
+    else:
+        trend_str = "🟢 Bullish (Golden Cross active)" if e["currently_bullish"] else "🔴 Bearish (Death Cross active)"
+        lines.extend([
+            f"<b>3) EMA 50/200 Crossover Cycle</b>",
+            f"   Current trend: {trend_str}",
+            f"   Last cross: {e['last_cross_type']} ({e['days_since_last_cross']} days ago)",
+            f"   Avg cycle length: {e['avg_cycle_days']} days "
+            f"({e['num_golden_crosses']} golden + {e['num_death_crosses']} death crosses found)" if e.get("avg_cycle_days") else "   Avg cycle length: insufficient history",
+            f"",
+        ])
+
+    if b.get("error"):
+        lines.append(f"<b>4) BB Squeeze Volatility Cycle</b>\n   ⚠️ {b['error']}\n")
+    else:
+        squeeze_str = "🟡 SQUEEZING NOW — breakout may be imminent" if b["is_squeezing_now"] else "⬜ Normal volatility"
+        lines.extend([
+            f"<b>4) BB Squeeze Volatility Cycle</b>",
+            f"   Current: {squeeze_str}",
+            f"   BB width: {b['current_width']}% (200d avg: {b['avg_width_200d']}%)",
+            f"   Avg squeeze interval: {b['avg_squeeze_interval_days']} days "
+            f"({b['num_squeezes_found']} squeezes found)" if b.get("avg_squeeze_interval_days") else "   Avg squeeze interval: insufficient history",
+            f"   Days since last squeeze: {b['days_since_last_squeeze']}",
+        ])
+
+    lines.append(f"\n<i>Combine all 4 signals: halving clock = macro timing, "
+                 f"RSI cycle = momentum extremes, EMA crossover = trend confirmation, "
+                 f"BB squeeze = volatility timing.</i>")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+# =============================================================================
+#  END OF CYCLE DETECTION ENGINE
+# =============================================================================
+
 async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error(f"Telegram error: {ctx.error}")
     try:
@@ -4781,6 +5192,8 @@ async def main() -> None:
     app.add_handler(CommandHandler("health",           cmd_health))
     app.add_handler(CommandHandler("uptrendcoins",     cmd_uptrendcoins))
     app.add_handler(CommandHandler("downtrendcoins",   cmd_downtrendcoins))
+    app.add_handler(CommandHandler("cycle",             cmd_cycle))
+    app.add_handler(CommandHandler("help",              cmd_help))
     app.add_error_handler(error_handler)
 
     # Recurring jobs
