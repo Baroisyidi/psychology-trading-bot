@@ -4159,6 +4159,527 @@ async def cmd_backtest(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 #  END OF BACKTEST ENGINE
 # =============================================================================
 
+
+# =============================================================================
+#  COIN SCREENER, HEALTH SCORE, UPTREND/DOWNTREND COMMANDS
+#  /screen [period]     — Alpha vs BTC screener for monitored symbols
+#  /health [SYMBOL]     — Full coin health score (1-100)
+#  /uptrendcoins        — Top 15 overperformers vs BTC from Bybit
+#  /downtrendcoins      — Top 15 underperformers vs BTC from Bybit
+# =============================================================================
+
+def _sync_get_all_usdt_symbols() -> list[str]:
+    """Fetch all actively traded USDT linear perpetual symbols from Bybit."""
+    try:
+        resp = bybit_session.get_instruments_info(category="linear", status="Trading")
+        symbols = []
+        for item in resp["result"]["list"]:
+            sym = item["symbol"]
+            # Only USDT linear, skip inverse and options
+            if sym.endswith("USDT") and item.get("quoteCoin") == "USDT":
+                symbols.append(sym)
+        return symbols
+    except Exception as e:
+        logger.error(f"_sync_get_all_usdt_symbols: {e}")
+        return []
+
+
+def _sync_get_coin_performance(symbol: str, days: int) -> Optional[dict]:
+    """
+    Get price performance for a symbol over last N days.
+    Returns dict with start_price, end_price, pct_change, volume_ratio.
+    """
+    try:
+        df = _sync_get_klines(symbol, "D", days + 5)
+        if df is None or len(df) < days:
+            return None
+        
+        start_price = float(df["close"].iloc[-(days+1)])
+        end_price   = float(df["close"].iloc[-1])
+        
+        if start_price <= 0:
+            return None
+        
+        pct_change = (end_price - start_price) / start_price * 100
+        
+        # Volume ratio: recent 14d avg vs prior 14d avg
+        if len(df) >= 28:
+            vol_recent = float(df["volume"].iloc[-14:].mean())
+            vol_prior  = float(df["volume"].iloc[-28:-14].mean())
+            vol_ratio  = vol_recent / vol_prior if vol_prior > 0 else 1.0
+        else:
+            vol_ratio = 1.0
+        
+        # ATH check: is current price within 20% of 1-year high?
+        high_1y = float(df["high"].tail(365).max()) if len(df) >= 365 else float(df["high"].max())
+        from_ath_pct = (end_price - high_1y) / high_1y * 100  # negative = below ATH
+        
+        # EMA200 slope
+        ema200 = df["close"].ewm(span=200, adjust=False).mean()
+        if len(ema200) >= 6:
+            ema200_slope = float((ema200.iloc[-1] - ema200.iloc[-6]) / ema200.iloc[-6] * 100)
+        else:
+            ema200_slope = 0.0
+        
+        # Weekly relative performance: slope of COIN/BTC proxy
+        # We use the coin's own momentum as proxy since BTC data comes separately
+        ema20 = df["close"].ewm(span=20, adjust=False).mean()
+        ema50 = df["close"].ewm(span=50, adjust=False).mean()
+        ema_aligned = float(ema20.iloc[-1]) > float(ema50.iloc[-1]) > float(ema200.iloc[-1])
+        
+        return {
+            "symbol":       symbol,
+            "pct_change":   round(pct_change, 2),
+            "start_price":  round(start_price, 6),
+            "end_price":    round(end_price, 6),
+            "vol_ratio":    round(vol_ratio, 2),
+            "from_ath_pct": round(from_ath_pct, 2),
+            "ema200_slope": round(ema200_slope, 4),
+            "ema_aligned":  ema_aligned,
+        }
+    except Exception as e:
+        logger.debug(f"_sync_get_coin_performance({symbol}): {e}")
+        return None
+
+
+def _sync_coin_health_score(symbol: str) -> dict:
+    """
+    Compute a 0-100 health score for a coin based on:
+    - Performance vs BTC (30 pts)
+    - EMA structure (20 pts)
+    - Volume momentum (15 pts)
+    - Distance from ATH vs BTC's distance from ATH (20 pts)
+    - Trend consistency (15 pts)
+    Returns full breakdown dict.
+    """
+    score = 0
+    breakdown = {}
+    details = []
+
+    try:
+        # Fetch coin data
+        df = _sync_get_klines(symbol, "D", 400)
+        if df is None or len(df) < 100:
+            return {"score": 0, "error": "Insufficient data", "symbol": symbol}
+
+        close   = df["close"].astype(float)
+        high    = df["high"].astype(float)
+        low     = df["low"].astype(float)
+        volume  = df["volume"].astype(float)
+
+        # Fetch BTC data for comparison
+        df_btc = _sync_get_klines("BTCUSDT", "D", 400)
+        btc_close = df_btc["close"].astype(float) if df_btc is not None else None
+
+        # ── Component 1: Performance vs BTC (30 pts) ─────────────────────────
+        for period_days, pts in [(30, 10), (90, 10), (180, 10)]:
+            if len(close) > period_days:
+                coin_ret = (float(close.iloc[-1]) - float(close.iloc[-period_days])) / float(close.iloc[-period_days]) * 100
+                if btc_close is not None and len(btc_close) > period_days:
+                    btc_ret  = (float(btc_close.iloc[-1]) - float(btc_close.iloc[-period_days])) / float(btc_close.iloc[-period_days]) * 100
+                    alpha    = coin_ret - btc_ret
+                    label    = f"{period_days}d"
+                    if alpha > 20:
+                        score += pts; breakdown[label] = f"+{alpha:.1f}% vs BTC ✅"
+                    elif alpha > 0:
+                        score += int(pts * 0.6); breakdown[label] = f"+{alpha:.1f}% vs BTC 🟡"
+                    elif alpha > -20:
+                        score += int(pts * 0.2); breakdown[label] = f"{alpha:.1f}% vs BTC 🟠"
+                    else:
+                        breakdown[label] = f"{alpha:.1f}% vs BTC ❌"
+                    details.append(f"{label}: coin {coin_ret:+.1f}% | BTC {btc_ret:+.1f}% | alpha {alpha:+.1f}%")
+
+        # ── Component 2: EMA structure (20 pts) ──────────────────────────────
+        ema20  = close.ewm(span=20,  adjust=False).mean()
+        ema50  = close.ewm(span=50,  adjust=False).mean()
+        ema100 = close.ewm(span=100, adjust=False).mean()
+        ema200 = close.ewm(span=200, adjust=False).mean()
+
+        price_now = float(close.iloc[-1])
+        e20, e50, e100, e200 = (float(x.iloc[-1]) for x in [ema20,ema50,ema100,ema200])
+
+        full_stack  = price_now > e20 > e50 > e100 > e200
+        above_200   = price_now > e200
+        ema200_slope = (float(ema200.iloc[-1]) - float(ema200.iloc[-30])) / float(ema200.iloc[-30]) * 100 if len(ema200) >= 30 else 0
+
+        if full_stack:
+            score += 20; breakdown["EMA"] = "Full bullish stack ✅"
+        elif above_200 and ema200_slope > 0:
+            score += 12; breakdown["EMA"] = "Above EMA200 (rising) 🟡"
+        elif above_200:
+            score += 6;  breakdown["EMA"] = "Above EMA200 (flat) 🟠"
+        else:
+            breakdown["EMA"] = f"Below EMA200 (slope {ema200_slope:+.2f}%) ❌"
+        details.append(f"EMA200 slope 30d: {ema200_slope:+.2f}%")
+
+        # ── Component 3: Volume momentum (15 pts) ────────────────────────────
+        vol_14  = float(volume.iloc[-14:].mean())
+        vol_90  = float(volume.iloc[-90:-14].mean()) if len(volume) >= 90 else float(volume.mean())
+        vol_ratio = vol_14 / vol_90 if vol_90 > 0 else 1.0
+
+        if vol_ratio > 1.5:
+            score += 15; breakdown["Volume"] = f"{vol_ratio:.2f}x 90d avg ✅"
+        elif vol_ratio > 1.1:
+            score += 9;  breakdown["Volume"] = f"{vol_ratio:.2f}x 90d avg 🟡"
+        elif vol_ratio > 0.8:
+            score += 5;  breakdown["Volume"] = f"{vol_ratio:.2f}x 90d avg 🟠"
+        else:
+            breakdown["Volume"] = f"{vol_ratio:.2f}x 90d avg (declining) ❌"
+        details.append(f"Vol ratio (14d/90d): {vol_ratio:.2f}x")
+
+        # ── Component 4: ATH distance vs BTC ATH distance (20 pts) ───────────
+        high_1y_coin = float(high.tail(365).max()) if len(high) >= 365 else float(high.max())
+        from_ath_coin = (price_now - high_1y_coin) / high_1y_coin * 100
+
+        btc_ath_dist = -50.0  # default
+        if btc_close is not None and df_btc is not None:
+            btc_high_1y  = float(df_btc["high"].astype(float).tail(365).max())
+            btc_now      = float(btc_close.iloc[-1])
+            btc_ath_dist = (btc_now - btc_high_1y) / btc_high_1y * 100
+
+        ath_diff = from_ath_coin - btc_ath_dist  # positive = coin closer to ATH than BTC
+        if ath_diff > 10:
+            score += 20; breakdown["ATH dist"] = f"Closer to ATH than BTC by {ath_diff:.1f}% ✅"
+        elif ath_diff > 0:
+            score += 12; breakdown["ATH dist"] = f"Slightly closer to ATH than BTC 🟡"
+        elif ath_diff > -20:
+            score += 5;  breakdown["ATH dist"] = f"{abs(ath_diff):.1f}% further from ATH than BTC 🟠"
+        else:
+            breakdown["ATH dist"] = f"{abs(ath_diff):.1f}% further from ATH than BTC ❌"
+        details.append(f"Coin from 1y-high: {from_ath_coin:.1f}% | BTC: {btc_ath_dist:.1f}%")
+
+        # ── Component 5: Trend consistency (15 pts) ──────────────────────────
+        # Count green vs red weeks over last 12 weeks
+        if len(close) >= 84:
+            weekly_rets = [float(close.iloc[i*7]) - float(close.iloc[(i-1)*7])
+                          for i in range(1, 13) if (i*7) < len(close)]
+            green_weeks = sum(1 for r in weekly_rets if r > 0)
+            consistency = green_weeks / len(weekly_rets) if weekly_rets else 0.5
+        else:
+            consistency = 0.5
+
+        if consistency >= 0.7:
+            score += 15; breakdown["Consistency"] = f"{green_weeks}/12 green weeks ✅"
+        elif consistency >= 0.5:
+            score += 8;  breakdown["Consistency"] = f"{green_weeks}/12 green weeks 🟡"
+        else:
+            score += 2;  breakdown["Consistency"] = f"{green_weeks}/12 green weeks ❌"
+        details.append(f"Trend consistency: {consistency*100:.0f}%")
+
+    except Exception as e:
+        logger.error(f"_sync_coin_health_score({symbol}): {e}", exc_info=True)
+        return {"score": 0, "error": str(e), "symbol": symbol}
+
+    # Health label
+    if score >= 75:   label = "🟢 Excellent"
+    elif score >= 55: label = "🟡 Good"
+    elif score >= 35: label = "🟠 Weak"
+    else:             label = "🔴 Poor"
+
+    return {
+        "symbol":    symbol,
+        "score":     score,
+        "label":     label,
+        "breakdown": breakdown,
+        "details":   details,
+    }
+
+
+def _sync_scan_top_coins(mode: str, days: int = 90, top_n: int = 15) -> list[dict]:
+    """
+    Scan all Bybit USDT linear symbols and rank by performance vs BTC.
+    mode: 'up' = outperformers, 'down' = underperformers
+    Returns list of top_n dicts sorted by alpha vs BTC.
+    """
+    # Get BTC performance as baseline
+    btc_perf = _sync_get_coin_performance("BTCUSDT", days)
+    btc_ret  = btc_perf["pct_change"] if btc_perf else 0.0
+
+    # Get all symbols — filter to top coins by some criteria
+    all_syms = _sync_get_all_usdt_symbols()
+
+    # Filter out micro/illiquid symbols — only symbols Bybit shows volume for
+    # Sample a subset for speed: pick symbols with common base coins
+    # We'll scan up to 80 symbols and pick the top 15
+    priority_syms = [
+        "BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT","ADAUSDT",
+        "AVAXUSDT","DOTUSDT","LINKUSDT","MATICUSDT","ATOMUSDT","LTCUSDT",
+        "UNIUSDT","AAVEUSDT","NEARUSDT","APTUSDT","ARBUSDT","OPUSDT",
+        "INJUSDT","SUIUSDT","SEIUSDT","TIAUSDT","JUPUSDT","FETUSDT",
+        "RENDERUSDT","WLDUSDT","STXUSDT","HBARUSDT","ALGOUSDT","VETUSDT",
+        "XLMUSDT","FILUSDT","ICPUSDT","THETAUSDT","AAVEUSDT","SANDUSDT",
+        "MANAUSDT","GRTUSDT","SNXUSDT","CRVUSDT","MKRUSDT","COMPUSDT",
+        "LDOUSDT","RNDRUSDT","EIGENUSDT","ENAAUSDT","PENDLEUSDT","WIFUSDT",
+        "BONKUSDT","PEPEUSDT","FLOKIUSDT","DOGEUSDT","SHIBUSDT","TRXUSDT",
+        "TONUSDT","NOTUSDT","CKBUSDT","KASUSDT","CFXUSDT","CELOUSDT",
+    ]
+
+    # Only scan symbols that exist on Bybit
+    valid_syms = [s for s in priority_syms if s in all_syms or s == "BTCUSDT"]
+    results = []
+
+    for sym in valid_syms:
+        if sym == "BTCUSDT":
+            continue
+        perf = _sync_get_coin_performance(sym, days)
+        if perf is None:
+            continue
+
+        alpha = perf["pct_change"] - btc_ret
+        perf["alpha"]   = round(alpha, 2)
+        perf["btc_ret"] = round(btc_ret, 2)
+        results.append(perf)
+        time.sleep(0.05)  # gentle rate limiting
+
+    # Sort
+    results.sort(key=lambda x: x["alpha"], reverse=(mode == "up"))
+    return results[:top_n]
+
+
+# ── COMMAND: /screen ─────────────────────────────────────────────────────────
+@public_command
+async def cmd_screen(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Alpha screener for monitored symbols vs BTC.
+    Usage: /screen [period]
+    Period: 30d, 90d (default), 180d
+    """
+    period_map = {"30d":30, "90d":90, "180d":180, "1m":30, "3m":90, "6m":180}
+    period_str = ctx.args[0].lower() if ctx.args else "90d"
+    days = period_map.get(period_str, 90)
+
+    all_syms = list(set(monitored_symbols + meme_symbols))
+    if not all_syms:
+        await update.message.reply_text(
+            "No symbols being monitored. Add some with /add_symbol first.")
+        return
+
+    await update.message.reply_text(
+        f"Scanning {len(all_syms)} symbols vs BTC over last {days} days...\n"
+        "Takes about 10 seconds.")
+
+    def run_screen():
+        btc_perf = _sync_get_coin_performance("BTCUSDT", days)
+        btc_ret  = btc_perf["pct_change"] if btc_perf else 0.0
+        results  = []
+        for sym in all_syms:
+            perf = _sync_get_coin_performance(sym, days)
+            if perf:
+                perf["alpha"]   = round(perf["pct_change"] - btc_ret, 2)
+                perf["btc_ret"] = round(btc_ret, 2)
+                results.append(perf)
+        results.sort(key=lambda x: x["alpha"], reverse=True)
+        return results, btc_ret
+
+    results, btc_ret = await asyncio.to_thread(run_screen)
+
+    if not results:
+        await update.message.reply_text("Failed to fetch data. Try again.")
+        return
+
+    lines = [
+        f"📊 <b>Alpha Screener — Last {days} days</b>",
+        f"━━━━━━━━━━━━━━━━━━━━",
+        f"BTC performance: {btc_ret:+.1f}%",
+        f"",
+    ]
+
+    for r in results:
+        alpha = r["alpha"]
+        coin_ret = r["pct_change"]
+        vol = r["vol_ratio"]
+
+        if alpha > 20:     tier = "🟢 Strong alpha"
+        elif alpha > 5:    tier = "🟡 Mild alpha"
+        elif alpha > -10:  tier = "⬜ Inline"
+        elif alpha > -30:  tier = "🟠 Underperform"
+        else:              tier = "🔴 Weak"
+
+        ema_str = "EMA✅" if r.get("ema_aligned") else "EMA❌"
+        sym_name = r["symbol"]
+        ath_pct = r["from_ath_pct"]
+        lines.append(
+            f"{tier}\n"
+            f"  <b>{sym_name}</b>: {coin_ret:+.1f}% | alpha: {alpha:+.1f}% vs BTC\n"
+            f"  Vol ratio: {vol:.2f}x | {ema_str} | from 1y-high: {ath_pct:.1f}%"
+        )
+
+    lines.append(f"\n<i>Alpha = coin return minus BTC return over {days}d</i>")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+
+# ── COMMAND: /health ─────────────────────────────────────────────────────────
+@public_command
+async def cmd_health(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Full coin health score for any symbol.
+    Usage: /health BTCUSDT
+    """
+    symbol = ctx.args[0].upper() if ctx.args else None
+    if not symbol:
+        await update.message.reply_text(
+            "Usage: /health SYMBOL\n"
+            "Scores 0-100 across 5 dimensions vs BTC performance.",
+            parse_mode="HTML")
+        return
+
+    if not symbol.endswith("USDT"):
+        symbol += "USDT"
+
+    await update.message.reply_text(
+        f"⏳ Computing health score for {symbol}...\n"
+        f"Fetching 400 days of price data (takes ~10 seconds)")
+
+    result = await asyncio.to_thread(_sync_coin_health_score, symbol)
+
+    if result.get("error"):
+        await update.message.reply_text(f"❌ Error: {result['error']}")
+        return
+
+    score = result["score"]
+    label = result["label"]
+    bd    = result["breakdown"]
+    det   = result["details"]
+
+    # Score bar
+    filled = int(score / 10)
+    bar    = "█" * filled + "░" * (10 - filled)
+
+    lines = [
+        f"🏥 <b>Coin Health Score — {symbol}</b>",
+        f"━━━━━━━━━━━━━━━━━━━━",
+        f"Score : <b>{score}/100</b>  {label}",
+        f"Visual: <code>{bar}</code>",
+        f"",
+        f"<b>Breakdown:</b>",
+    ]
+
+    for key, val in bd.items():
+        lines.append(f"  {key:12}: {val}")
+
+    lines.append(f"")
+    lines.append(f"<b>Raw data:</b>")
+    for d in det:
+        lines.append(f"  {d}")
+
+    lines.append(f"")
+    if score >= 75:
+        lines.append("✅ <b>Bot bias: LONG entries favoured. Strategy filters normal.</b>")
+    elif score >= 55:
+        lines.append("🟡 <b>Bot bias: LONG entries allowed. Watch for confirmation.</b>")
+    elif score >= 35:
+        lines.append("🟠 <b>Bot bias: LONG entries need 7/8 score (raised bar).</b>")
+    else:
+        lines.append("🔴 <b>Bot bias: SHORT entries only. LONGs require 8/8 score.</b>")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+# ── COMMAND: /uptrendcoins ───────────────────────────────────────────────────
+@public_command
+async def cmd_uptrendcoins(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Fetch top 15 coins overperforming BTC over last 90 days from Bybit.
+    Usage: /uptrendcoins [period]   e.g. /uptrendcoins 180d
+    """
+    period_map = {"30d":30,"90d":90,"180d":180,"1m":30,"3m":90,"6m":180}
+    period_str = ctx.args[0].lower() if ctx.args else "90d"
+    days = period_map.get(period_str, 90)
+
+    await update.message.reply_text(
+        f"📈 Scanning Bybit for top 15 outperformers vs BTC over {days} days...\n"
+        f"Checking ~60 symbols. Takes 20-40 seconds.")
+
+    results = await asyncio.to_thread(_sync_scan_top_coins, "up", days, 15)
+
+    if not results:
+        await update.message.reply_text("Failed to fetch data. Try again.")
+        return
+
+    btc_ret = results[0]["btc_ret"] if results else 0.0
+    lines = [
+        f"📈 <b>Top 15 Outperformers vs BTC — Last {days} days</b>",
+        f"━━━━━━━━━━━━━━━━━━━━",
+        f"BTC baseline: {btc_ret:+.1f}%",
+        f"",
+    ]
+
+    for i, r in enumerate(results, 1):
+        alpha    = r["alpha"]
+        coin_ret = r["pct_change"]
+        vol      = r["vol_ratio"]
+        ema_str  = "✅" if r.get("ema_aligned") else "❌"
+        ath_str  = f"{r['from_ath_pct']:.1f}%"
+
+        lines.append(
+            f"<b>#{i} {r['symbol']}</b>\n"
+            f"  Return: {coin_ret:+.1f}% | Alpha vs BTC: <b>+{alpha:.1f}%</b>\n"
+            f"  Vol: {vol:.2f}x | EMA stack: {ema_str} | From 1y-high: {ath_str}"
+        )
+
+    lines.append(
+        "These coins are generating alpha above BTC.\n"
+        "Use /health SYMBOL for a full score on any of these.\n"
+        "Use /add_symbol SYMBOL to start monitoring."
+    )
+
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+# ── COMMAND: /downtrendcoins ─────────────────────────────────────────────────
+@public_command
+async def cmd_downtrendcoins(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Fetch top 15 coins underperforming BTC over last 90 days from Bybit.
+    Usage: /downtrendcoins [period]   e.g. /downtrendcoins 180d
+    """
+    period_map = {"30d":30,"90d":90,"180d":180,"1m":30,"3m":90,"6m":180}
+    period_str = ctx.args[0].lower() if ctx.args else "90d"
+    days = period_map.get(period_str, 90)
+
+    await update.message.reply_text(
+        f"📉 Scanning Bybit for top 15 underperformers vs BTC over {days} days...\n"
+        f"Checking ~60 symbols. Takes 20-40 seconds.")
+
+    results = await asyncio.to_thread(_sync_scan_top_coins, "down", days, 15)
+
+    if not results:
+        await update.message.reply_text("Failed to fetch data. Try again.")
+        return
+
+    btc_ret = results[0]["btc_ret"] if results else 0.0
+    lines = [
+        f"📉 <b>Top 15 Underperformers vs BTC — Last {days} days</b>",
+        f"━━━━━━━━━━━━━━━━━━━━",
+        f"BTC baseline: {btc_ret:+.1f}%",
+        f"",
+    ]
+
+    for i, r in enumerate(results, 1):
+        alpha    = r["alpha"]
+        coin_ret = r["pct_change"]
+        vol      = r["vol_ratio"]
+        ema_str  = "✅" if r.get("ema_aligned") else "❌"
+
+        lines.append(
+            f"<b>#{i} {r['symbol']}</b>\n"
+            f"  Return: {coin_ret:+.1f}% | Alpha vs BTC: <b>{alpha:.1f}%</b>\n"
+            f"  Vol: {vol:.2f}x | EMA stack: {ema_str} | From 1y-high: {r['from_ath_pct']:.1f}%"
+        )
+
+    lines.append(
+        "These coins are losing ground vs BTC.\n"
+        "Avoid LONG entries. Good SHORT candidates when regime confirms downtrend.\n"
+        "Use /health SYMBOL for a full breakdown."
+    )
+
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+# =============================================================================
+#  END OF SCREENER MODULE
+# =============================================================================
+
 async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error(f"Telegram error: {ctx.error}")
     try:
@@ -4256,6 +4777,10 @@ async def main() -> None:
     app.add_handler(CommandHandler("regime",          cmd_regime))
     app.add_handler(CommandHandler("regime_all",      cmd_regime_all))
     app.add_handler(CommandHandler("backtest",         cmd_backtest))
+    app.add_handler(CommandHandler("screen",           cmd_screen))
+    app.add_handler(CommandHandler("health",           cmd_health))
+    app.add_handler(CommandHandler("uptrendcoins",     cmd_uptrendcoins))
+    app.add_handler(CommandHandler("downtrendcoins",   cmd_downtrendcoins))
     app.add_error_handler(error_handler)
 
     # Recurring jobs
