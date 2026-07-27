@@ -26,6 +26,7 @@ import time
 import random
 import threading
 import concurrent.futures
+import requests
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -3746,6 +3747,82 @@ async def cmd_regime_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
 #  7. Collect results and send Telegram report
 # =============================================================================
 
+def _sync_fetch_binance_klines(symbol: str, interval: str, days_back: int) -> Optional[pd.DataFrame]:
+    """
+    Fallback data source: Binance public REST API (no auth required).
+    Used when Bybit's listing history for a symbol is too short to build
+    reliable long-term cycle indicators (e.g. RSI cycle needing 2-3+ years).
+
+    Binance often has longer historical data for major coins since many
+    were listed there years before appearing on Bybit's linear perpetuals.
+    Binance kline endpoint allows up to 1000 candles per request and
+    supports pagination via startTime/endTime, same approach as Bybit.
+
+    interval: Binance format — "1d", "1w", "4h", "1h" (different from Bybit's
+    "D"/"240"/"60" — caller must pass Binance-style interval strings)
+    """
+    try:
+        base_url = "https://api.binance.com/api/v3/klines"
+        interval_ms = {
+            "1d": 86400000, "4h": 14400000, "1h": 3600000, "1w": 604800000,
+        }.get(interval, 86400000)
+
+        end_time = int(time.time() * 1000)
+        start_time = end_time - (days_back * 86400000)
+
+        all_rows = []
+        cur_end = end_time
+        max_requests = 10
+
+        for _ in range(max_requests):
+            params = {
+                "symbol": symbol,
+                "interval": interval,
+                "endTime": cur_end,
+                "limit": 1000,
+            }
+            resp = requests.get(base_url, params=params, timeout=10)
+            if resp.status_code != 200:
+                logger.warning(f"[BINANCE] {symbol} returned status {resp.status_code}: {resp.text[:200]}")
+                break
+
+            raw = resp.json()
+            if not raw or not isinstance(raw, list):
+                break
+
+            all_rows = raw + all_rows
+            oldest_ts = raw[0][0]
+            if oldest_ts <= start_time or len(raw) < 1000:
+                break
+            cur_end = oldest_ts - 1
+            time.sleep(0.15)  # respect Binance rate limits
+
+        if not all_rows:
+            return None
+
+        df = pd.DataFrame(all_rows, columns=[
+            "timestamp","open","high","low","close","volume",
+            "close_time","quote_volume","trades","taker_buy_base",
+            "taker_buy_quote","ignore"
+        ])
+        for col in ["open","high","low","close","volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df["timestamp"] = df["timestamp"].astype("int64")
+        df = df[["timestamp","open","high","low","close","volume"]]
+        df.sort_values("timestamp", inplace=True)
+        df.reset_index(drop=True, inplace=True)
+
+        cutoff_ms = end_time - days_back * 86400000
+        df = df[df["timestamp"] >= cutoff_ms].reset_index(drop=True)
+
+        logger.info(f"[BINANCE] Fetched {len(df)} candles for {symbol} "
+                    f"({interval}, {days_back}d fallback)")
+        return df
+    except Exception as e:
+        logger.error(f"_sync_fetch_binance_klines({symbol},{interval}): {e}", exc_info=True)
+        return None
+
+
 def _sync_fetch_paginated_klines(symbol: str, interval: str,
                                   days_back: int) -> Optional[pd.DataFrame]:
     """
@@ -4812,6 +4889,13 @@ def _sync_rsi_cycle(symbol: str) -> dict:
     events, compute average cycle length, and current position in cycle.
     Uses paginated fetch to cover multiple years — a single 1000-candle
     request only reaches back ~2.7 years, which misses full bear cycles.
+
+    IMPORTANT: resamples to TRUE calendar weeks using the actual close of
+    the last trading day in each week — NOT positional sampling (iloc[::7]).
+    Positional sampling can silently skip over a sharp multi-day crash if
+    the crash bottom doesn't happen to land on a sampled row, which was
+    causing real RSI-bottom events (like FTX-collapse-era crashes) to be
+    missed entirely on some symbols.
     """
     try:
         # Paginate back ~5 years (1825 days) to reliably capture 2+ full
@@ -4821,17 +4905,23 @@ def _sync_rsi_cycle(symbol: str) -> dict:
             # Fall back to whatever single-request data is available
             df = _sync_get_klines(symbol, "D", 1000)
         if df is None or len(df) < 200:
-            return {"error": "Insufficient data"}
+            # Try alternate exchange (Binance) — some symbols have shorter
+            # history on Bybit than their actual market history elsewhere
+            df = _sync_fetch_binance_klines(symbol, "1d", 1825)
+        if df is None or len(df) < 200:
+            return {"error": "Insufficient data", "source": "none"}
 
-        # Resample to weekly using every 7th candle (approximation, fast)
-        df = df.reset_index(drop=True)
-        weekly_close = df["close"].iloc[::7].reset_index(drop=True)
-        weekly_ts    = df["timestamp"].iloc[::7].reset_index(drop=True)
+        # ── TRUE calendar-week resampling (fixes positional sampling bug) ────
+        df = df.copy()
+        df["dt"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+        df = df.set_index("dt")
+        weekly = df["close"].resample("W").last().dropna()
+        weekly_low  = df["low"].resample("W").min().dropna()
 
-        if len(weekly_close) < 20:
+        if len(weekly) < 20:
             return {"error": "Insufficient weekly data"}
 
-        rsi = ta.rsi(weekly_close, length=14)
+        rsi = ta.rsi(weekly, length=14)
         if rsi is None:
             return {"error": "RSI calc failed"}
 
@@ -4908,6 +4998,8 @@ def _sync_ema_crossover_cycle(symbol: str) -> dict:
         df = _sync_fetch_paginated_klines(symbol, "D", 1825)
         if df is None or len(df) < 210:
             df = _sync_get_klines(symbol, "D", 1000)
+        if df is None or len(df) < 210:
+            df = _sync_fetch_binance_klines(symbol, "1d", 1825)
         if df is None or len(df) < 210:
             return {"error": "Insufficient data"}
 
@@ -5004,6 +5096,121 @@ def _sync_bb_squeeze_cycle(symbol: str) -> dict:
     except Exception as e:
         logger.error(f"_sync_bb_squeeze_cycle({symbol}): {e}", exc_info=True)
         return {"error": str(e)}
+
+
+def _sync_detect_fast_swings(symbol: str) -> dict:
+    """
+    Short-term cycle detector — catches faster rhythms the macro swing
+    detector (30-day window) would smooth over. Uses a 5-day window and
+    lower thresholds (25% rally / 15% drop) appropriate for memecoins and
+    other fast-moving assets that complete full cycles in weeks, not years.
+
+    Only looks at the last 180 days — older data isn't relevant to a
+    coin's CURRENT short-term rhythm, which can change as liquidity,
+    volume, and market structure evolve.
+    """
+    try:
+        df = _sync_get_klines(symbol, "D", 180)
+        if df is None or len(df) < 30:
+            return {"error": "Insufficient data", "completed_cycles": []}
+
+        close = df["close"].astype(float).values
+        high  = df["high"].astype(float).values
+        low   = df["low"].astype(float).values
+        n = len(close)
+
+        window = 5  # ~1 week — catches short bursts a 30-day window misses
+        swing_highs, swing_lows = [], []
+
+        for i in range(window, n - window):
+            if high[i] == max(high[i-window:i+window]):
+                swing_highs.append((i, high[i]))
+            if low[i] == min(low[i-window:i+window]):
+                swing_lows.append((i, low[i]))
+
+        def dedupe(swings, is_high):
+            if not swings:
+                return []
+            deduped = [swings[0]]
+            for idx, val in swings[1:]:
+                if idx - deduped[-1][0] < 4:
+                    if (is_high and val > deduped[-1][1]) or (not is_high and val < deduped[-1][1]):
+                        deduped[-1] = (idx, val)
+                else:
+                    deduped.append((idx, val))
+            return deduped
+
+        swing_highs = dedupe(swing_highs, True)
+        swing_lows  = dedupe(swing_lows, False)
+
+        all_swings = sorted(
+            [(idx, val, "H") for idx, val in swing_highs] +
+            [(idx, val, "L") for idx, val in swing_lows]
+        )
+
+        # Lower thresholds for short-term: 25% rally confirms a swing high,
+        # 15% drop confirms it was genuine (vs 60%/40% for the macro detector)
+        completed_cycles = []
+        i = 0
+        while i < len(all_swings) - 2:
+            if all_swings[i][2] == "L":
+                low_idx, low_val = all_swings[i][0], all_swings[i][1]
+                for j in range(i+1, len(all_swings)):
+                    if all_swings[j][2] == "H":
+                        high_idx, high_val = all_swings[j][0], all_swings[j][1]
+                        rally_pct = (high_val - low_val) / low_val * 100
+                        if rally_pct < 25:
+                            continue
+                        confirmed = False
+                        for k in range(j+1, len(all_swings)):
+                            if all_swings[k][2] == "L":
+                                next_low_val = all_swings[k][1]
+                                drop_pct = (high_val - next_low_val) / high_val * 100
+                                if drop_pct >= 15:
+                                    confirmed = True
+                                break
+                        if confirmed:
+                            completed_cycles.append({
+                                "low_idx": low_idx, "low_price": round(low_val, 6),
+                                "high_idx": high_idx, "high_price": round(high_val, 6),
+                                "multiple": round(high_val / low_val, 2),
+                                "days_low_to_high": high_idx - low_idx,
+                            })
+                        i = j
+                        break
+                else:
+                    break
+            i += 1
+
+        current_price = float(close[-1])
+        recent_low_val, recent_low_idx = None, None
+        if swing_lows:
+            recent_low_idx, recent_low_val = swing_lows[-1]
+
+        # Average short-term cycle length (low-to-low, in days)
+        avg_short_cycle_days = None
+        if len(swing_lows) >= 2:
+            low_indices = [idx for idx, _ in swing_lows]
+            intervals = [low_indices[k] - low_indices[k-1] for k in range(1, len(low_indices))]
+            avg_short_cycle_days = sum(intervals) / len(intervals)
+
+        days_since_recent_low = (n - 1 - recent_low_idx) if recent_low_idx is not None else None
+
+        return {
+            "completed_cycles": completed_cycles,
+            "num_completed_cycles": len(completed_cycles),
+            "current_price": round(current_price, 6),
+            "most_recent_swing_low": round(recent_low_val, 6) if recent_low_val else None,
+            "days_since_recent_low": days_since_recent_low,
+            "avg_short_cycle_days": round(avg_short_cycle_days, 1) if avg_short_cycle_days else None,
+            "num_swing_lows_found": len(swing_lows),
+            "num_swing_highs_found": len(swing_highs),
+            "total_candles_analysed": n,
+            "window_days": window,
+        }
+    except Exception as e:
+        logger.error(f"_sync_detect_fast_swings({symbol}): {e}", exc_info=True)
+        return {"error": str(e), "completed_cycles": []}
 
 
 def _sync_detect_historical_swings(symbol: str) -> dict:
@@ -5282,23 +5489,25 @@ def _build_cycle_conclusion(symbol: str, halving: dict, rsi: dict,
 
 
 def _sync_full_cycle_analysis(symbol: str) -> dict:
-    """Combine all 4 cycle indicators + historical swings into one comprehensive report."""
-    halving = _sync_halving_clock()
-    rsi_cyc = _sync_rsi_cycle(symbol)
-    ema_cyc = _sync_ema_crossover_cycle(symbol)
-    bb_cyc  = _sync_bb_squeeze_cycle(symbol)
-    swings  = _sync_detect_historical_swings(symbol)
+    """Combine all 4 cycle indicators + macro & short-term swings into one report."""
+    halving      = _sync_halving_clock()
+    rsi_cyc      = _sync_rsi_cycle(symbol)
+    ema_cyc      = _sync_ema_crossover_cycle(symbol)
+    bb_cyc       = _sync_bb_squeeze_cycle(symbol)
+    swings       = _sync_detect_historical_swings(symbol)   # macro (30d window, 1-2yr+ cycles)
+    fast_swings  = _sync_detect_fast_swings(symbol)          # short-term (5d window, weeks-scale)
 
     conclusion = _build_cycle_conclusion(symbol, halving, rsi_cyc, ema_cyc, bb_cyc, swings)
 
     return {
-        "symbol":     symbol,
-        "halving":    halving,
-        "rsi":        rsi_cyc,
-        "ema":        ema_cyc,
-        "bb":         bb_cyc,
-        "swings":     swings,
-        "conclusion": conclusion,
+        "symbol":      symbol,
+        "halving":     halving,
+        "rsi":         rsi_cyc,
+        "ema":         ema_cyc,
+        "bb":          bb_cyc,
+        "swings":      swings,
+        "fast_swings": fast_swings,
+        "conclusion":  conclusion,
     }
 
 
@@ -5381,6 +5590,31 @@ async def cmd_cycle(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             f"({b['num_squeezes_found']} squeezes found)" if b.get("avg_squeeze_interval_days") else "   Avg squeeze interval: insufficient history",
             f"   Days since last squeeze: {b['days_since_last_squeeze']}",
         ])
+
+    lines.append("")
+    fs = result.get("fast_swings", {})
+    if fs.get("error"):
+        lines.append(f"<b>5) Short-Term Cycle (5-day window, last 180d)</b>\n   ⚠️ {fs['error']}\n")
+    else:
+        fs_cycles = fs.get("completed_cycles", [])
+        if fs.get("avg_short_cycle_days"):
+            lines.extend([
+                f"<b>5) Short-Term Cycle (5-day window, last 180d)</b>",
+                f"   Avg swing-low-to-swing-low: {fs['avg_short_cycle_days']} days",
+                f"   Days since last swing low: {fs['days_since_recent_low']}",
+                f"   Completed short cycles found: {len(fs_cycles)} "
+                f"({fs['num_swing_lows_found']} lows, {fs['num_swing_highs_found']} highs)",
+            ])
+            if fs_cycles:
+                multiples = [c["multiple"] for c in fs_cycles]
+                lines.append(f"   Historical low→high multiples: {', '.join(f'{m}x' for m in multiples)}")
+        else:
+            lines.extend([
+                f"<b>5) Short-Term Cycle (5-day window, last 180d)</b>",
+                f"   {fs['num_swing_lows_found']} swing lows found — not enough to average a short cycle",
+                f"   This coin's short-term rhythm is not yet established, or moves too erratically",
+                f"   for a repeating pattern in the last 180 days.",
+            ])
 
     lines.append(f"\n<i>Raw indicator data above. Conclusion follows below ⬇️</i>")
 
