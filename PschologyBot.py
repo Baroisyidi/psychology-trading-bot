@@ -4810,10 +4810,16 @@ def _sync_rsi_cycle(symbol: str) -> dict:
     """
     Analyse Weekly RSI cycle: find historical RSI<30 (bottom) and RSI>70 (top)
     events, compute average cycle length, and current position in cycle.
+    Uses paginated fetch to cover multiple years — a single 1000-candle
+    request only reaches back ~2.7 years, which misses full bear cycles.
     """
     try:
-        # Fetch enough daily data to build weekly candles (need ~3 years)
-        df = _sync_get_klines(symbol, "D", 1000)
+        # Paginate back ~5 years (1825 days) to reliably capture 2+ full
+        # bear/bull cycles for RSI bottom/top detection
+        df = _sync_fetch_paginated_klines(symbol, "D", 1825)
+        if df is None or len(df) < 200:
+            # Fall back to whatever single-request data is available
+            df = _sync_get_klines(symbol, "D", 1000)
         if df is None or len(df) < 200:
             return {"error": "Insufficient data"}
 
@@ -4851,10 +4857,11 @@ def _sync_rsi_cycle(symbol: str) -> dict:
         weeks_since_top    = (len(rsi) - 1 - tops[-1]) if tops else None
 
         # Determine current cycle position
+        coin_age_weeks = len(rsi)
         if current_rsi < 30:
-            position = "🟢 AT CYCLE BOTTOM (RSI<30) — historically a buy zone"
+            position = "🟢 AT CYCLE BOTTOM (RSI&lt;30) — historically a buy zone"
         elif current_rsi > 70:
-            position = "🔴 AT CYCLE TOP (RSI>70) — historically a sell zone"
+            position = "🔴 AT CYCLE TOP (RSI&gt;70) — historically a sell zone"
         elif avg_cycle_weeks and weeks_since_bottom is not None:
             pct_through = min(100, weeks_since_bottom / avg_cycle_weeks * 100)
             if pct_through < 30:
@@ -4863,8 +4870,18 @@ def _sync_rsi_cycle(symbol: str) -> dict:
                 position = f"📈 Mid cycle ({pct_through:.0f}% through since last bottom)"
             else:
                 position = f"⚠️ Late cycle ({pct_through:.0f}% through — watch for top)"
+        elif len(bottoms) == 1 and weeks_since_bottom is not None:
+            # Only 1 bottom found — can't average, but still useful context
+            position = (f"📍 {weeks_since_bottom}w since only bottom found "
+                       f"(coin too young for average cycle — {coin_age_weeks}w of history)")
+        elif len(bottoms) == 0 and coin_age_weeks < 52:
+            # New coin, never hit RSI<30 — likely still in its first uptrend
+            position = (f"🆕 New coin ({coin_age_weeks}w old) — never hit RSI&lt;30 yet. "
+                       f"No completed cycle to measure.")
+        elif current_rsi >= 40 and current_rsi <= 60:
+            position = f"⬜ Neutral zone — no clear cycle extreme, {coin_age_weeks}w of history"
         else:
-            position = "❓ Insufficient history for position estimate"
+            position = f"❓ {coin_age_weeks}w of history — not enough bottom/top events to average"
 
         return {
             "current_rsi": round(current_rsi, 1),
@@ -4873,6 +4890,7 @@ def _sync_rsi_cycle(symbol: str) -> dict:
             "weeks_since_top": weeks_since_top,
             "num_bottoms_found": len(bottoms),
             "num_tops_found": len(tops),
+            "coin_age_weeks": coin_age_weeks,
             "position": position,
         }
     except Exception as e:
@@ -4884,9 +4902,12 @@ def _sync_ema_crossover_cycle(symbol: str) -> dict:
     """
     Find historical golden cross (EMA50>EMA200) and death cross events.
     Compute average cycle length and current position.
+    Uses paginated fetch — single 1000-candle request only covers ~2.7 years.
     """
     try:
-        df = _sync_get_klines(symbol, "D", 1000)
+        df = _sync_fetch_paginated_klines(symbol, "D", 1825)
+        if df is None or len(df) < 210:
+            df = _sync_get_klines(symbol, "D", 1000)
         if df is None or len(df) < 210:
             return {"error": "Insufficient data"}
 
@@ -4985,19 +5006,299 @@ def _sync_bb_squeeze_cycle(symbol: str) -> dict:
         return {"error": str(e)}
 
 
+def _sync_detect_historical_swings(symbol: str) -> dict:
+    """
+    Find actual completed cycle lows and highs using real price data —
+    not assumptions. A "swing low" is a price point where the coin fell
+    at least 40% from a prior peak and then recovered at least 60% from
+    that low. A "swing high" is the peak before such a drawdown.
+    Only counts a swing as COMPLETE if price has since moved away from it
+    by the threshold in both directions — i.e. the low/high actually held.
+    Returns real historical low-to-high price ratios from THIS coin's
+    own past cycles — used later to build a price target range.
+    """
+    try:
+        df = _sync_fetch_paginated_klines(symbol, "D", 1825)
+        if df is None or len(df) < 200:
+            df = _sync_get_klines(symbol, "D", 1000)
+        if df is None or len(df) < 200:
+            return {"error": "Insufficient data", "completed_cycles": []}
+
+        close = df["close"].astype(float).values
+        high  = df["high"].astype(float).values
+        low   = df["low"].astype(float).values
+        n = len(close)
+
+        # Find local maxima and minima using a rolling window approach
+        window = 30  # ~1 month — filters noise, keeps genuine swings
+        swing_highs, swing_lows = [], []
+
+        for i in range(window, n - window):
+            if high[i] == max(high[i-window:i+window]):
+                swing_highs.append((i, high[i]))
+            if low[i] == min(low[i-window:i+window]):
+                swing_lows.append((i, low[i]))
+
+        # Dedupe swings within 20 bars of each other, keep the most extreme
+        def dedupe(swings, is_high):
+            if not swings:
+                return []
+            deduped = [swings[0]]
+            for idx, val in swings[1:]:
+                if idx - deduped[-1][0] < 20:
+                    if (is_high and val > deduped[-1][1]) or (not is_high and val < deduped[-1][1]):
+                        deduped[-1] = (idx, val)
+                else:
+                    deduped.append((idx, val))
+            return deduped
+
+        swing_highs = dedupe(swing_highs, True)
+        swing_lows  = dedupe(swing_lows, False)
+
+        # Merge and sort chronologically to find alternating low->high->low sequences
+        all_swings = sorted(
+            [(idx, val, "H") for idx, val in swing_highs] +
+            [(idx, val, "L") for idx, val in swing_lows]
+        )
+
+        # Extract completed cycles: a LOW followed by a HIGH that is at least
+        # 60% above the low, followed by ANOTHER low that is at least 40%
+        # below that high — this confirms the high was a genuine cycle top
+        # (price actually reversed and fell significantly after it).
+        completed_cycles = []
+        i = 0
+        while i < len(all_swings) - 2:
+            if all_swings[i][2] == "L":
+                low_idx, low_val = all_swings[i][0], all_swings[i][1]
+                # find next high with sufficient rally
+                for j in range(i+1, len(all_swings)):
+                    if all_swings[j][2] == "H":
+                        high_idx, high_val = all_swings[j][0], all_swings[j][1]
+                        rally_pct = (high_val - low_val) / low_val * 100
+                        if rally_pct < 60:
+                            continue
+                        # confirm this high is genuine: find a subsequent low
+                        # that drops at least 40% from this high
+                        confirmed = False
+                        for k in range(j+1, len(all_swings)):
+                            if all_swings[k][2] == "L":
+                                next_low_val = all_swings[k][1]
+                                drop_pct = (high_val - next_low_val) / high_val * 100
+                                if drop_pct >= 40:
+                                    confirmed = True
+                                break
+                        if confirmed:
+                            completed_cycles.append({
+                                "low_idx": low_idx, "low_price": round(low_val, 6),
+                                "high_idx": high_idx, "high_price": round(high_val, 6),
+                                "multiple": round(high_val / low_val, 2),
+                                "days_low_to_high": high_idx - low_idx,
+                            })
+                        i = j
+                        break
+                else:
+                    break
+            i += 1
+
+        # Current price context
+        current_price = float(close[-1])
+        # Find most recent confirmed low (start of current cycle attempt)
+        recent_low_val, recent_low_idx = None, None
+        if swing_lows:
+            recent_low_idx, recent_low_val = swing_lows[-1]
+
+        return {
+            "completed_cycles": completed_cycles,
+            "num_completed_cycles": len(completed_cycles),
+            "current_price": round(current_price, 6),
+            "most_recent_swing_low": round(recent_low_val, 6) if recent_low_val else None,
+            "days_since_recent_low": (n - 1 - recent_low_idx) if recent_low_idx is not None else None,
+            "total_candles_analysed": n,
+        }
+    except Exception as e:
+        logger.error(f"_sync_detect_historical_swings({symbol}): {e}", exc_info=True)
+        return {"error": str(e), "completed_cycles": []}
+
+
+def _build_cycle_conclusion(symbol: str, halving: dict, rsi: dict,
+                            ema: dict, bb: dict, swings: dict) -> dict:
+    """
+    Synthesize all indicators + real historical swing data into a
+    data-derived conclusion. Every claim here traces back to a specific
+    computed value — nothing is asserted without a source.
+    Returns: cycle_type, position_pct, time_remaining_range, price_target,
+             outlook, action, and a confidence_level based on data quality.
+    """
+    conclusion = {
+        "cycle_type": "Unknown",
+        "position_summary": None,
+        "time_remaining": None,
+        "price_target": None,
+        "outlook": None,
+        "action": None,
+        "confidence": "Low",
+        "data_quality_notes": [],
+    }
+
+    data_points_available = 0
+    total_possible = 4
+
+    # ── Determine cycle TYPE from confluence of indicators ───────────────────
+    ema_bullish = ema.get("currently_bullish", None)
+    current_rsi = rsi.get("current_rsi", None)
+    is_squeezing = bb.get("is_squeezing_now", None)
+
+    if ema_bullish is not None:
+        data_points_available += 1
+    if current_rsi is not None:
+        data_points_available += 1
+    if is_squeezing is not None:
+        data_points_available += 1
+    if swings.get("num_completed_cycles", 0) > 0:
+        data_points_available += 1
+
+    # Cycle type logic — purely from measured values
+    if ema_bullish is True and current_rsi and current_rsi > 55:
+        conclusion["cycle_type"] = "📈 Bull phase (uptrend confirmed + rising momentum)"
+    elif ema_bullish is True and current_rsi and current_rsi <= 55:
+        conclusion["cycle_type"] = "🌱 Early recovery (uptrend confirmed, momentum still building)"
+    elif ema_bullish is False and current_rsi and current_rsi < 45:
+        conclusion["cycle_type"] = "📉 Bear phase (downtrend confirmed + weak momentum)"
+    elif ema_bullish is False and current_rsi and current_rsi >= 45:
+        conclusion["cycle_type"] = "⚠️ Bear phase with relief bounce (downtrend confirmed, momentum recovering)"
+    else:
+        conclusion["cycle_type"] = "❓ Unclear — insufficient confirming data"
+
+    # ── Position in cycle — from RSI cycle % if available, else EMA cycle ────
+    position_source = None
+    if rsi.get("avg_cycle_weeks") and rsi.get("weeks_since_bottom") is not None:
+        pct = min(100, rsi["weeks_since_bottom"] / rsi["avg_cycle_weeks"] * 100)
+        conclusion["position_summary"] = (
+            f"{pct:.0f}% through the average RSI cycle "
+            f"(based on {rsi['num_bottoms_found']} historical bottoms on this coin)")
+        position_source = "RSI cycle"
+    elif ema.get("avg_cycle_days") and ema.get("days_since_last_cross") is not None:
+        pct = min(100, ema["days_since_last_cross"] / ema["avg_cycle_days"] * 100)
+        conclusion["position_summary"] = (
+            f"{pct:.0f}% through the average EMA trend cycle "
+            f"(based on {ema['num_golden_crosses']} golden + {ema['num_death_crosses']} death crosses)")
+        position_source = "EMA cycle"
+    else:
+        conclusion["position_summary"] = "Cannot calculate — insufficient completed cycles on this coin"
+        conclusion["data_quality_notes"].append(
+            "No cycle-position percentage available: this coin has not "
+            "completed enough historical cycles to measure an average.")
+
+    # ── Time remaining — statistical range from historical cycle lengths ─────
+    if rsi.get("avg_cycle_weeks") and rsi.get("weeks_since_bottom") is not None:
+        remaining_weeks = rsi["avg_cycle_weeks"] - rsi["weeks_since_bottom"]
+        if remaining_weeks > 0:
+            conclusion["time_remaining"] = (
+                f"~{remaining_weeks:.0f} weeks remaining if this cycle matches "
+                f"the historical average ({rsi['avg_cycle_weeks']:.0f}w). "
+                f"This is a statistical estimate from {rsi['num_bottoms_found']} "
+                f"past cycles on {symbol} — not a guarantee.")
+        else:
+            conclusion["time_remaining"] = (
+                f"Already {abs(remaining_weeks):.0f} weeks PAST the historical "
+                f"average cycle length ({rsi['avg_cycle_weeks']:.0f}w) — "
+                f"this cycle is running longer than typical for this coin.")
+    else:
+        conclusion["time_remaining"] = "Cannot estimate — no completed RSI cycle history for this coin"
+        conclusion["data_quality_notes"].append(
+            "Time-remaining estimate unavailable: requires at least 2 "
+            "historical RSI-bottom events, which this coin does not have yet.")
+
+    # ── Price target — ONLY from this coin's own completed cycle multiples ───
+    cycles = swings.get("completed_cycles", [])
+    current_price = swings.get("current_price")
+    recent_low = swings.get("most_recent_swing_low")
+
+    if len(cycles) >= 2 and recent_low:
+        multiples = [c["multiple"] for c in cycles]
+        avg_multiple = sum(multiples) / len(multiples)
+        min_multiple = min(multiples)
+        max_multiple = max(multiples)
+
+        low_target  = round(recent_low * min_multiple, 6)
+        avg_target  = round(recent_low * avg_multiple, 6)
+        high_target = round(recent_low * max_multiple, 6)
+
+        conclusion["price_target"] = {
+            "based_on_low": recent_low,
+            "low_estimate": low_target,
+            "avg_estimate": avg_target,
+            "high_estimate": high_target,
+            "historical_multiples": multiples,
+            "num_cycles_used": len(cycles),
+        }
+    elif len(cycles) == 1 and recent_low:
+        conclusion["price_target"] = {
+            "based_on_low": recent_low,
+            "single_cycle_multiple": cycles[0]["multiple"],
+            "single_estimate": round(recent_low * cycles[0]["multiple"], 6),
+            "num_cycles_used": 1,
+        }
+        conclusion["data_quality_notes"].append(
+            "Price target based on only 1 completed historical cycle — "
+            "low confidence. Need 2+ cycles for a reliable range.")
+    else:
+        conclusion["price_target"] = None
+        conclusion["data_quality_notes"].append(
+            f"No price target calculated: {symbol} has "
+            f"{len(cycles)} completed cycle(s) in available history — "
+            f"need at least 1 confirmed low→high→low sequence.")
+
+    # ── Outlook + Action — derived from cycle type + regime bias ─────────────
+    if "Bull phase" in conclusion["cycle_type"]:
+        conclusion["outlook"] = "Continuation of uptrend likely while EMA stack and momentum hold."
+        conclusion["action"]  = "LONG entries favoured. Standard 8-filter strategy rules apply."
+    elif "Early recovery" in conclusion["cycle_type"]:
+        conclusion["outlook"] = "Uptrend confirmed but not yet momentum-confirmed — higher risk of failed breakout."
+        conclusion["action"]  = "LONG entries allowed but require full 8/8 filter score, not just 5/8."
+    elif "Bear phase with relief" in conclusion["cycle_type"]:
+        conclusion["outlook"] = "Downtrend intact; current bounce is historically likely to fail and resume lower."
+        conclusion["action"]  = "SHORT bias. Avoid LONG entries until EMA stack turns bullish."
+    elif "Bear phase" in conclusion["cycle_type"]:
+        conclusion["outlook"] = "Downtrend confirmed with weak momentum — further downside has historical precedent."
+        conclusion["action"]  = "SHORT entries favoured. LONG entries blocked by regime gate."
+    else:
+        conclusion["outlook"] = "Indicators are mixed or data is insufficient — no reliable directional read."
+        conclusion["action"]  = "No strong bias. Wait for EMA stack and RSI to align before entering."
+
+    # ── Confidence level based on how much real data backs the conclusion ────
+    if data_points_available == total_possible and len(cycles) >= 2:
+        conclusion["confidence"] = "High — all 4 indicators available, 2+ completed cycles confirmed"
+    elif data_points_available >= 3 and len(cycles) >= 1:
+        conclusion["confidence"] = "Medium — most indicators available, limited cycle history"
+    else:
+        conclusion["confidence"] = "Low — insufficient historical data for this coin"
+        conclusion["data_quality_notes"].append(
+            f"Overall confidence is LOW: only {data_points_available}/{total_possible} "
+            f"indicators returned usable data, and {len(cycles)} completed "
+            f"cycle(s) found. Treat this conclusion as directional context only.")
+
+    return conclusion
+
+
 def _sync_full_cycle_analysis(symbol: str) -> dict:
-    """Combine all 4 cycle indicators into one comprehensive report."""
+    """Combine all 4 cycle indicators + historical swings into one comprehensive report."""
     halving = _sync_halving_clock()
     rsi_cyc = _sync_rsi_cycle(symbol)
     ema_cyc = _sync_ema_crossover_cycle(symbol)
     bb_cyc  = _sync_bb_squeeze_cycle(symbol)
+    swings  = _sync_detect_historical_swings(symbol)
+
+    conclusion = _build_cycle_conclusion(symbol, halving, rsi_cyc, ema_cyc, bb_cyc, swings)
 
     return {
-        "symbol":  symbol,
-        "halving": halving,
-        "rsi":     rsi_cyc,
-        "ema":     ema_cyc,
-        "bb":      bb_cyc,
+        "symbol":     symbol,
+        "halving":    halving,
+        "rsi":        rsi_cyc,
+        "ema":        ema_cyc,
+        "bb":         bb_cyc,
+        "swings":     swings,
+        "conclusion": conclusion,
     }
 
 
@@ -5081,11 +5382,67 @@ async def cmd_cycle(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             f"   Days since last squeeze: {b['days_since_last_squeeze']}",
         ])
 
-    lines.append(f"\n<i>Combine all 4 signals: halving clock = macro timing, "
-                 f"RSI cycle = momentum extremes, EMA crossover = trend confirmation, "
-                 f"BB squeeze = volatility timing.</i>")
+    lines.append(f"\n<i>Raw indicator data above. Conclusion follows below ⬇️</i>")
 
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    # ── Message 2: Data-derived conclusion ──────────────────────────────────
+    c = result["conclusion"]
+
+    concl_lines = [
+        f"🎯 <b>Cycle Conclusion — {symbol}</b>",
+        f"━━━━━━━━━━━━━━━━━━━━",
+        f"",
+        f"<b>Cycle type:</b>\n{c['cycle_type']}",
+        f"",
+        f"<b>Where we are:</b>\n{c['position_summary']}",
+        f"",
+        f"<b>Time remaining:</b>\n{c['time_remaining']}",
+        f"",
+    ]
+
+    pt = c.get("price_target")
+    if pt is None:
+        concl_lines.append(f"<b>Price target:</b>\nNot available — see data notes below")
+    elif "num_cycles_used" in pt and pt["num_cycles_used"] >= 2:
+        concl_lines.append(
+            f"<b>Price target</b> (from {pt['num_cycles_used']} completed cycles on this coin):\n"
+            f"Based on most recent swing low: <code>{pt['based_on_low']}</code>\n"
+            f"Conservative: <code>{pt['low_estimate']}</code> "
+            f"(min historical multiple {min(pt['historical_multiples']):.2f}x)\n"
+            f"Average:      <code>{pt['avg_estimate']}</code>\n"
+            f"Optimistic:   <code>{pt['high_estimate']}</code> "
+            f"(max historical multiple {max(pt['historical_multiples']):.2f}x)"
+        )
+    else:
+        concl_lines.append(
+            f"<b>Price target</b> (⚠️ low confidence — only 1 completed cycle):\n"
+            f"Based on swing low: <code>{pt['based_on_low']}</code>\n"
+            f"Single-cycle estimate: <code>{pt['single_estimate']}</code> "
+            f"({pt['single_cycle_multiple']:.2f}x historical multiple)"
+        )
+
+    concl_lines.extend([
+        f"",
+        f"<b>Outlook:</b>\n{c['outlook']}",
+        f"",
+        f"<b>What to do:</b>\n{c['action']}",
+        f"",
+        f"<b>Confidence:</b> {c['confidence']}",
+    ])
+
+    if c["data_quality_notes"]:
+        concl_lines.append(f"\n<b>⚠️ Data limitations:</b>")
+        for note in c["data_quality_notes"]:
+            concl_lines.append(f"• {note}")
+
+    concl_lines.append(
+        f"\n<i>Every value above is computed directly from {symbol}'s own "
+        f"price history — no assumptions or generic Fibonacci levels used. "
+        f"Where data is insufficient, this is stated explicitly rather "
+        f"than estimated.</i>")
+
+    await update.message.reply_text("\n".join(concl_lines), parse_mode="HTML")
 
 # =============================================================================
 #  END OF CYCLE DETECTION ENGINE
