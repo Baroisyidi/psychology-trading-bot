@@ -206,6 +206,19 @@ consec_losses:     int                    = 0
 last_reset_day:    str                    = ""
 last_reset_week:   str                    = ""
 
+# ── Whipsaw circuit breaker (per-symbol) ──────────────────────────────────
+# Tracks rapid open->close round trips (< 20 min hold time). If a symbol
+# whipsaws 2+ times within 60 minutes, that symbol is paused for 2 hours
+# and the owner is alerted — this is a safety net independent of any
+# specific root cause, so it protects against whipsaw loops even from
+# bugs we haven't found yet.
+QUICK_EXIT_THRESHOLD_MIN = 20     # trade held < this = counts as "quick"
+WHIPSAW_WINDOW_MIN       = 60     # look for repeats within this window
+WHIPSAW_TRIGGER_COUNT    = 2      # this many quick exits = whipsaw detected
+WHIPSAW_COOLDOWN_MIN     = 120    # pause the symbol for this long
+symbol_quick_exit_times: dict[str, list]  = {}   # symbol -> [timestamps]
+symbol_cooldown_until:   dict[str, float] = {}   # symbol -> unix ts
+
 # ── MemeBot global state ───────────────────────────────────────────────────
 meme_symbols:       list[str]             = []
 meme_positions:     dict[str, dict]       = {}   # symbol -> memecoin position
@@ -696,6 +709,19 @@ def _compute_indicators(
     price  = float(df_1d["close"].iloc[-1])
     debug["price"] = price
 
+    # CRITICAL: for Daily-timeframe STRUCTURAL indicators (EMA stack, Ichimoku
+    # cloud, MACD) we must use only CLOSED daily candles — never the still-
+    # forming live candle. The live candle's close changes every 10 seconds
+    # as price ticks, which can flip a borderline EMA/cloud/MACD reading back
+    # and forth many times per minute. This MUST match the data basis used
+    # by _check_ema_exit() (which already correctly drops the live candle),
+    # otherwise entry and exit can be evaluated on different data and
+    # contradict each other within seconds — causing rapid open/close
+    # whipsaw loops that bleed fees with no real price movement.
+    # `price` above stays LIVE (that's the real price we'd actually trade
+    # at) — only the indicator LINES themselves are computed from closed data.
+    df_1d_closed = df_1d.iloc[:-1] if len(df_1d) > 1 else df_1d
+
     def ema(df: pd.DataFrame, p: int) -> pd.Series:
         return df["close"].ewm(span=p, adjust=False).mean()
 
@@ -708,11 +734,11 @@ def _compute_indicators(
     debug["adx"] = round(adx, 2)
     (passed if adx > 20 else failed).append("ADX>20")
 
-    # Filter 2 — Ichimoku Cloud (Daily)
-    conv  = (df_1d["high"].rolling(ICHI_CONV).max()  + df_1d["low"].rolling(ICHI_CONV).min())  / 2
-    base  = (df_1d["high"].rolling(ICHI_BASE).max()  + df_1d["low"].rolling(ICHI_BASE).min())  / 2
+    # Filter 2 — Ichimoku Cloud (Daily) — uses CLOSED candles only (see note above)
+    conv  = (df_1d_closed["high"].rolling(ICHI_CONV).max()  + df_1d_closed["low"].rolling(ICHI_CONV).min())  / 2
+    base  = (df_1d_closed["high"].rolling(ICHI_BASE).max()  + df_1d_closed["low"].rolling(ICHI_BASE).min())  / 2
     spa   = ((conv + base) / 2).shift(ICHI_BASE)
-    spb   = ((df_1d["high"].rolling(ICHI_SPAN).max() + df_1d["low"].rolling(ICHI_SPAN).min()) / 2).shift(ICHI_BASE)
+    spb   = ((df_1d_closed["high"].rolling(ICHI_SPAN).max() + df_1d_closed["low"].rolling(ICHI_SPAN).min()) / 2).shift(ICHI_BASE)
     ct = max(float(spa.iloc[-1]), float(spb.iloc[-1]))
     cb = min(float(spa.iloc[-1]), float(spb.iloc[-1]))
     debug["cloud_top"] = round(ct, 2)
@@ -744,11 +770,15 @@ def _compute_indicators(
     else:
         (passed if st_dir == -1 else failed).append("SupertrendSELL")
 
-    # Filter 5 (MANDATORY) — EMA alignment (Daily)
-    e20  = float(ema(df_1d, 20).iloc[-1])
-    e50  = float(ema(df_1d, 50).iloc[-1])
-    e100 = float(ema(df_1d, 100).iloc[-1])
-    e200 = float(ema(df_1d, 200).iloc[-1])
+    # Filter 5 (MANDATORY) — EMA alignment (Daily) — CLOSED candles only.
+    # This now matches _check_ema_exit()'s data basis exactly, so a fresh
+    # entry can never be immediately contradicted by the exit check reading
+    # different (live vs closed) data — the root cause of rapid-fire
+    # open/close whipsaw loops seen on low-liquidity symbols.
+    e20  = float(ema(df_1d_closed, 20).iloc[-1])
+    e50  = float(ema(df_1d_closed, 50).iloc[-1])
+    e100 = float(ema(df_1d_closed, 100).iloc[-1])
+    e200 = float(ema(df_1d_closed, 200).iloc[-1])
     debug["emas_daily"] = {20: round(e20,2), 50: round(e50,2),
                            100: round(e100,2), 200: round(e200,2)}
     if direction == "LONG":
@@ -758,8 +788,8 @@ def _compute_indicators(
         ema_ok = (e20 < e50 < e100 < e200) and (price < e50)
         (passed if ema_ok else failed).append("EMA_Bearish_Stack")
 
-    # Filter 6 — MACD (Daily)
-    macd = ta.macd(df_1d["close"], fast=MACD_FAST, slow=MACD_SLOW, signal=MACD_SIG)
+    # Filter 6 — MACD (Daily) — CLOSED candles only (see note above)
+    macd = ta.macd(df_1d_closed["close"], fast=MACD_FAST, slow=MACD_SLOW, signal=MACD_SIG)
     if macd is not None:
         m   = float(macd[f"MACD_{MACD_FAST}_{MACD_SLOW}_{MACD_SIG}"].iloc[-1])
         sig = float(macd[f"MACDs_{MACD_FAST}_{MACD_SLOW}_{MACD_SIG}"].iloc[-1])
@@ -1202,7 +1232,18 @@ async def manage_position(pos: dict, bot) -> None:
         return
 
     # ── EMA inversion exit ───────────────────────────────────────────────────
-    ema_exit = await asyncio.to_thread(_check_ema_exit, df_1d, direction)
+    # SAFETY NET: never allow this exit within the first 15 minutes of a
+    # fresh entry, regardless of what the indicator says. This protects
+    # against any residual data-timing edge case (not just the live-vs-closed
+    # candle mismatch that was the root cause here) causing an immediate
+    # open->close whipsaw. A genuine EMA structure inversion persists for
+    # hours/days — it will still be there 15 minutes later if it's real.
+    trade_age_minutes = (time.time() - pos["entry_time"]) / 60
+    if trade_age_minutes < 15:
+        ema_exit = False
+    else:
+        ema_exit = await asyncio.to_thread(_check_ema_exit, df_1d, direction)
+
     if ema_exit:
         await close_full(symbol, direction)
         pnl = _est_pnl(pos, current_price)
@@ -1212,9 +1253,25 @@ async def manage_position(pos: dict, bot) -> None:
             f"Closed @ <code>{current_price:.4f}</code>\n"
             f"Est. PnL: {pnl:+.2f} USDT\n"
             f"Bot goes FLAT on {symbol}. Checking for reversal entry...")
-        # Check for reversal entry
-        await check_reversal_after_exit(symbol, direction, bot)
-        _close_pos(symbol, pnl, exit_price=current_price, exit_reason="EMA_EXIT")
+        # Close bookkeeping FIRST — must happen before checking for a
+        # reversal entry, otherwise a freshly-opened reversal position
+        # would get its data wiped by this same close call afterward.
+        whipsaw = _close_pos(symbol, pnl, exit_price=current_price, exit_reason="EMA_EXIT")
+        if whipsaw:
+            await alert(bot,
+                f"🚨 <b>WHIPSAW DETECTED — {symbol}</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"{QUICK_EXIT_THRESHOLD_MIN}+ minute trades closed rapidly "
+                f"{WHIPSAW_TRIGGER_COUNT}+ times within {WHIPSAW_WINDOW_MIN} minutes.\n"
+                f"⏸ {symbol} PAUSED for {WHIPSAW_COOLDOWN_MIN} minutes — "
+                f"no new entries until cooldown expires.\n"
+                f"This protects your balance from repeated fee-bleed on a "
+                f"choppy/borderline signal. Use /resume to override early "
+                f"if you believe this is a false positive.")
+        else:
+            # Only check for reversal if this wasn't flagged as a whipsaw —
+            # no point immediately re-entering right after a rapid flip.
+            await check_reversal_after_exit(symbol, direction, bot)
         return
 
     # ── Stop loss hit ────────────────────────────────────────────────────────
@@ -1233,7 +1290,18 @@ async def manage_position(pos: dict, bot) -> None:
             f"Est. PnL: {pnl:+.2f} USDT\n"
             f"Consecutive losses: {consec_losses}{loss_warn}\n"
             f"Bot goes FLAT on {symbol}. Waiting for next valid signal.")
-        _close_pos(symbol, pnl, exit_price=current_price, exit_reason="SL")
+        whipsaw = _close_pos(symbol, pnl, exit_price=current_price, exit_reason="SL")
+        if whipsaw:
+            await alert(bot,
+                f"🚨 <b>WHIPSAW DETECTED — {symbol}</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"{QUICK_EXIT_THRESHOLD_MIN}+ minute trades closed rapidly "
+                f"{WHIPSAW_TRIGGER_COUNT}+ times within {WHIPSAW_WINDOW_MIN} minutes.\n"
+                f"⏸ {symbol} PAUSED for {WHIPSAW_COOLDOWN_MIN} minutes — "
+                f"no new entries until cooldown expires.\n"
+                f"This protects your balance from repeated fee-bleed on a "
+                f"choppy/borderline signal. Use /resume to override early "
+                f"if you believe this is a false positive.")
         return
 
     # ── Regime context for this position ────────────────────────────────────
@@ -1328,8 +1396,28 @@ def _close_pos(symbol: str, pnl: float, exit_price: float = 0.0,
     pos = symbol_positions.get(symbol)
     if pos and exit_price > 0:
         _record_trade(pos, exit_price, pnl, exit_reason, bot_type="psych")
+
+    # ── Whipsaw detection ──────────────────────────────────────────────────
+    # If this trade was held for less than QUICK_EXIT_THRESHOLD_MIN, log it.
+    # If enough quick exits pile up for this symbol within WHIPSAW_WINDOW_MIN,
+    # pause the symbol so it can't immediately re-enter and repeat the loop.
+    whipsaw_triggered = False
+    if pos:
+        hold_minutes = (time.time() - pos.get("entry_time", time.time())) / 60
+        if hold_minutes < QUICK_EXIT_THRESHOLD_MIN:
+            now = time.time()
+            history = symbol_quick_exit_times.get(symbol, [])
+            history = [t for t in history if now - t <= WHIPSAW_WINDOW_MIN * 60]
+            history.append(now)
+            symbol_quick_exit_times[symbol] = history
+            if len(history) >= WHIPSAW_TRIGGER_COUNT:
+                symbol_cooldown_until[symbol] = now + WHIPSAW_COOLDOWN_MIN * 60
+                symbol_quick_exit_times[symbol] = []  # reset counter after triggering
+                whipsaw_triggered = True
+
     symbol_positions.pop(symbol, None)
     save_state()
+    return whipsaw_triggered
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  REVERSAL CHECK — called after exit, checks if opposite trade is valid
@@ -1851,6 +1939,16 @@ async def _monitor_symbol_inner(symbol: str, bot, job_data: dict) -> None:
     regime_conf    = regime_result["confidence"]
     logger.info(f"[{symbol}] Regime: {regime_label(current_regime)} ({regime_conf}%)")
 
+    # ── Whipsaw cooldown gate ─────────────────────────────────────────────────
+    # If this symbol recently whipsawed (rapid open/close loop), skip all
+    # entry scanning until the cooldown expires — even if regime/filters
+    # would otherwise say to enter.
+    cooldown_until = symbol_cooldown_until.get(symbol)
+    if cooldown_until and time.time() < cooldown_until:
+        remaining_min = round((cooldown_until - time.time()) / 60)
+        logger.info(f"[{symbol}] In whipsaw cooldown — {remaining_min}m remaining. Skipping scan.")
+        return
+
     # CHOPPY regime — skip new entries entirely
     if current_regime == REGIME_CHOPPY_RANGING:
         logger.info(f"[{symbol}] Regime CHOPPY ({regime_conf}%) — skipping entry scan")
@@ -2198,6 +2296,17 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"<b>Watching:</b> {', '.join(monitored_symbols) or 'None'}",
         "",
     ]
+
+    # Show any symbols currently in whipsaw cooldown
+    now = time.time()
+    active_cooldowns = {s: u for s, u in symbol_cooldown_until.items() if u > now}
+    if active_cooldowns:
+        lines.append("<b>⏸ Whipsaw cooldowns active:</b>")
+        for sym, until in active_cooldowns.items():
+            remaining_min = round((until - now) / 60)
+            lines.append(f"  {sym}: {remaining_min}m remaining (use /resume to clear early)")
+        lines.append("")
+
     if symbol_positions:
         lines.append("<b>Open Positions:</b>")
         for sym, pos in symbol_positions.items():
@@ -2294,12 +2403,19 @@ async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         for job in ctx.job_queue.jobs():
             if job.data and isinstance(job.data, dict):
                 job.data["circuit_alerted"] = False
+    # Clear any whipsaw cooldowns — user is manually overriding
+    cleared_symbols = list(symbol_cooldown_until.keys())
+    symbol_cooldown_until.clear()
+    symbol_quick_exit_times.clear()
     save_state()
+    cooldown_note = (f"\nWhipsaw cooldowns cleared: {', '.join(cleared_symbols)}"
+                     if cleared_symbols else "")
     await update.message.reply_text(
         "▶️ <b>Bot resumed.</b>\n"
         "Consecutive losses: reset to 0\n"
         "Daily/weekly loss counters: reset\n"
-        "Circuit breaker: cleared\n"
+        "Circuit breaker: cleared"
+        f"{cooldown_note}\n"
         "Bot is now actively scanning for entries.",
         parse_mode="HTML")
 
