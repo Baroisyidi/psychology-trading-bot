@@ -79,10 +79,46 @@ except ValueError:
 
 # ── PsychologyBot trading params ──────────────────────────────────────────
 LEVERAGE         = 10
-POSITION_PCT     = 0.20     # 20% of balance per symbol
+POSITION_PCT     = 0.20     # 20% of balance per symbol (used as a CEILING now,
+                             # not the direct sizing input — see RISK_PCT below)
 POLL_INTERVAL    = 10       # seconds between monitor cycles
 DEAD_TRADE_DAYS  = 7        # close dead trade after 7 days
 SL_BUFFER        = 0.02     # 2% breathing room on initial SL
+
+# ── Volatility-normalized risk management ──────────────────────────────────
+# PROBLEM THIS SOLVES: a fixed 20% position + fixed 2% SL buffer means
+# BTC (calm) and a volatile alt like HYPE get identical dollar risk exposure
+# per trade even though HYPE can move 3-5x further in the same timeframe.
+# Real-data backtesting (/backtest_compare across 9 coins) showed BTC/HYPE
+# losing money on a fixed-SL approach — a clean signature of SL distance
+# not being scaled to each coin's own volatility.
+#
+# FIX: risk-based position sizing. RISK_PCT is the % of balance you're
+# willing to lose if SL is hit — this stays CONSTANT across all coins.
+# Position size is then SOLVED FOR given the SL distance (which itself is
+# now ATR-scaled per coin), so a volatile coin with a wide SL automatically
+# gets a smaller position, and a calm coin with a tight SL gets a larger
+# position — but the DOLLAR risk if wrong is the same either way.
+RISK_PCT           = 0.02   # risk 2% of balance per trade if SL is hit
+SL_ATR_MULT        = 1.5    # SL distance = 1.5× ATR(14) on 4H, floor/ceiling below
+SL_MIN_PCT         = 0.01   # never let SL be tighter than 1% (avoid noise stop-outs)
+SL_MAX_PCT         = 0.06   # never let SL be wider than 6% (caps worst-case risk)
+MAX_POSITION_PCT   = 0.30   # hard ceiling: position value never exceeds 30% of
+                             # balance even if risk-sizing would suggest more
+                             # (protects against a freakishly tight ATR implying
+                             # an oversized position for the same $ risk)
+
+# ── Health-score entry gating ───────────────────────────────────────────────
+# Wires /health's LONG/SHORT scores into live entry decisions. A coin with
+# weak LONG health (structurally declining) needs a stronger signal (more
+# of the 6 optional filters) to justify a LONG — and vice versa for SHORT.
+# Cached per-symbol with a TTL since health score requires fetching 400
+# days of data — too expensive to recompute every 10-second scan tick.
+HEALTH_CACHE_TTL_SEC = 3600   # recompute health score at most once per hour
+HEALTH_BLOCK_BELOW   = 35     # below this score, direction is blocked entirely
+HEALTH_RAISE_BAR_BELOW = 55   # below this score, require 4 of 6 optional filters
+                               # (raised from the normal 3 of 6)
+symbol_health_cache: dict[str, dict] = {}   # symbol -> {"long":.., "short":.., "ts":..}
 
 # ── MemeBot trading params (volatile coins — 5m/3m timeframes) ────────────
 MEME_LEVERAGE        = 5        # Hard cap 5x — memecoins wick massively
@@ -725,14 +761,32 @@ def _compute_indicators(
     def ema(df: pd.DataFrame, p: int) -> pd.Series:
         return df["close"].ewm(span=p, adjust=False).mean()
 
-    # Filter 1 — ADX > 20 (4H)
+    # Filter 1 — ADX relative to the coin's OWN baseline (4H)
+    # FIX (was fixed ADX>20 for every coin): "trending" means something
+    # different in absolute ADX terms for BTC vs a newer, choppier perp.
+    # Now requires ADX to be above this coin's own recent average — i.e.
+    # currently trending MORE than its typical/baseline state — plus a
+    # low absolute floor (12) to reject genuinely flat/dead markets that
+    # happen to sit above their own (also low) baseline.
     try:
-        adx_df = ta.adx(df_4h["high"], df_4h["low"], df_4h["close"], length=ADX_PERIOD)
-        adx = float(adx_df[f"ADX_{ADX_PERIOD}"].iloc[-1])
+        adx_series = ta.adx(df_4h["high"], df_4h["low"], df_4h["close"], length=ADX_PERIOD)[f"ADX_{ADX_PERIOD}"]
+        adx = float(adx_series.iloc[-1])
+        adx_baseline = float(adx_series.tail(90).mean()) if len(adx_series) >= 90 else 20.0
     except Exception:
-        adx = 0.0
+        adx, adx_baseline = 0.0, 20.0
     debug["adx"] = round(adx, 2)
-    (passed if adx > 20 else failed).append("ADX>20")
+    debug["adx_baseline"] = round(adx_baseline, 2)
+    adx_relative_ok = adx > adx_baseline
+    adx_absolute_floor_ok = adx > 12   # reject genuinely dead/flat markets outright
+    (passed if (adx_relative_ok and adx_absolute_floor_ok) else failed).append("ADX>Baseline")
+
+    # ATR(14) on 4H — used for volatility-normalized SL/sizing downstream
+    try:
+        atr_series_4h = ta.atr(df_4h["high"], df_4h["low"], df_4h["close"], length=14)
+        atr = float(atr_series_4h.iloc[-1]) if atr_series_4h is not None and pd.notna(atr_series_4h.iloc[-1]) else price*0.02
+    except Exception:
+        atr = price * 0.02
+    debug["atr"] = round(atr, 6)
 
     # Filter 2 — Ichimoku Cloud (Daily) — uses CLOSED candles only (see note above)
     conv  = (df_1d_closed["high"].rolling(ICHI_CONV).max()  + df_1d_closed["low"].rolling(ICHI_CONV).min())  / 2
@@ -840,6 +894,7 @@ def _compute_indicators(
         "failed":  failed,
         "debug":   debug,
         "e100_4h": e100_4h,
+        "atr":     atr,
     }
 
 def _check_ema_exit(df_1d: pd.DataFrame, direction: str) -> bool:
@@ -879,24 +934,46 @@ def _round_qty(qty: float, min_q: float, step: float = 0.0) -> float:
 def _calc_sl(entry: float, direction: str, e100_4h: float,
              regime: str = REGIME_UNKNOWN, atr: float = 0.0) -> float:
     """
-    Regime-aware SL calculation:
-    - Volatile Breakout: tighter SL at 0.8× ATR (fast exit if breakout fails)
-    - All others: standard SL at 4H EMA100 − 2% buffer
+    Volatility-normalized SL calculation.
+
+    FIX (was a fixed 2% buffer for every coin): real-data backtesting
+    (/backtest_compare across 9 coins) showed a fixed-percentage SL losing
+    money on both calm coins (BTC) and volatile coins (HYPE) — a flat 2%
+    buffer means nothing consistent across coins with very different
+    typical daily ranges. A volatile coin gets stopped out by normal noise;
+    a calm coin's SL is needlessly wide relative to its real risk.
+
+    Now: SL distance = SL_ATR_MULT × ATR(14, 4H), clamped between
+    SL_MIN_PCT and SL_MAX_PCT of entry price. This means SL distance
+    scales with each coin's OWN actual volatility instead of one fixed
+    number for every symbol. The former EMA100-anchored structural level
+    is dropped in favor of this — ATR captures the same "give it room"
+    intent in a coin-relative, principled way.
+
+    - Volatile Breakout regime: tighter SL at 0.8× ATR (fast exit if a
+      breakout fails) — kept as before, still the most sensitive case.
     """
     if regime == REGIME_VOLATILE_BREAKOUT and atr > 0:
-        # Tight ATR-based SL — 0.8× ATR from entry
         sl_dist = atr * 0.8
         if direction == "LONG":
             return round(entry - sl_dist, 6)
         else:
             return round(entry + sl_dist, 6)
-    # Standard SL
-    if direction == "LONG":
-        base = min(e100_4h, entry * (1 - 0.015))
-        return round(base * (1 - SL_BUFFER), 6)
+
+    # Standard case: volatility-scaled via ATR, clamped to a sane range
+    if atr > 0:
+        atr_pct_frac = atr / entry
+        raw_dist_frac = SL_ATR_MULT * atr_pct_frac
+        clamped_dist_frac = min(max(raw_dist_frac, SL_MIN_PCT), SL_MAX_PCT)
+        dist = entry * clamped_dist_frac
     else:
-        base = max(e100_4h, entry * (1 + 0.015))
-        return round(base * (1 + SL_BUFFER), 6)
+        # Fallback if ATR unavailable — old fixed-2% behavior as a safety net
+        dist = entry * 0.02
+
+    if direction == "LONG":
+        return round(entry - dist, 6)
+    else:
+        return round(entry + dist, 6)
 
 def _calc_tps(entry: float, sl: float, direction: str):
     risk = abs(entry - sl)
@@ -904,6 +981,33 @@ def _calc_tps(entry: float, sl: float, direction: str):
         return round(entry + risk * 1.5, 6), round(entry + risk * 3.0, 6)
     else:
         return round(entry - risk * 1.5, 6), round(entry - risk * 3.0, 6)
+
+def _calc_risk_based_qty(balance: float, entry: float, sl: float, leverage: float) -> float:
+    """
+    FIX (was fixed 20% of balance for every trade, regardless of SL
+    distance): solves for position size such that RISK_PCT of balance is
+    lost if SL is hit — REGARDLESS of how wide or tight that coin's
+    volatility-scaled SL turned out to be. A volatile coin with a wide SL
+    automatically gets a SMALLER position; a calm coin with a tight SL
+    gets a LARGER position (up to a hard ceiling) — but the dollar risk
+    if wrong stays the same either way, instead of swinging wildly by coin.
+    """
+    sl_dist_frac = abs(entry - sl) / entry
+    if sl_dist_frac <= 0:
+        sl_dist_frac = 0.02  # safety fallback, should not normally happen
+
+    risk_amount = balance * RISK_PCT
+    qty = risk_amount / (sl_dist_frac * entry)
+
+    # Hard ceiling: position notional value never exceeds MAX_POSITION_PCT
+    # of balance × leverage, even if risk-sizing math would suggest more
+    # (protects against an anomalously tight ATR implying an oversized
+    # position for the same dollar risk).
+    max_notional = balance * MAX_POSITION_PCT * leverage
+    max_qty = max_notional / entry
+    qty = min(qty, max_qty)
+
+    return qty
 
 def _est_pnl(pos: dict, price: float) -> float:
     """
@@ -943,19 +1047,22 @@ async def open_trade(symbol: str, direction: str, indicators: dict, bot) -> None
         await alert(bot, f"⚠️ [{symbol}] Cannot fetch balance — trade skipped.")
         return
 
-    sl       = _calc_sl(entry, direction, indicators["e100_4h"])
+    atr_val  = indicators.get("atr", 0.0)
+    current_regime = indicators.get("regime", REGIME_UNKNOWN)
+    sl       = _calc_sl(entry, direction, indicators["e100_4h"], regime=current_regime, atr=atr_val)
     tp1, tp2 = _calc_tps(entry, sl, direction)
     min_q, max_q, step, min_notional, max_lev = await get_instrument_constraints(symbol)
     effective_lev = actual_lev
 
-    # ── REGIME ADAPTATION — position size and leverage ──────────────────────
-    # Volatile Breakout: halve position, cap leverage at 5x
-    # All other regimes: normal sizing
-    current_regime = indicators.get("regime", REGIME_UNKNOWN)
+    # ── REGIME ADAPTATION — leverage cap + extra caution multiplier ─────────
+    # Base sizing is now RISK-BASED (see _calc_risk_based_qty): position
+    # size is solved from the volatility-scaled SL distance so that
+    # RISK_PCT of balance is at stake regardless of which coin/how wide
+    # the ATR-based SL turned out to be. Volatile Breakout regime still
+    # applies extra caution on TOP of that (leverage cap + 0.5x multiplier)
+    # since an active breakout is a different risk than merely elevated ATR.
     if current_regime == REGIME_VOLATILE_BREAKOUT:
-        regime_pos_pct = POSITION_PCT * 0.5    # 10% instead of 20%
-        regime_lev     = min(effective_lev, 5)  # hard cap 5x
-        # Re-set leverage on Bybit to the regime cap
+        regime_lev = min(effective_lev, 5)  # hard cap 5x
         if regime_lev < effective_lev:
             import math
             try:
@@ -965,19 +1072,18 @@ async def open_trade(symbol: str, direction: str, indicators: dict, bot) -> None
                 effective_lev = regime_lev
             except Exception:
                 pass
+        regime_size_mult = 0.5
     else:
-        regime_pos_pct = POSITION_PCT          # 20% normal
-        regime_lev     = effective_lev
+        regime_lev = effective_lev
+        regime_size_mult = 1.0
 
-    target_margin   = balance * regime_pos_pct
-    target_notional = target_margin * effective_lev
-    raw_qty         = target_notional / entry
-    raw_qty         = max(raw_qty, min_notional / entry)
+    raw_qty = _calc_risk_based_qty(balance, entry, sl, regime_lev) * regime_size_mult
+    raw_qty = max(raw_qty, min_notional / entry)
 
     qty = _round_qty(raw_qty, min_q, step)
 
-    logger.info(f"[{symbol}] Sizing: regime={current_regime} pos_pct={regime_pos_pct*100:.0f}% "
-                f"lev={effective_lev}x notional={target_notional:.2f} qty={qty}")
+    logger.info(f"[{symbol}] Sizing: regime={current_regime} risk_pct={RISK_PCT*100:.0f}% "
+                f"sl_dist={abs(entry-sl)/entry*100:.2f}% lev={effective_lev}x qty={qty}")
 
     if qty <= 0:
         await alert(bot, f"⚠️ [{symbol}] Position size too small.")
@@ -1964,13 +2070,26 @@ async def _monitor_symbol_inner(symbol: str, bot, job_data: dict) -> None:
             continue
         indicators = await asyncio.to_thread(
             _compute_indicators, df_1d, df_4h, df_1h, direction)
-        if indicators["should_enter"]:
-            indicators["regime"]            = current_regime
-            indicators["regime_confidence"] = regime_conf
-            logger.info(f"[{symbol}] {direction} confirmed (score {indicators['score']}) "
-                        f"regime={current_regime}")
-            await open_trade(symbol, direction, indicators, bot)
-            return
+        if not indicators["should_enter"]:
+            continue
+
+        # ── Health-score gate ────────────────────────────────────────────────
+        # Blocks or raises the bar for this direction based on the coin's
+        # LONG/SHORT health score (cached, ~1hr TTL — see _get_cached_health_scores).
+        health = await _get_cached_health_scores(symbol)
+        health_score = health.get("long_score" if direction == "LONG" else "short_score", 50)
+        indicators = _apply_health_gate(indicators, direction, health_score)
+        if not indicators["should_enter"]:
+            logger.info(f"[{symbol}] {direction} blocked by health gate: "
+                        f"{indicators.get('health_gate_reason', '')}")
+            continue
+
+        indicators["regime"]            = current_regime
+        indicators["regime_confidence"] = regime_conf
+        logger.info(f"[{symbol}] {direction} confirmed (score {indicators['score']}) "
+                    f"regime={current_regime} health={health_score:.0f}")
+        await open_trade(symbol, direction, indicators, bot)
+        return
 
     # No signal found this cycle — log why for debugging
     logger.info(f"[{symbol}] No entry signal this cycle. "
@@ -4030,6 +4149,11 @@ def _sync_run_backtest(symbol: str, days: int, start_balance: float = 10000.0) -
         df_1d = _sync_fetch_paginated_klines(symbol, "D",   total_days)
         df_4h = _sync_fetch_paginated_klines(symbol, "240", total_days)
         df_1h = _sync_fetch_paginated_klines(symbol, "60",  min(days, 180))  # 180d of 1H max
+        # BTC data — needed for health-score gating (alpha vs BTC, ATH
+        # distance vs BTC's own ATH distance). Fetched once, sliced
+        # per-day inside the loop to avoid lookahead bias.
+        df_btc_window = _sync_fetch_paginated_klines("BTCUSDT", "D", total_days) if symbol != "BTCUSDT" else df_1d
+        health_cache: dict = {}   # recomputed every 7 backtest days, not every day
         
         if df_1d is None or df_4h is None or df_1h is None:
             result["error"] = "Failed to fetch candle data from Bybit"
@@ -4194,16 +4318,29 @@ def _sync_run_backtest(symbol: str, days: int, start_balance: float = 10000.0) -
                 
                 if not ind["should_enter"]:
                     continue
-                
+
+                # ── Health-score gate (as-of this backtest day, no lookahead) ──
+                if health_cache.get("checked_day") != bt_idx // 7:
+                    health_cache["checked_day"] = bt_idx // 7
+                    health_cache["scores"] = _compute_health_scores_from_window(
+                        df_1d_window, df_btc_window[df_btc_window["timestamp"] < day_end_ms] if df_btc_window is not None else None)
+                hs = health_cache.get("scores", {})
+                health_score = hs.get("long_score" if direction=="LONG" else "short_score", 50)
+                ind = _apply_health_gate(ind, direction, health_score)
+                if not ind["should_enter"]:
+                    continue
+
                 # Entry found — simulate the trade
                 entry_price = day_close   # enter at day's close
                 e100_4h     = ind["e100_4h"]
-                sl  = _calc_sl(entry_price, direction, e100_4h)
+                atr_val     = ind.get("atr", 0.0)
+                sl  = _calc_sl(entry_price, direction, e100_4h, atr=atr_val)
                 tp1, tp2 = _calc_tps(entry_price, sl, direction)
                 
-                # Position sizing
-                risk_amount = balance * POSITION_PCT
-                qty = risk_amount * LEVERAGE / entry_price
+                # Risk-based position sizing (was fixed POSITION_PCT — now
+                # solved from the volatility-scaled SL distance, see
+                # _calc_risk_based_qty for full rationale)
+                qty = _calc_risk_based_qty(balance, entry_price, sl, LEVERAGE)
                 
                 trade = {
                     "symbol":       symbol,
@@ -4316,16 +4453,20 @@ def _compute_indicators_with_stack(df_1d_window, df_4h_window, df_1h_day, direct
 
 def _run_single_stack_backtest(symbol: str, stack_mode: str, backtest_days: pd.DataFrame,
                                 df_1d: pd.DataFrame, df_4h: pd.DataFrame, df_1h: pd.DataFrame,
-                                adaptive_state_series, start_balance: float) -> dict:
+                                adaptive_state_series, start_balance: float,
+                                df_btc_window: pd.DataFrame = None) -> dict:
     """
     One full backtest pass using either the classic or adaptive stack for
     Filter 5 and the EMA-inversion exit. Mirrors _sync_run_backtest's trade
     simulation mechanics exactly (SL/TP1/TP2/trail/dead-trade/sizing) so the
     ONLY difference between a classic and adaptive run is Filter 5's logic.
+    Also applies the same volatility-scaled SL/risk-based sizing and
+    health-score gating as the main backtest engine, for consistency.
     """
     result = {"trades": [], "balance_curve": []}
     balance = start_balance
     open_trade = None
+    health_cache: dict = {}
     result["balance_curve"].append({"ts": int(backtest_days.iloc[0]["timestamp"]), "bal": balance})
 
     for bt_idx, (_, day_row) in enumerate(backtest_days.iterrows()):
@@ -4420,12 +4561,26 @@ def _run_single_stack_backtest(symbol: str, stack_mode: str, backtest_days: pd.D
             if not ind["should_enter"]:
                 continue
 
+            # Health-score gate (as-of this day, no lookahead) — same rule
+            # applied to both classic and adaptive runs so any PnL delta
+            # remains isolated to the Filter 5 difference, not this gate.
+            if health_cache.get("checked_day") != bt_idx // 7:
+                health_cache["checked_day"] = bt_idx // 7
+                btc_slice = (df_btc_window[df_btc_window["timestamp"] < day_end_ms]
+                            if df_btc_window is not None else None)
+                health_cache["scores"] = _compute_health_scores_from_window(df_1d_window, btc_slice)
+            hs = health_cache.get("scores", {})
+            health_score = hs.get("long_score" if direction=="LONG" else "short_score", 50)
+            ind = _apply_health_gate(ind, direction, health_score)
+            if not ind["should_enter"]:
+                continue
+
             entry_price = day_close
             e100_4h = ind["e100_4h"]
-            sl = _calc_sl(entry_price, direction, e100_4h)
+            atr_val = ind.get("atr", 0.0)
+            sl = _calc_sl(entry_price, direction, e100_4h, atr=atr_val)
             tp1, tp2 = _calc_tps(entry_price, sl, direction)
-            risk_amount = balance * POSITION_PCT
-            qty = risk_amount * LEVERAGE / entry_price
+            qty = _calc_risk_based_qty(balance, entry_price, sl, LEVERAGE)
 
             open_trade = {
                 "symbol": symbol, "direction": direction,
@@ -4470,6 +4625,7 @@ def _sync_run_backtest_comparison(symbol: str, days: int, start_balance: float =
         df_1d = _sync_fetch_paginated_klines(symbol, "D",   total_days)
         df_4h = _sync_fetch_paginated_klines(symbol, "240", total_days)
         df_1h = _sync_fetch_paginated_klines(symbol, "60",  min(days, 180))
+        df_btc_window = _sync_fetch_paginated_klines("BTCUSDT", "D", total_days) if symbol != "BTCUSDT" else df_1d
 
         if df_1d is None or df_4h is None or df_1h is None:
             result["error"] = "Failed to fetch candle data from Bybit"
@@ -4490,9 +4646,9 @@ def _sync_run_backtest_comparison(symbol: str, days: int, start_balance: float =
         adaptive_state_series = _adaptive_4kama_stack_series(close_full, volume_full)
 
         classic_result  = _run_single_stack_backtest(
-            symbol, "classic", backtest_days, df_1d, df_4h, df_1h, None, start_balance)
+            symbol, "classic", backtest_days, df_1d, df_4h, df_1h, None, start_balance, df_btc_window)
         adaptive_result = _run_single_stack_backtest(
-            symbol, "adaptive", backtest_days, df_1d, df_4h, df_1h, adaptive_state_series, start_balance)
+            symbol, "adaptive", backtest_days, df_1d, df_4h, df_1h, adaptive_state_series, start_balance, df_btc_window)
 
         result["classic"]  = classic_result
         result["adaptive"] = adaptive_result
@@ -4864,147 +5020,294 @@ def _sync_get_coin_performance(symbol: str, days: int) -> Optional[dict]:
         return None
 
 
-def _sync_coin_health_score(symbol: str) -> dict:
+def _compute_health_scores_core(close: pd.Series, high: pd.Series, volume: pd.Series,
+                                 btc_close: pd.Series, btc_high: pd.Series) -> dict:
     """
-    Compute a 0-100 health score for a coin based on:
-    - Performance vs BTC (30 pts)
-    - EMA structure (20 pts)
-    - Volume momentum (15 pts)
-    - Distance from ATH vs BTC's distance from ATH (20 pts)
-    - Trend consistency (15 pts)
-    Returns full breakdown dict.
+    Core LONG/SHORT health scoring logic, operating on already-fetched
+    price Series. Shared by both:
+      - _sync_coin_health_score (live: fetches the LATEST 400 days)
+      - _compute_health_scores_from_window (backtest: uses only data up
+        to a specific historical day, avoiding lookahead bias)
+
+    IMPORTANT DESIGN NOTE: SHORT health is NOT simply (100 - long_score).
+    A coin that is choppy/directionless should score LOW on both scales —
+    it's not a good long AND not a confidently-structured short. Only a
+    coin showing genuine CONFIRMED bearish structure (bearish EMA stack,
+    negative alpha vs BTC, red-week consistency, distribution-style
+    volume, structurally impaired vs BTC's own ATH distance) should score
+    high on SHORT health.
     """
-    score = 0
-    breakdown = {}
+    long_score, short_score = 0, 0
+    long_breakdown, short_breakdown = {}, {}
     details = []
 
+    # ── Component 1: Performance vs BTC (30 pts each direction) ──────────
+    for period_days, pts in [(30, 10), (90, 10), (180, 10)]:
+        if len(close) > period_days:
+            coin_ret = (float(close.iloc[-1]) - float(close.iloc[-period_days])) / float(close.iloc[-period_days]) * 100
+            if btc_close is not None and len(btc_close) > period_days:
+                btc_ret  = (float(btc_close.iloc[-1]) - float(btc_close.iloc[-period_days])) / float(btc_close.iloc[-period_days]) * 100
+                alpha    = coin_ret - btc_ret
+                label    = f"{period_days}d"
+                if alpha > 20:
+                    long_score += pts; long_breakdown[label] = f"+{alpha:.1f}% vs BTC ✅"
+                elif alpha > 0:
+                    long_score += int(pts*0.6); long_breakdown[label] = f"+{alpha:.1f}% vs BTC 🟡"
+                elif alpha > -20:
+                    long_score += int(pts*0.2); long_breakdown[label] = f"{alpha:.1f}% vs BTC 🟠"
+                else:
+                    long_breakdown[label] = f"{alpha:.1f}% vs BTC ❌"
+                if alpha < -20:
+                    short_score += pts; short_breakdown[label] = f"{alpha:.1f}% vs BTC ✅"
+                elif alpha < 0:
+                    short_score += int(pts*0.6); short_breakdown[label] = f"{alpha:.1f}% vs BTC 🟡"
+                elif alpha < 20:
+                    short_score += int(pts*0.2); short_breakdown[label] = f"+{alpha:.1f}% vs BTC 🟠"
+                else:
+                    short_breakdown[label] = f"+{alpha:.1f}% vs BTC ❌"
+                details.append(f"{label}: coin {coin_ret:+.1f}% | BTC {btc_ret:+.1f}% | alpha {alpha:+.1f}%")
+
+    # ── Component 2: EMA structure (20 pts each direction) ───────────────
+    ema20  = close.ewm(span=20,  adjust=False).mean()
+    ema50  = close.ewm(span=50,  adjust=False).mean()
+    ema100 = close.ewm(span=100, adjust=False).mean()
+    ema200 = close.ewm(span=200, adjust=False).mean()
+
+    price_now = float(close.iloc[-1])
+    e20, e50, e100, e200 = (float(x.iloc[-1]) for x in [ema20,ema50,ema100,ema200])
+
+    full_bull_stack = price_now > e20 > e50 > e100 > e200
+    full_bear_stack = price_now < e20 < e50 < e100 < e200
+    above_200 = price_now > e200
+    below_200 = price_now < e200
+    ema200_slope = (float(ema200.iloc[-1]) - float(ema200.iloc[-30])) / float(ema200.iloc[-30]) * 100 if len(ema200) >= 30 else 0
+
+    if full_bull_stack:
+        long_score += 20; long_breakdown["EMA"] = "Full bullish stack ✅"
+    elif above_200 and ema200_slope > 0:
+        long_score += 12; long_breakdown["EMA"] = "Above EMA200 (rising) 🟡"
+    elif above_200:
+        long_score += 6; long_breakdown["EMA"] = "Above EMA200 (flat) 🟠"
+    else:
+        long_breakdown["EMA"] = f"Below EMA200 (slope {ema200_slope:+.2f}%) ❌"
+    if full_bear_stack:
+        short_score += 20; short_breakdown["EMA"] = "Full bearish stack ✅"
+    elif below_200 and ema200_slope < 0:
+        short_score += 12; short_breakdown["EMA"] = "Below EMA200 (falling) 🟡"
+    elif below_200:
+        short_score += 6; short_breakdown["EMA"] = "Below EMA200 (flat) 🟠"
+    else:
+        short_breakdown["EMA"] = f"Above EMA200 (slope {ema200_slope:+.2f}%) ❌"
+    details.append(f"EMA200 slope 30d: {ema200_slope:+.2f}%")
+
+    # ── Component 3: Volume momentum (15 pts each direction) ─────────────
+    vol_14  = float(volume.iloc[-14:].mean())
+    vol_90  = float(volume.iloc[-90:-14].mean()) if len(volume) >= 90 else float(volume.mean())
+    vol_ratio = vol_14 / vol_90 if vol_90 > 0 else 1.0
+    price_chg_14d = (float(close.iloc[-1]) - float(close.iloc[-14])) / float(close.iloc[-14]) * 100 if len(close) >= 14 else 0
+
+    if vol_ratio > 1.5 and price_chg_14d > 0:
+        long_score += 15; long_breakdown["Volume"] = f"{vol_ratio:.2f}x + price up ✅"
+    elif vol_ratio > 1.1 and price_chg_14d > 0:
+        long_score += 9; long_breakdown["Volume"] = f"{vol_ratio:.2f}x + price up 🟡"
+    elif vol_ratio > 0.8:
+        long_score += 5; long_breakdown["Volume"] = f"{vol_ratio:.2f}x 90d avg 🟠"
+    else:
+        long_breakdown["Volume"] = f"{vol_ratio:.2f}x 90d avg (declining) ❌"
+    if vol_ratio > 1.5 and price_chg_14d < 0:
+        short_score += 15; short_breakdown["Volume"] = f"{vol_ratio:.2f}x + price down ✅"
+    elif vol_ratio > 1.1 and price_chg_14d < 0:
+        short_score += 9; short_breakdown["Volume"] = f"{vol_ratio:.2f}x + price down 🟡"
+    elif vol_ratio > 0.8 and price_chg_14d < 0:
+        short_score += 5; short_breakdown["Volume"] = f"{vol_ratio:.2f}x 90d avg, price down 🟠"
+    else:
+        short_breakdown["Volume"] = f"{vol_ratio:.2f}x 90d avg (no distribution signal) ❌"
+    details.append(f"Vol ratio (14d/90d): {vol_ratio:.2f}x | 14d price chg: {price_chg_14d:+.1f}%")
+
+    # ── Component 4: ATH distance vs BTC ATH distance (20 pts each) ──────
+    high_1y_coin = float(high.tail(365).max()) if len(high) >= 365 else float(high.max())
+    from_ath_coin = (price_now - high_1y_coin) / high_1y_coin * 100
+
+    btc_ath_dist = -50.0
+    if btc_close is not None and btc_high is not None:
+        btc_high_1y = float(btc_high.tail(365).max())
+        btc_now     = float(btc_close.iloc[-1])
+        btc_ath_dist = (btc_now - btc_high_1y) / btc_high_1y * 100
+
+    ath_diff = from_ath_coin - btc_ath_dist
+    if ath_diff > 10:
+        long_score += 20; long_breakdown["ATH dist"] = f"Closer to ATH than BTC by {ath_diff:.1f}% ✅"
+    elif ath_diff > 0:
+        long_score += 12; long_breakdown["ATH dist"] = "Slightly closer to ATH than BTC 🟡"
+    elif ath_diff > -20:
+        long_score += 5; long_breakdown["ATH dist"] = f"{abs(ath_diff):.1f}% further from ATH than BTC 🟠"
+    else:
+        long_breakdown["ATH dist"] = f"{abs(ath_diff):.1f}% further from ATH than BTC ❌"
+    if ath_diff < -20:
+        short_score += 20; short_breakdown["ATH dist"] = f"{abs(ath_diff):.1f}% further from ATH than BTC ✅"
+    elif ath_diff < 0:
+        short_score += 12; short_breakdown["ATH dist"] = "Slightly further from ATH than BTC 🟡"
+    elif ath_diff < 10:
+        short_score += 5; short_breakdown["ATH dist"] = f"Only {ath_diff:.1f}% closer to ATH than BTC 🟠"
+    else:
+        short_breakdown["ATH dist"] = f"Closer to ATH than BTC by {ath_diff:.1f}% ❌"
+    details.append(f"Coin from 1y-high: {from_ath_coin:.1f}% | BTC: {btc_ath_dist:.1f}%")
+
+    # ── Component 5: Trend consistency (15 pts each direction) ───────────
+    green_weeks, red_weeks = 0, 0
+    if len(close) >= 84:
+        weekly_rets = [float(close.iloc[i*7]) - float(close.iloc[(i-1)*7])
+                      for i in range(1, 13) if (i*7) < len(close)]
+        green_weeks = sum(1 for r in weekly_rets if r > 0)
+        red_weeks = len(weekly_rets) - green_weeks
+        consistency_long  = green_weeks / len(weekly_rets) if weekly_rets else 0.5
+        consistency_short = red_weeks   / len(weekly_rets) if weekly_rets else 0.5
+    else:
+        consistency_long = consistency_short = 0.5
+
+    if consistency_long >= 0.7:
+        long_score += 15; long_breakdown["Consistency"] = f"{green_weeks}/12 green weeks ✅"
+    elif consistency_long >= 0.5:
+        long_score += 8; long_breakdown["Consistency"] = f"{green_weeks}/12 green weeks 🟡"
+    else:
+        long_score += 2; long_breakdown["Consistency"] = f"{green_weeks}/12 green weeks ❌"
+
+    if consistency_short >= 0.7:
+        short_score += 15; short_breakdown["Consistency"] = f"{red_weeks}/12 red weeks ✅"
+    elif consistency_short >= 0.5:
+        short_score += 8; short_breakdown["Consistency"] = f"{red_weeks}/12 red weeks 🟡"
+    else:
+        short_score += 2; short_breakdown["Consistency"] = f"{red_weeks}/12 red weeks ❌"
+    details.append(f"Trend consistency: {green_weeks}/12 green, {red_weeks}/12 red")
+
+    def label_for(s):
+        if s >= 75:   return "🟢 Excellent"
+        elif s >= 55: return "🟡 Good"
+        elif s >= 35: return "🟠 Weak"
+        else:         return "🔴 Poor"
+
+    return {
+        "score": long_score, "label": label_for(long_score),
+        "breakdown": long_breakdown, "details": details,
+        "long_score": long_score, "long_label": label_for(long_score),
+        "long_breakdown": long_breakdown,
+        "short_score": short_score, "short_label": label_for(short_score),
+        "short_breakdown": short_breakdown,
+    }
+
+
+def _sync_coin_health_score(symbol: str) -> dict:
+    """
+    LIVE wrapper: fetches the latest 400 days of data for the coin and BTC,
+    then delegates to the shared core scoring logic. See
+    _compute_health_scores_core for the full design rationale.
+    """
     try:
-        # Fetch coin data
         df = _sync_get_klines(symbol, "D", 400)
         if df is None or len(df) < 100:
             return {"score": 0, "error": "Insufficient data", "symbol": symbol}
 
-        close   = df["close"].astype(float)
-        high    = df["high"].astype(float)
-        low     = df["low"].astype(float)
-        volume  = df["volume"].astype(float)
+        close, high, volume = df["close"].astype(float), df["high"].astype(float), df["volume"].astype(float)
 
-        # Fetch BTC data for comparison
         df_btc = _sync_get_klines("BTCUSDT", "D", 400)
         btc_close = df_btc["close"].astype(float) if df_btc is not None else None
+        btc_high  = df_btc["high"].astype(float) if df_btc is not None else None
 
-        # ── Component 1: Performance vs BTC (30 pts) ─────────────────────────
-        for period_days, pts in [(30, 10), (90, 10), (180, 10)]:
-            if len(close) > period_days:
-                coin_ret = (float(close.iloc[-1]) - float(close.iloc[-period_days])) / float(close.iloc[-period_days]) * 100
-                if btc_close is not None and len(btc_close) > period_days:
-                    btc_ret  = (float(btc_close.iloc[-1]) - float(btc_close.iloc[-period_days])) / float(btc_close.iloc[-period_days]) * 100
-                    alpha    = coin_ret - btc_ret
-                    label    = f"{period_days}d"
-                    if alpha > 20:
-                        score += pts; breakdown[label] = f"+{alpha:.1f}% vs BTC ✅"
-                    elif alpha > 0:
-                        score += int(pts * 0.6); breakdown[label] = f"+{alpha:.1f}% vs BTC 🟡"
-                    elif alpha > -20:
-                        score += int(pts * 0.2); breakdown[label] = f"{alpha:.1f}% vs BTC 🟠"
-                    else:
-                        breakdown[label] = f"{alpha:.1f}% vs BTC ❌"
-                    details.append(f"{label}: coin {coin_ret:+.1f}% | BTC {btc_ret:+.1f}% | alpha {alpha:+.1f}%")
-
-        # ── Component 2: EMA structure (20 pts) ──────────────────────────────
-        ema20  = close.ewm(span=20,  adjust=False).mean()
-        ema50  = close.ewm(span=50,  adjust=False).mean()
-        ema100 = close.ewm(span=100, adjust=False).mean()
-        ema200 = close.ewm(span=200, adjust=False).mean()
-
-        price_now = float(close.iloc[-1])
-        e20, e50, e100, e200 = (float(x.iloc[-1]) for x in [ema20,ema50,ema100,ema200])
-
-        full_stack  = price_now > e20 > e50 > e100 > e200
-        above_200   = price_now > e200
-        ema200_slope = (float(ema200.iloc[-1]) - float(ema200.iloc[-30])) / float(ema200.iloc[-30]) * 100 if len(ema200) >= 30 else 0
-
-        if full_stack:
-            score += 20; breakdown["EMA"] = "Full bullish stack ✅"
-        elif above_200 and ema200_slope > 0:
-            score += 12; breakdown["EMA"] = "Above EMA200 (rising) 🟡"
-        elif above_200:
-            score += 6;  breakdown["EMA"] = "Above EMA200 (flat) 🟠"
-        else:
-            breakdown["EMA"] = f"Below EMA200 (slope {ema200_slope:+.2f}%) ❌"
-        details.append(f"EMA200 slope 30d: {ema200_slope:+.2f}%")
-
-        # ── Component 3: Volume momentum (15 pts) ────────────────────────────
-        vol_14  = float(volume.iloc[-14:].mean())
-        vol_90  = float(volume.iloc[-90:-14].mean()) if len(volume) >= 90 else float(volume.mean())
-        vol_ratio = vol_14 / vol_90 if vol_90 > 0 else 1.0
-
-        if vol_ratio > 1.5:
-            score += 15; breakdown["Volume"] = f"{vol_ratio:.2f}x 90d avg ✅"
-        elif vol_ratio > 1.1:
-            score += 9;  breakdown["Volume"] = f"{vol_ratio:.2f}x 90d avg 🟡"
-        elif vol_ratio > 0.8:
-            score += 5;  breakdown["Volume"] = f"{vol_ratio:.2f}x 90d avg 🟠"
-        else:
-            breakdown["Volume"] = f"{vol_ratio:.2f}x 90d avg (declining) ❌"
-        details.append(f"Vol ratio (14d/90d): {vol_ratio:.2f}x")
-
-        # ── Component 4: ATH distance vs BTC ATH distance (20 pts) ───────────
-        high_1y_coin = float(high.tail(365).max()) if len(high) >= 365 else float(high.max())
-        from_ath_coin = (price_now - high_1y_coin) / high_1y_coin * 100
-
-        btc_ath_dist = -50.0  # default
-        if btc_close is not None and df_btc is not None:
-            btc_high_1y  = float(df_btc["high"].astype(float).tail(365).max())
-            btc_now      = float(btc_close.iloc[-1])
-            btc_ath_dist = (btc_now - btc_high_1y) / btc_high_1y * 100
-
-        ath_diff = from_ath_coin - btc_ath_dist  # positive = coin closer to ATH than BTC
-        if ath_diff > 10:
-            score += 20; breakdown["ATH dist"] = f"Closer to ATH than BTC by {ath_diff:.1f}% ✅"
-        elif ath_diff > 0:
-            score += 12; breakdown["ATH dist"] = f"Slightly closer to ATH than BTC 🟡"
-        elif ath_diff > -20:
-            score += 5;  breakdown["ATH dist"] = f"{abs(ath_diff):.1f}% further from ATH than BTC 🟠"
-        else:
-            breakdown["ATH dist"] = f"{abs(ath_diff):.1f}% further from ATH than BTC ❌"
-        details.append(f"Coin from 1y-high: {from_ath_coin:.1f}% | BTC: {btc_ath_dist:.1f}%")
-
-        # ── Component 5: Trend consistency (15 pts) ──────────────────────────
-        # Count green vs red weeks over last 12 weeks
-        if len(close) >= 84:
-            weekly_rets = [float(close.iloc[i*7]) - float(close.iloc[(i-1)*7])
-                          for i in range(1, 13) if (i*7) < len(close)]
-            green_weeks = sum(1 for r in weekly_rets if r > 0)
-            consistency = green_weeks / len(weekly_rets) if weekly_rets else 0.5
-        else:
-            consistency = 0.5
-
-        if consistency >= 0.7:
-            score += 15; breakdown["Consistency"] = f"{green_weeks}/12 green weeks ✅"
-        elif consistency >= 0.5:
-            score += 8;  breakdown["Consistency"] = f"{green_weeks}/12 green weeks 🟡"
-        else:
-            score += 2;  breakdown["Consistency"] = f"{green_weeks}/12 green weeks ❌"
-        details.append(f"Trend consistency: {consistency*100:.0f}%")
-
+        result = _compute_health_scores_core(close, high, volume, btc_close, btc_high)
+        result["symbol"] = symbol
+        return result
     except Exception as e:
         logger.error(f"_sync_coin_health_score({symbol}): {e}", exc_info=True)
         return {"score": 0, "error": str(e), "symbol": symbol}
 
-    # Health label
-    if score >= 75:   label = "🟢 Excellent"
-    elif score >= 55: label = "🟡 Good"
-    elif score >= 35: label = "🟠 Weak"
-    else:             label = "🔴 Poor"
 
-    return {
-        "symbol":    symbol,
-        "score":     score,
-        "label":     label,
-        "breakdown": breakdown,
-        "details":   details,
+def _compute_health_scores_from_window(df_1d_window: pd.DataFrame, df_btc_window: pd.DataFrame) -> dict:
+    """
+    BACKTEST-SAFE wrapper: computes health scores using ONLY data up to a
+    specific historical point (df_1d_window / df_btc_window are already
+    sliced to "as of this backtest day" by the caller). This avoids the
+    lookahead bias that would occur if the backtest called the live
+    _sync_coin_health_score, which always fetches the LATEST data from
+    Bybit regardless of what day the backtest simulation is currently on.
+    """
+    try:
+        if df_1d_window is None or len(df_1d_window) < 100:
+            return {"error": "Insufficient data", "long_score": 0, "short_score": 0}
+        close  = df_1d_window["close"].astype(float)
+        high   = df_1d_window["high"].astype(float)
+        volume = df_1d_window["volume"].astype(float)
+        btc_close = df_btc_window["close"].astype(float) if df_btc_window is not None and len(df_btc_window) >= 100 else None
+        btc_high  = df_btc_window["high"].astype(float) if df_btc_window is not None and len(df_btc_window) >= 100 else None
+        return _compute_health_scores_core(close, high, volume, btc_close, btc_high)
+    except Exception as e:
+        logger.error(f"_compute_health_scores_from_window: {e}", exc_info=True)
+        return {"error": str(e), "long_score": 0, "short_score": 0}
+
+
+def _apply_health_gate(ind: dict, direction: str, health_score: float) -> dict:
+    """
+    Adjusts an already-computed indicators dict's should_enter decision
+    based on the coin's LONG or SHORT health score (whichever matches
+    the trade direction). Works on the output of _compute_indicators or
+    _compute_indicators_with_stack — decoupled from HOW the health score
+    was obtained (live cache vs backtest window) so both live trading and
+    the backtest engine can share this exact same gating logic.
+
+      score < HEALTH_BLOCK_BELOW (35)      -> direction blocked entirely
+      score < HEALTH_RAISE_BAR_BELOW (55)  -> require 4 of 6 optional
+                                               filters instead of normal 3
+      score >= HEALTH_RAISE_BAR_BELOW      -> unchanged (normal 3 of 6 bar)
+    """
+    if ind.get("error"):
+        return ind
+    m5 = "EMA_Bullish_Stack" if direction == "LONG" else "EMA_Bearish_Stack"
+    m8 = "Bullish1HCandle"   if direction == "LONG" else "Bearish1HCandle"
+    passed = ind.get("passed", [])
+    opt = [p for p in passed if p not in (m5, m8)]
+
+    new_ind = dict(ind)
+    new_ind["health_score_used"] = health_score
+
+    if health_score < HEALTH_BLOCK_BELOW:
+        new_ind["should_enter"] = False
+        new_ind["health_gate_reason"] = f"Blocked: {direction} health {health_score:.0f} < {HEALTH_BLOCK_BELOW}"
+    elif health_score < HEALTH_RAISE_BAR_BELOW:
+        required = (m5 in passed) and (m8 in passed) and len(opt) >= 4  # raised from 3
+        new_ind["should_enter"] = required
+        new_ind["health_gate_reason"] = (
+            f"Raised bar (need 4/6 optional): {direction} health {health_score:.0f}, "
+            f"had {len(opt)}/6 optional passed"
+            if not required else f"Passed raised bar: {direction} health {health_score:.0f}")
+    else:
+        new_ind["health_gate_reason"] = f"Normal bar: {direction} health {health_score:.0f}"
+    return new_ind
+
+
+
+
+async def _get_cached_health_scores(symbol: str) -> dict:
+    """
+    Live-trading health score lookup with caching (HEALTH_CACHE_TTL_SEC).
+    Health score requires fetching 400 days of data for the coin AND BTC —
+    too expensive to recompute on every 10-second scan tick, so it's cached
+    per-symbol and only refreshed once per hour. The components involved
+    (30/90/180d performance, EMA structure, ATH distance) don't meaningfully
+    change within an hour, so this is a safe trade-off.
+    """
+    cached = symbol_health_cache.get(symbol)
+    now = time.time()
+    if cached and (now - cached.get("ts", 0)) < HEALTH_CACHE_TTL_SEC:
+        return cached
+
+    result = await asyncio.to_thread(_sync_coin_health_score, symbol)
+    entry = {
+        "long_score": result.get("long_score", 50),
+        "short_score": result.get("short_score", 50),
+        "ts": now,
+        "error": result.get("error"),
     }
+    symbol_health_cache[symbol] = entry
+    return entry
 
 
 def _sync_scan_top_coins(mode: str, days: int = 90, top_n: int = 15) -> list[dict]:
@@ -5135,14 +5438,17 @@ async def cmd_screen(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 @public_command
 async def cmd_health(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Full coin health score for any symbol.
+    Full coin health score for any symbol — TWO independent scores:
+    LONG health and SHORT health. A coin can score well on one, both,
+    or neither — they are NOT mirror images of each other.
     Usage: /health BTCUSDT
     """
     symbol = ctx.args[0].upper() if ctx.args else None
     if not symbol:
         await update.message.reply_text(
             "Usage: /health SYMBOL\n"
-            "Scores 0-100 across 5 dimensions vs BTC performance.",
+            "Scores 0-100 across 5 dimensions, computed separately for "
+            "LONG favorability and SHORT favorability.",
             parse_mode="HTML")
         return
 
@@ -5150,7 +5456,7 @@ async def cmd_health(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         symbol += "USDT"
 
     await update.message.reply_text(
-        f"⏳ Computing health score for {symbol}...\n"
+        f"⏳ Computing LONG + SHORT health scores for {symbol}...\n"
         f"Fetching 400 days of price data (takes ~10 seconds)")
 
     result = await asyncio.to_thread(_sync_coin_health_score, symbol)
@@ -5159,41 +5465,65 @@ async def cmd_health(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"❌ Error: {result['error']}")
         return
 
-    score = result["score"]
-    label = result["label"]
-    bd    = result["breakdown"]
-    det   = result["details"]
+    long_score, short_score = result["long_score"], result["short_score"]
+    long_label, short_label = result["long_label"], result["short_label"]
+    lbd, sbd = result["long_breakdown"], result["short_breakdown"]
+    det = result["details"]
 
-    # Score bar
-    filled = int(score / 10)
-    bar    = "█" * filled + "░" * (10 - filled)
+    def bar(s):
+        filled = int(s/10)
+        return "█"*filled + "░"*(10-filled)
 
     lines = [
         f"🏥 <b>Coin Health Score — {symbol}</b>",
         f"━━━━━━━━━━━━━━━━━━━━",
-        f"Score : <b>{score}/100</b>  {label}",
-        f"Visual: <code>{bar}</code>",
         f"",
-        f"<b>Breakdown:</b>",
+        f"<b>🟢 LONG health: {long_score}/100</b>  {long_label}",
+        f"<code>{bar(long_score)}</code>",
     ]
-
-    for key, val in bd.items():
+    for key, val in lbd.items():
         lines.append(f"  {key:12}: {val}")
 
-    lines.append(f"")
-    lines.append(f"<b>Raw data:</b>")
+    lines.append("")
+    lines.append(f"<b>🔴 SHORT health: {short_score}/100</b>  {short_label}")
+    lines.append(f"<code>{bar(short_score)}</code>")
+    for key, val in sbd.items():
+        lines.append(f"  {key:12}: {val}")
+
+    lines.append("")
+    lines.append("<b>Raw data:</b>")
     for d in det:
         lines.append(f"  {d}")
+    lines.append("")
 
-    lines.append(f"")
-    if score >= 75:
-        lines.append("✅ <b>Bot bias: LONG entries favoured. Strategy filters normal.</b>")
-    elif score >= 55:
-        lines.append("🟡 <b>Bot bias: LONG entries allowed. Watch for confirmation.</b>")
-    elif score >= 35:
-        lines.append("🟠 <b>Bot bias: LONG entries need 7/8 score (raised bar).</b>")
+    # Direction-aware bias — the actual fix: a coin with LOW long score
+    # and LOW short score is CHOPPY (raise the bar on BOTH directions),
+    # not automatically a short candidate. Only a genuinely HIGH short
+    # score should favor shorts.
+    if long_score >= 75:
+        lines.append("✅ <b>LONG bias:</b> entries favoured, normal 5/8 filter bar.")
+    elif long_score >= 55:
+        lines.append("🟡 <b>LONG bias:</b> allowed, watch for confirmation.")
+    elif long_score >= 35:
+        lines.append("🟠 <b>LONG bias:</b> needs 7/8 score (raised bar).")
     else:
-        lines.append("🔴 <b>Bot bias: SHORT entries only. LONGs require 8/8 score.</b>")
+        lines.append("🔴 <b>LONG bias:</b> blocked or requires 8/8 score.")
+
+    if short_score >= 75:
+        lines.append("✅ <b>SHORT bias:</b> entries favoured, normal 5/8 filter bar.")
+    elif short_score >= 55:
+        lines.append("🟡 <b>SHORT bias:</b> allowed, watch for confirmation.")
+    elif short_score >= 35:
+        lines.append("🟠 <b>SHORT bias:</b> needs 7/8 score (raised bar).")
+    else:
+        lines.append("🔴 <b>SHORT bias:</b> blocked or requires 8/8 score.")
+
+    if long_score < 35 and short_score < 35:
+        lines.append("\n⚠️ <i>Both scores low — this coin looks CHOPPY/directionless, "
+                     "not a confident trade in either direction.</i>")
+    elif long_score >= 55 and short_score >= 55:
+        lines.append("\n⚠️ <i>Both scores elevated — mixed signals, check regime "
+                     "detector for a tiebreaker.</i>")
 
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
