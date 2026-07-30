@@ -4256,6 +4256,367 @@ def _sync_run_backtest(symbol: str, days: int, start_balance: float = 10000.0) -
     return result
 
 
+def _get_adaptive_f5_state(adaptive_state_series: pd.Series, full_idx: int, direction: str) -> bool:
+    """Given the precomputed adaptive stack series, does Filter 5 (adaptive) pass?"""
+    if adaptive_state_series is None or full_idx >= len(adaptive_state_series):
+        return False
+    state = adaptive_state_series.iloc[full_idx]
+    return (state == 1) if direction == "LONG" else (state == -1)
+
+
+def _get_adaptive_exit(adaptive_state_series: pd.Series, full_idx: int, direction: str) -> bool:
+    """Adaptive-stack equivalent of _check_ema_exit — has the stack flipped
+    against the trade's direction?"""
+    if adaptive_state_series is None or full_idx >= len(adaptive_state_series):
+        return False
+    state = adaptive_state_series.iloc[full_idx]
+    target = 1 if direction == "LONG" else -1
+    return state != target
+
+
+def _compute_indicators_with_stack(df_1d_window, df_4h_window, df_1h_day, direction,
+                                    stack_mode: str, adaptive_state_series=None,
+                                    full_idx: int = None) -> dict:
+    """
+    Wraps _compute_indicators, optionally overriding ONLY Filter 5 with the
+    Adaptive Confirmed Stack instead of the classic EMA 20/50/100/200 stack.
+    Filters 1-4, 6-8 are computed identically either way — this isolates
+    the comparison to Filter 5's effect alone, which is the actual point
+    of the comparison (does the better Filter 5 alone improve results,
+    not some incidental difference elsewhere).
+    """
+    ind = _compute_indicators(df_1d_window, df_4h_window, df_1h_day, direction)
+    if stack_mode == "classic":
+        return ind
+
+    m5 = "EMA_Bullish_Stack" if direction == "LONG" else "EMA_Bearish_Stack"
+    m8 = "Bullish1HCandle"   if direction == "LONG" else "Bearish1HCandle"
+
+    classic_m5_passed  = m5 in ind["passed"]
+    adaptive_m5_passed = _get_adaptive_f5_state(adaptive_state_series, full_idx, direction)
+
+    passed = list(ind["passed"])
+    failed = list(ind["failed"])
+    if classic_m5_passed and not adaptive_m5_passed:
+        passed.remove(m5); failed.append(m5)
+    elif not classic_m5_passed and adaptive_m5_passed:
+        failed.remove(m5); passed.append(m5)
+    # if they already agree, no change needed
+
+    opt = [p for p in passed if p not in (m5, m8)]
+    should_enter = (m5 in passed) and (m8 in passed) and len(opt) >= 3
+
+    new_ind = dict(ind)
+    new_ind["passed"] = passed
+    new_ind["failed"] = failed
+    new_ind["should_enter"] = should_enter
+    new_ind["score"] = len(passed)
+    return new_ind
+
+
+def _run_single_stack_backtest(symbol: str, stack_mode: str, backtest_days: pd.DataFrame,
+                                df_1d: pd.DataFrame, df_4h: pd.DataFrame, df_1h: pd.DataFrame,
+                                adaptive_state_series, start_balance: float) -> dict:
+    """
+    One full backtest pass using either the classic or adaptive stack for
+    Filter 5 and the EMA-inversion exit. Mirrors _sync_run_backtest's trade
+    simulation mechanics exactly (SL/TP1/TP2/trail/dead-trade/sizing) so the
+    ONLY difference between a classic and adaptive run is Filter 5's logic.
+    """
+    result = {"trades": [], "balance_curve": []}
+    balance = start_balance
+    open_trade = None
+    result["balance_curve"].append({"ts": int(backtest_days.iloc[0]["timestamp"]), "bal": balance})
+
+    for bt_idx, (_, day_row) in enumerate(backtest_days.iterrows()):
+        day_ts    = int(day_row["timestamp"])
+        day_close = float(day_row["close"])
+        day_high  = float(day_row["high"])
+        day_low   = float(day_row["low"])
+
+        full_idx_list = df_1d.index[df_1d["timestamp"] == day_ts].tolist()
+        if not full_idx_list:
+            continue
+        full_i = full_idx_list[0]
+        if full_i < 220:
+            continue
+
+        # ── Manage open trade ─────────────────────────────────────────────
+        if open_trade:
+            t = open_trade
+            entry, sl, tp1, tp2, dir_ = t["entry"], t["sl"], t["tp1"], t["tp2"], t["direction"]
+
+            sl_hit  = (dir_=="LONG" and day_low<=sl) or (dir_=="SHORT" and day_high>=sl)
+            tp1_hit = (dir_=="LONG" and day_high>=tp1) or (dir_=="SHORT" and day_low<=tp1)
+            tp2_hit = (dir_=="LONG" and day_high>=tp2) or (dir_=="SHORT" and day_low<=tp2)
+
+            if stack_mode == "classic":
+                df_for_exit = df_1d.iloc[:full_i]
+                ema_exit = _check_ema_exit(df_for_exit, dir_)
+            else:
+                ema_exit = _get_adaptive_exit(adaptive_state_series, full_i, dir_)
+
+            trade_age = bt_idx - t["entry_bt_idx"]
+            dead = trade_age >= 7 and not t.get("tp1_hit")
+
+            closed = False
+            qty = t["qty"]
+
+            if sl_hit and not t.get("tp1_hit"):
+                pnl = (sl-entry)*qty if dir_=="LONG" else (entry-sl)*qty
+                t.update({"exit_price":sl,"exit_reason":"SL","exit_day":day_ts,"pnl":round(pnl,2)})
+                balance += pnl; closed = True
+            elif not t.get("tp1_hit") and tp1_hit:
+                close_qty = qty*0.4
+                pnl_tp1 = (tp1-entry)*close_qty if dir_=="LONG" else (entry-tp1)*close_qty
+                t["qty"]=qty*0.6; t["sl"]=entry; t["tp1_hit"]=True
+                t["pnl_partial"]=round(pnl_tp1,2); balance += pnl_tp1
+            elif t.get("tp1_hit") and not t.get("tp2_hit") and tp2_hit:
+                rem_qty = t["qty"]; close_now = rem_qty*(2/3)
+                pnl_tp2 = (tp2-entry)*close_now if dir_=="LONG" else (entry-tp2)*close_now
+                t["qty"]=rem_qty-close_now; t["tp2_hit"]=True
+                t["pnl_partial"]=t.get("pnl_partial",0)+round(pnl_tp2,2); balance += pnl_tp2
+            elif t.get("tp2_hit") and t["qty"]>0:
+                new_sl = day_low if dir_=="LONG" else day_high
+                if dir_=="LONG" and new_sl>t["sl"]: t["sl"]=new_sl
+                if dir_=="SHORT" and new_sl<t["sl"]: t["sl"]=new_sl
+                if (dir_=="LONG" and day_low<=t["sl"]) or (dir_=="SHORT" and day_high>=t["sl"]):
+                    pnl_trail=(t["sl"]-entry)*t["qty"] if dir_=="LONG" else (entry-t["sl"])*t["qty"]
+                    total_pnl=t.get("pnl_partial",0)+round(pnl_trail,2)
+                    t.update({"exit_price":t["sl"],"exit_reason":"TP2_TRAIL","exit_day":day_ts,"pnl":total_pnl})
+                    balance += pnl_trail; closed = True
+
+            if not closed and (ema_exit or dead):
+                rem = t["qty"]; exit_p = day_close
+                pnl_rem = (exit_p-entry)*rem if dir_=="LONG" else (entry-exit_p)*rem
+                total_pnl = t.get("pnl_partial",0)+round(pnl_rem,2)
+                reason = "DEAD" if dead else "EMA_EXIT"
+                t.update({"exit_price":exit_p,"exit_reason":reason,"exit_day":day_ts,"pnl":total_pnl})
+                balance += pnl_rem; closed = True
+
+            if closed:
+                result["trades"].append(t)
+                open_trade = None
+                result["balance_curve"].append({"ts":day_ts,"bal":round(balance,2)})
+            continue
+
+        # ── Look for new entry ────────────────────────────────────────────
+        df_1d_window = df_1d.iloc[:full_i+1]
+        day_end_ms = day_ts + 86400000
+        df_4h_window = df_4h[df_4h["timestamp"] < day_end_ms].tail(300)
+        if len(df_4h_window) < 50:
+            continue
+        df_1h_day = df_1h[(df_1h["timestamp"]>=day_ts) & (df_1h["timestamp"]<day_end_ms)]
+        if len(df_1h_day) < 3:
+            continue
+
+        for direction in ("LONG", "SHORT"):
+            try:
+                ind = _compute_indicators_with_stack(
+                    df_1d_window, df_4h_window, df_1h_day, direction,
+                    stack_mode, adaptive_state_series, full_i)
+            except Exception:
+                continue
+            if not ind["should_enter"]:
+                continue
+
+            entry_price = day_close
+            e100_4h = ind["e100_4h"]
+            sl = _calc_sl(entry_price, direction, e100_4h)
+            tp1, tp2 = _calc_tps(entry_price, sl, direction)
+            risk_amount = balance * POSITION_PCT
+            qty = risk_amount * LEVERAGE / entry_price
+
+            open_trade = {
+                "symbol": symbol, "direction": direction,
+                "entry": round(entry_price,6), "entry_day": day_ts, "entry_bt_idx": bt_idx,
+                "sl": round(sl,6), "tp1": round(tp1,6), "tp2": round(tp2,6),
+                "qty": qty, "orig_qty": qty, "score": ind["score"], "passed": ind["passed"],
+                "tp1_hit": False, "tp2_hit": False, "pnl_partial": 0.0,
+                "exit_price": None, "exit_reason": None, "exit_day": None, "pnl": 0.0,
+            }
+            break
+
+    if open_trade:
+        t = open_trade
+        last_close = float(backtest_days.iloc[-1]["close"])
+        rem = t["qty"]
+        pnl_rem = (last_close-t["entry"])*rem if t["direction"]=="LONG" else (t["entry"]-last_close)*rem
+        total_pnl = t.get("pnl_partial",0)+round(pnl_rem,2)
+        t.update({"exit_price":last_close,"exit_reason":"PERIOD_END","pnl":total_pnl})
+        balance += pnl_rem
+        result["trades"].append(t)
+
+    result["final_balance"] = round(balance, 2)
+    result["balance_curve"].append({"ts": int(backtest_days.iloc[-1]["timestamp"]), "bal": round(balance,2)})
+    return result
+
+
+def _sync_run_backtest_comparison(symbol: str, days: int, start_balance: float = 10000.0) -> dict:
+    """
+    Runs the FULL trading strategy backtest twice on the SAME real historical
+    data — once with the classic EMA 20/50/100/200 stack as Filter 5, once
+    with the Adaptive Confirmed Stack (KAMA + volume confirmation +
+    hysteresis) as Filter 5. Every other filter, SL/TP rule, and position
+    sizing rule is byte-identical between the two runs — the comparison is
+    isolated purely to whether the better Filter 5 changes trading outcomes.
+    """
+    result = {"symbol": symbol, "days": days, "error": None, "start_balance": start_balance}
+    try:
+        logger.info(f"[STACK COMPARE] Starting {symbol} {days}d comparison backtest...")
+        warmup = 220
+        total_days = days + warmup
+
+        df_1d = _sync_fetch_paginated_klines(symbol, "D",   total_days)
+        df_4h = _sync_fetch_paginated_klines(symbol, "240", total_days)
+        df_1h = _sync_fetch_paginated_klines(symbol, "60",  min(days, 180))
+
+        if df_1d is None or df_4h is None or df_1h is None:
+            result["error"] = "Failed to fetch candle data from Bybit"
+            return result
+
+        cutoff_ms = (int(time.time()) - days * 86400) * 1000
+        backtest_days = df_1d[df_1d["timestamp"] >= cutoff_ms].copy()
+        if len(backtest_days) < 10:
+            result["error"] = f"Only {len(backtest_days)} daily candles — need at least 10"
+            return result
+
+        # Precompute the adaptive stack ONCE over the full history — this is
+        # a purely causal (no-lookahead) computation, safe to precompute
+        # and index per-day during the walk-forward loop, exactly like EMAs
+        # are computed once and indexed rather than recomputed each day.
+        close_full  = df_1d["close"].astype(float).reset_index(drop=True)
+        volume_full = df_1d["volume"].astype(float).reset_index(drop=True)
+        adaptive_state_series = _adaptive_4kama_stack_series(close_full, volume_full)
+
+        classic_result  = _run_single_stack_backtest(
+            symbol, "classic", backtest_days, df_1d, df_4h, df_1h, None, start_balance)
+        adaptive_result = _run_single_stack_backtest(
+            symbol, "adaptive", backtest_days, df_1d, df_4h, df_1h, adaptive_state_series, start_balance)
+
+        result["classic"]  = classic_result
+        result["adaptive"] = adaptive_result
+        logger.info(f"[STACK COMPARE] Done: classic {len(classic_result['trades'])} trades "
+                    f"${classic_result['final_balance']:.2f} | adaptive {len(adaptive_result['trades'])} "
+                    f"trades ${adaptive_result['final_balance']:.2f}")
+    except Exception as e:
+        logger.error(f"[STACK COMPARE] failed: {e}", exc_info=True)
+        result["error"] = str(e)
+    return result
+
+
+def _format_stack_comparison(r: dict) -> list[str]:
+    """Format the side-by-side backtest comparison into Telegram messages."""
+    if r.get("error"):
+        return [f"❌ Comparison backtest failed: {r['error']}"]
+
+    sym, days, start = r["symbol"], r["days"], r["start_balance"]
+    c, a = r["classic"], r["adaptive"]
+
+    def stats(res):
+        trades = res["trades"]
+        final = res.get("final_balance", start)
+        pnl = final - start
+        ret_pct = pnl/start*100
+        wins = [t for t in trades if t["pnl"] > 0]
+        losses = [t for t in trades if t["pnl"] <= 0]
+        win_rate = len(wins)/len(trades)*100 if trades else 0
+        return {
+            "trades": len(trades), "final": final, "pnl": pnl, "ret_pct": ret_pct,
+            "win_rate": win_rate, "wins": len(wins), "losses": len(losses),
+        }
+
+    cs, as_ = stats(c), stats(a)
+
+    msg1 = (
+        f"📊 <b>Stack Backtest Comparison — {sym}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Period: last {days} days | Start: ${start:,.0f}\n"
+        f"Same F1-F4/F6-F8 filters, SL/TP rules, and sizing in BOTH runs.\n"
+        f"ONLY Filter 5 (EMA stack) differs.\n\n"
+        f"<b>🔵 CLASSIC (EMA 20/50/100/200):</b>\n"
+        f"Final balance: ${cs['final']:,.2f}\n"
+        f"PnL: {cs['pnl']:+,.2f} ({cs['ret_pct']:+.1f}%)\n"
+        f"Trades: {cs['trades']} | Win rate: {cs['win_rate']:.1f}% "
+        f"({cs['wins']}W/{cs['losses']}L)\n\n"
+        f"<b>🟢 ADAPTIVE (KAMA + volume + hysteresis):</b>\n"
+        f"Final balance: ${as_['final']:,.2f}\n"
+        f"PnL: {as_['pnl']:+,.2f} ({as_['ret_pct']:+.1f}%)\n"
+        f"Trades: {as_['trades']} | Win rate: {as_['win_rate']:.1f}% "
+        f"({as_['wins']}W/{as_['losses']}L)\n\n"
+        f"<b>Δ Difference:</b>\n"
+        f"PnL: {as_['pnl']-cs['pnl']:+,.2f} USDT\n"
+        f"Return: {as_['ret_pct']-cs['ret_pct']:+.1f} percentage points\n"
+        f"Win rate: {as_['win_rate']-cs['win_rate']:+.1f} points\n"
+        f"Trade count: {as_['trades']-cs['trades']:+d}"
+    )
+
+    # Exit reason breakdown for both
+    def reason_breakdown(trades):
+        r = {}
+        for t in trades:
+            k = t.get("exit_reason","?")
+            r[k] = r.get(k,0)+1
+        return r
+
+    cr, ar = reason_breakdown(c["trades"]), reason_breakdown(a["trades"])
+    msg2 = (
+        f"📋 <b>Exit reason breakdown — {sym}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Classic : {'  '.join(f'{k}:{v}' for k,v in sorted(cr.items()))}\n"
+        f"Adaptive: {'  '.join(f'{k}:{v}' for k,v in sorted(ar.items()))}\n\n"
+        f"<i>This runs the REAL strategy — same 8-filter structure, same "
+        f"SL/TP tiers, same position sizing — with only Filter 5 swapped. "
+        f"Unlike /compare_stack, this measures actual trading PnL on real "
+        f"historical data, not just signal timing. Not wired into live "
+        f"trading — for evaluation only.</i>"
+    )
+    return [msg1, msg2]
+
+
+@public_command
+async def cmd_backtest_compare(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Full strategy backtest comparison: classic EMA stack vs Adaptive
+    Confirmed Stack, on the SAME real historical data, with every other
+    rule held identical. Usage: /backtest_compare SYMBOL PERIOD [capital]
+    """
+    if len(ctx.args) < 2:
+        await update.message.reply_text(
+            "Usage: /backtest_compare SYMBOL PERIOD [capital]\n"
+            "Example: /backtest_compare BTCUSDT 6m\n\n"
+            "Runs the FULL trading strategy twice on real historical data — "
+            "once with the classic EMA 20/50/100/200 stack, once with the "
+            "Adaptive Confirmed Stack — with every other rule (SL/TP, "
+            "sizing, other 6 filters) held identical. Shows actual PnL "
+            "difference, not just signal timing.\n\n"
+            "Periods: 1m/3m/6m/1y/2y. Takes 20-40 seconds (double backtest).")
+        return
+
+    symbol = ctx.args[0].upper()
+    if not symbol.endswith("USDT"):
+        symbol += "USDT"
+    period_map = {"1m":30,"3m":90,"6m":180,"1y":365,"2y":730}
+    days = period_map.get(ctx.args[1].lower())
+    if not days:
+        await update.message.reply_text(f"Unknown period '{ctx.args[1]}'. Use: 1m, 3m, 6m, 1y, 2y")
+        return
+    start_balance = 10000.0
+    if len(ctx.args) >= 3:
+        try: start_balance = float(ctx.args[2])
+        except ValueError: pass
+
+    await update.message.reply_text(
+        f"⏳ Running comparison backtest for {symbol} ({ctx.args[1]})...\n"
+        f"Running the full strategy TWICE (classic + adaptive Filter 5) "
+        f"on real 4H+1H candle data. Takes 20-40 seconds.")
+
+    result = await asyncio.to_thread(_sync_run_backtest_comparison, symbol, days, start_balance)
+    messages = _format_stack_comparison(result)
+    for msg in messages:
+        await update.message.reply_text(msg, parse_mode="HTML")
+
+
 def _format_backtest_results(r: dict) -> list[str]:
     """
     Format backtest results into Telegram messages.
@@ -5489,6 +5850,231 @@ _CPO_PHASE_ORDER = ["Compression", "Expansion", "Euphoria", "Capitulation"]
 _CPO_PHASE_IDX = {p: i for i, p in enumerate(_CPO_PHASE_ORDER)}
 
 
+# =============================================================================
+#  ADAPTIVE CONFIRMED STACK — proposed replacement for the classic
+#  EMA 20/50/100/200 stack (Filter 5). Uses Kaufman Adaptive MAs instead
+#  of fixed-span EMAs, plus volume confirmation and hysteresis.
+#  See conversation history for full design rationale and synthetic-data
+#  validation (32% faster reaction / +16pt accuracy on short regimes,
+#  19% faster / +4pt accuracy on long regimes, with a real, disclosed
+#  cost of more false flips during extended chop on long-regime data).
+#  THIS SECTION: real-data comparison tool, NOT wired into live trading.
+#  Run /compare_stack SYMBOL to see how it behaves on actual coin history.
+# =============================================================================
+
+def _classic_4ema_stack_series(close: pd.Series, p1=20, p2=50, p3=100, p4=200) -> pd.Series:
+    """The bot's current Filter 5 logic, as a full time series (1=bull,-1=bear,0=neither)."""
+    e1 = close.ewm(span=p1, adjust=False).mean()
+    e2 = close.ewm(span=p2, adjust=False).mean()
+    e3 = close.ewm(span=p3, adjust=False).mean()
+    e4 = close.ewm(span=p4, adjust=False).mean()
+    bull = (e1 > e2) & (e2 > e3) & (e3 > e4)
+    bear = (e1 < e2) & (e2 < e3) & (e3 < e4)
+    out = pd.Series(0, index=close.index)
+    out[bull] = 1
+    out[bear] = -1
+    return out
+
+
+def _adaptive_4kama_stack_series(close: pd.Series, volume: pd.Series,
+                                  p1=20, p2=50, p3=100, p4=200,
+                                  vol_confirm_thresh: float = 1.3,
+                                  hysteresis_bars: int = 4) -> pd.Series:
+    """
+    Proposed replacement for Filter 5: same 4-tier stack CONCEPT, but each
+    line is a Kaufman Adaptive MA, a stack change only counts if confirmed
+    by elevated volume, and the new state must persist for N bars before
+    the official signal flips. Parameters tuned via synthetic backtesting
+    (see conversation history) as the best balance across whipsaw/lag/accuracy.
+    """
+    k1 = _kaufman_adaptive_mean(close, fast=2, slow=p1)
+    k2 = _kaufman_adaptive_mean(close, fast=2, slow=p2)
+    k3 = _kaufman_adaptive_mean(close, fast=2, slow=p3)
+    k4 = _kaufman_adaptive_mean(close, fast=2, slow=p4)
+    raw_bull = (k1 > k2) & (k2 > k3) & (k3 > k4)
+    raw_bear = (k1 < k2) & (k2 < k3) & (k3 < k4)
+    raw_state = pd.Series(0, index=close.index)
+    raw_state[raw_bull] = 1
+    raw_state[raw_bear] = -1
+
+    vol_ratio = volume / volume.rolling(20).mean()
+
+    current_state = 0
+    challenge_count = 0
+    challenger = None
+    final = []
+    for i in range(len(close)):
+        candidate = raw_state.iloc[i]
+        if candidate == current_state:
+            challenge_count = 0
+            final.append(current_state)
+            continue
+        vr = vol_ratio.iloc[i] if pd.notna(vol_ratio.iloc[i]) else 1.0
+        vol_ok = vr >= vol_confirm_thresh
+        if challenger == candidate:
+            challenge_count += 1
+        else:
+            challenger, challenge_count = candidate, 1
+        if challenge_count >= hysteresis_bars and vol_ok and candidate != 0:
+            current_state = candidate
+            challenge_count = 0
+        final.append(current_state)
+    return pd.Series(final, index=close.index)
+
+
+def _sync_compare_stacks(symbol: str, days: int = 365) -> dict:
+    """
+    Run BOTH the classic EMA stack and the new Adaptive Confirmed Stack
+    on REAL historical Bybit data for this symbol, and report:
+      - total direction flips for each (fewer = more decisive/less noisy)
+      - the calendar dates of every flip for each method
+      - dates where the two methods currently disagree
+    No "accuracy" score is given — real history has no ground truth for
+    what the "correct" call was at each point, unlike the synthetic
+    validation data. This is an honest side-by-side comparison only.
+    """
+    try:
+        df = _sync_fetch_paginated_klines(symbol, "D", days + 220)  # +220 for EMA200 warmup
+        if df is None or len(df) < 220:
+            df = _sync_get_klines(symbol, "D", 1000)
+        if df is None or len(df) < 220:
+            return {"error": "Insufficient data (need 220+ days for EMA/KAMA 200 warmup)"}
+
+        close = df["close"].astype(float).reset_index(drop=True)
+        volume = df["volume"].astype(float).reset_index(drop=True)
+        timestamps = df["timestamp"].astype("int64").reset_index(drop=True)
+
+        classic = _classic_4ema_stack_series(close)
+        adaptive = _adaptive_4kama_stack_series(close, volume)
+
+        # Trim warmup period (first 220 bars) — both need it to stabilize
+        warmup = 220
+        n = len(close)
+
+        def ts_to_date(ts):
+            return datetime.fromtimestamp(ts/1000, tz=timezone.utc).strftime("%Y-%m-%d")
+
+        classic_flips, adaptive_flips = [], []
+        for i in range(warmup+1, n):
+            if classic.iloc[i] != classic.iloc[i-1] and classic.iloc[i] != 0:
+                classic_flips.append({
+                    "date": ts_to_date(timestamps.iloc[i]),
+                    "direction": "BULL" if classic.iloc[i]==1 else "BEAR",
+                    "price": round(float(close.iloc[i]), 6),
+                })
+            if adaptive.iloc[i] != adaptive.iloc[i-1] and adaptive.iloc[i] != 0:
+                adaptive_flips.append({
+                    "date": ts_to_date(timestamps.iloc[i]),
+                    "direction": "BULL" if adaptive.iloc[i]==1 else "BEAR",
+                    "price": round(float(close.iloc[i]), 6),
+                })
+
+        current_classic = int(classic.iloc[-1])
+        current_adaptive = int(adaptive.iloc[-1])
+        agree = current_classic == current_adaptive
+
+        return {
+            "symbol": symbol,
+            "days_analysed": n - warmup,
+            "start_date": ts_to_date(timestamps.iloc[warmup]),
+            "end_date": ts_to_date(timestamps.iloc[-1]),
+            "classic_flips": classic_flips,
+            "adaptive_flips": adaptive_flips,
+            "classic_flip_count": len(classic_flips),
+            "adaptive_flip_count": len(adaptive_flips),
+            "current_classic": {"BULL":"🟢 Bullish","BEAR":"🔴 Bearish",0:"⬜ Neutral"}.get(
+                "BULL" if current_classic==1 else "BEAR" if current_classic==-1 else 0),
+            "current_adaptive": {"BULL":"🟢 Bullish","BEAR":"🔴 Bearish",0:"⬜ Neutral"}.get(
+                "BULL" if current_adaptive==1 else "BEAR" if current_adaptive==-1 else 0),
+            "currently_agree": agree,
+        }
+    except Exception as e:
+        logger.error(f"_sync_compare_stacks({symbol}): {e}", exc_info=True)
+        return {"error": str(e)}
+
+
+@public_command
+async def cmd_compare_stack(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Real-data comparison: classic EMA 20/50/100/200 stack vs the proposed
+    Adaptive Confirmed Stack (KAMA + volume confirmation + hysteresis).
+    Usage: /compare_stack SYMBOL [days]
+    NOT wired into live trading — for evaluation only.
+    """
+    if not ctx.args:
+        await update.message.reply_text(
+            "Usage: /compare_stack SYMBOL [days]\n"
+            "Example: /compare_stack BTCUSDT 730\n\n"
+            "Compares the classic EMA 20/50/100/200 stack against the "
+            "proposed Adaptive Confirmed Stack on REAL historical data.\n"
+            "Shows flip count and flip dates for each — no accuracy score "
+            "is given since real history has no ground truth, unlike the "
+            "synthetic data used to design this indicator.")
+        return
+
+    symbol = ctx.args[0].upper()
+    if not symbol.endswith("USDT"):
+        symbol += "USDT"
+    days = int(ctx.args[1]) if len(ctx.args) > 1 else 365
+    days = min(days, 1460)  # cap at 4 years to keep pagination reasonable
+
+    await update.message.reply_text(
+        f"⏳ Fetching real {days}-day history for {symbol} and running both "
+        f"indicators... (paginated fetch, may take 15-30s)")
+
+    result = await asyncio.to_thread(_sync_compare_stacks, symbol, days)
+
+    if result.get("error"):
+        await update.message.reply_text(f"❌ {result['error']}")
+        return
+
+    agree_str = "✅ Currently AGREE" if result["currently_agree"] else "⚠️ Currently DISAGREE"
+
+    lines = [
+        f"📊 <b>Stack Comparison — {symbol}</b>",
+        f"━━━━━━━━━━━━━━━━━━━━",
+        f"Period: {result['start_date']} to {result['end_date']} "
+        f"({result['days_analysed']} days)",
+        f"",
+        f"<b>Current reading:</b>",
+        f"Classic EMA stack   : {result['current_classic']}",
+        f"Adaptive stack (new): {result['current_adaptive']}",
+        f"{agree_str}",
+        f"",
+        f"<b>Total direction flips over the period:</b>",
+        f"Classic EMA stack   : {result['classic_flip_count']} flips",
+        f"Adaptive stack (new): {result['adaptive_flip_count']} flips",
+        f"",
+    ]
+
+    # Show last 8 flips for each, most recent first
+    lines.append("<b>Recent CLASSIC flips</b> (most recent first):")
+    for f in result["classic_flips"][-8:][::-1]:
+        emoji = "🟢" if f["direction"]=="BULL" else "🔴"
+        lines.append(f"  {emoji} {f['date']} @ {f['price']}")
+    if not result["classic_flips"]:
+        lines.append("  (none in this period)")
+
+    lines.append("")
+    lines.append("<b>Recent ADAPTIVE flips</b> (most recent first):")
+    for f in result["adaptive_flips"][-8:][::-1]:
+        emoji = "🟢" if f["direction"]=="BULL" else "🔴"
+        lines.append(f"  {emoji} {f['date']} @ {f['price']}")
+    if not result["adaptive_flips"]:
+        lines.append("  (none in this period)")
+
+    lines.append(
+        f"\n<i>No accuracy score is shown — real market history has no "
+        f"ground truth for what the 'correct' call was at any point, "
+        f"unlike the synthetic data used to design this indicator. "
+        f"Compare flip DATES against known real events yourself (e.g. "
+        f"does the adaptive version turn bullish/bearish earlier around "
+        f"a move you remember?) for a real-world sanity check.\n\n"
+        f"This is evaluation-only — NOT wired into live trading yet.</i>")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
 def _sync_cycle_phase_oscillator(symbol: str, interval: str = "D",
                                   lookback: int = 300, smooth: int = 6,
                                   score_smooth: int = 8, hysteresis_bars: int = 2,
@@ -6385,6 +6971,8 @@ async def main() -> None:
     app.add_handler(CommandHandler("uptrendcoins",     cmd_uptrendcoins))
     app.add_handler(CommandHandler("downtrendcoins",   cmd_downtrendcoins))
     app.add_handler(CommandHandler("cycle",             cmd_cycle))
+    app.add_handler(CommandHandler("compare_stack",     cmd_compare_stack))
+    app.add_handler(CommandHandler("backtest_compare",  cmd_backtest_compare))
     app.add_handler(CommandHandler("help",              cmd_help))
     app.add_error_handler(error_handler)
 
