@@ -5878,14 +5878,30 @@ def _classic_4ema_stack_series(close: pd.Series, p1=20, p2=50, p3=100, p4=200) -
 
 def _adaptive_4kama_stack_series(close: pd.Series, volume: pd.Series,
                                   p1=20, p2=50, p3=100, p4=200,
-                                  vol_confirm_thresh: float = 1.3,
-                                  hysteresis_bars: int = 4) -> pd.Series:
+                                  vol_confirm_thresh: float = 1.15,
+                                  hysteresis_bars: int = 3,
+                                  max_wait_bars: int = 10) -> pd.Series:
     """
     Proposed replacement for Filter 5: same 4-tier stack CONCEPT, but each
     line is a Kaufman Adaptive MA, a stack change only counts if confirmed
     by elevated volume, and the new state must persist for N bars before
-    the official signal flips. Parameters tuned via synthetic backtesting
-    (see conversation history) as the best balance across whipsaw/lag/accuracy.
+    the official signal flips.
+
+    v2 FIX (based on real-data /backtest_compare results showing trade
+    counts collapsing to near-zero on real coins like SOL/XRP): the
+    original design required volume confirmation on the EXACT bar the
+    hysteresis counter reached its threshold — a much stricter, less
+    realistic requirement than "was there genuine volume support at any
+    point during the transition." Real volume spikes rarely land on the
+    precise final confirmation day. Fixed to check volume across the
+    WHOLE persistence window instead of one bar, lowered the threshold
+    (1.3->1.15) since real volume distributions are noisier than the
+    synthetic data this was originally calibrated on, and added a
+    max_wait_bars backstop so a genuinely persistent trend change is
+    never permanently blocked just because volume never spiked — after
+    max_wait_bars of sustained candidate persistence, the flip goes
+    through on persistence alone, treating volume as a confidence boost
+    rather than an absolute requirement.
     """
     k1 = _kaufman_adaptive_mean(close, fast=2, slow=p1)
     k2 = _kaufman_adaptive_mean(close, fast=2, slow=p2)
@@ -5902,22 +5918,45 @@ def _adaptive_4kama_stack_series(close: pd.Series, volume: pd.Series,
     current_state = 0
     challenge_count = 0
     challenger = None
+    vol_confirmed_in_window = False   # tracks whether ANY bar in the
+                                       # current challenge streak had
+                                       # elevated volume — not just the
+                                       # final bar
     final = []
     for i in range(len(close)):
         candidate = raw_state.iloc[i]
         if candidate == current_state:
             challenge_count = 0
+            challenger = None
+            vol_confirmed_in_window = False
             final.append(current_state)
             continue
+
         vr = vol_ratio.iloc[i] if pd.notna(vol_ratio.iloc[i]) else 1.0
-        vol_ok = vr >= vol_confirm_thresh
+        vol_ok_this_bar = vr >= vol_confirm_thresh
+
         if challenger == candidate:
             challenge_count += 1
         else:
             challenger, challenge_count = candidate, 1
-        if challenge_count >= hysteresis_bars and vol_ok and candidate != 0:
+            vol_confirmed_in_window = False
+
+        if vol_ok_this_bar:
+            vol_confirmed_in_window = True
+
+        # Flip if EITHER: persistence + volume confirmed anywhere in the
+        # window, OR persistence alone has lasted long enough that we
+        # shouldn't keep waiting for a volume spike that may never come.
+        persistence_ok = challenge_count >= hysteresis_bars
+        long_persistence = challenge_count >= max_wait_bars
+
+        if candidate != 0 and (
+            (persistence_ok and vol_confirmed_in_window) or long_persistence
+        ):
             current_state = candidate
             challenge_count = 0
+            challenger = None
+            vol_confirmed_in_window = False
         final.append(current_state)
     return pd.Series(final, index=close.index)
 
