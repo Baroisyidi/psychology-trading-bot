@@ -111,13 +111,17 @@ MAX_POSITION_PCT   = 0.30   # hard ceiling: position value never exceeds 30% of
 # ── Health-score entry gating ───────────────────────────────────────────────
 # Wires /health's LONG/SHORT scores into live entry decisions. A coin with
 # weak LONG health (structurally declining) needs a stronger signal (more
-# of the 6 optional filters) to justify a LONG — and vice versa for SHORT.
+# passed filters) to justify a LONG — and vice versa for SHORT. A coin's
+# health favoring one direction NEVER blocks the other direction outright
+# — it only raises the required filter count from 6/9 to 7/9 when the
+# OPPOSING direction's health clearly outweighs this one.
 # Cached per-symbol with a TTL since health score requires fetching 400
 # days of data — too expensive to recompute every 10-second scan tick.
 HEALTH_CACHE_TTL_SEC = 3600   # recompute health score at most once per hour
-HEALTH_BLOCK_BELOW   = 35     # below this score, direction is blocked entirely
-HEALTH_RAISE_BAR_BELOW = 55   # below this score, require 4 of 6 optional filters
-                               # (raised from the normal 3 of 6)
+HEALTH_BLOCK_BELOW   = 35     # legacy threshold, no longer used to block —
+                               # kept only for /health command display tiers
+HEALTH_RAISE_BAR_BELOW = 55   # opposing score must reach this + beat own
+                               # score by HEALTH_GAP_MARGIN to raise 6/9->7/9
 symbol_health_cache: dict[str, dict] = {}   # symbol -> {"long":.., "short":.., "ts":..}
 
 # ── MemeBot trading params (volatile coins — 5m/3m timeframes) ────────────
@@ -144,6 +148,10 @@ EMA_PERIODS  = [20, 50, 100, 200]
 MACD_FAST, MACD_SLOW, MACD_SIG = 12, 26, 9
 ST_PERIOD, ST_MULT = 10, 3.0
 ICHI_CONV, ICHI_BASE, ICHI_SPAN = 9, 26, 52
+VOL_CONFIRM_THRESHOLD = 1.2   # Filter 9 (mandatory): current 4H volume must be
+                               # >= 1.2x the 20-period 4H average — rejects
+                               # technically-valid setups with no real
+                               # participation behind them
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  LOGGING
@@ -865,12 +873,17 @@ def _compute_indicators(
     lbl  = "PullbackToEMA" if direction == "LONG" else "RallyToEMA"
     (passed if near else failed).append(lbl)
 
-    # Filter 8 (MANDATORY) — 1H candle
+    # Filter 8 (was mandatory, now optional) — 1H candle
+    # DEMOTED from mandatory: a single candle's shape (body size, close
+    # position) is inherently noisier than trend structure, trend
+    # strength, or volume — a lone candle can fake out easily (that's
+    # literally what a wick is). It still counts toward the optional pool.
     c    = df_1h.iloc[-1]
     body = c["close"] - c["open"]
     rng  = c["high"] - c["low"]
     if rng == 0:
         candle_ok = False
+        (failed).append("Bullish1HCandle" if direction=="LONG" else "Bearish1HCandle")
     else:
         bpct     = abs(body) / c["open"]
         cpos     = (c["close"] - c["low"]) / rng
@@ -881,11 +894,39 @@ def _compute_indicators(
             candle_ok = body < 0 and bpct >= 0.003 and cpos <= 0.5
             (passed if candle_ok else failed).append("Bearish1HCandle")
 
-    # Entry decision: both mandatory filters + 3 of remaining 6
+    # Filter 9 (MANDATORY, new) — Volume Confirmation (4H)
+    # GAP THIS FILLS: none of Filters 1-8 check participation behind a
+    # move — they're all price-structure or momentum checks. A setup can
+    # pass every structural box on thin, unconvincing volume. This
+    # directly targets the overtrading-in-chop pattern seen on coins like
+    # HYPE in real /backtest_compare results (most trades of any coin
+    # tested, among the worst win rates — the signature of entering on
+    # technically-valid-looking setups nobody is actually behind).
+    try:
+        vol_4h = df_4h["volume"].astype(float)
+        vol_ratio = float(vol_4h.iloc[-1]) / float(vol_4h.tail(20).mean()) if float(vol_4h.tail(20).mean()) > 0 else 1.0
+    except Exception:
+        vol_ratio = 1.0
+    debug["vol_ratio_4h"] = round(vol_ratio, 2)
+    volume_confirmed = vol_ratio >= VOL_CONFIRM_THRESHOLD
+    (passed if volume_confirmed else failed).append("VolumeConfirmed")
+
+    # ── Entry decision ────────────────────────────────────────────────────
+    # 3 MANDATORY filters (must ALL pass, regardless of anything else):
+    #   F1 (ADX relative to own baseline) — rejects weak/choppy trend strength
+    #   F5 (EMA stack)                    — anchors correct macro direction
+    #   F9 (Volume Confirmation)          — rejects unconvincing, thin-volume moves
+    # F8 (1H candle) is now one of the 6 OPTIONAL filters, not mandatory —
+    # a single candle's shape is noisier than trend/strength/volume and
+    # doesn't deserve the same unconditional veto power.
+    # Minimum to enter: all 3 mandatory + at least 3 of the remaining 6
+    # optional filters = 6 of 9 total passed.
+    m1 = "ADX>Baseline"
     m5 = "EMA_Bullish_Stack" if direction == "LONG" else "EMA_Bearish_Stack"
-    m8 = "Bullish1HCandle"   if direction == "LONG" else "Bearish1HCandle"
-    opt = [p for p in passed if p not in (m5, m8)]
-    should_enter = (m5 in passed) and (m8 in passed) and len(opt) >= 3
+    m9 = "VolumeConfirmed"
+    mandatory = (m1, m5, m9)
+    mandatory_ok = all(m in passed for m in mandatory)
+    should_enter = mandatory_ok and len(passed) >= 6
 
     return {
         "should_enter": should_enter,
@@ -1181,7 +1222,7 @@ async def open_trade(symbol: str, direction: str, indicators: dict, bot) -> None
         f"📌 Entry  : <code>{fill_price:.4f}</code>\n"
         f"🛡 SL     : <code>{sl:.4f}</code>  ({sl_type})\n"
         f"{tp_lines}\n"
-        f"📊 Score  : {indicators['score']}/8\n"
+        f"📊 Score  : {indicators['score']}/9\n"
         f"✅ Passed : {f_str}\n"
         f"❌ Failed : {fail_s}\n"
         f"{regime_emoji(re)} Regime: {regime_label(re)} ({rc}%)\n"
@@ -1543,13 +1584,13 @@ async def check_reversal_after_exit(symbol: str, old_direction: str, bot) -> Non
         await alert(bot,
             f"🔄 <b>REVERSAL SIGNAL — {symbol} {new_direction}</b>\n"
             f"After exiting {old_direction}, {new_direction} conditions confirmed.\n"
-            f"Score: {indicators['score']}/8 — Opening reversal trade...")
+            f"Score: {indicators['score']}/9 — Opening reversal trade...")
         await open_trade(symbol, new_direction, indicators, bot)
     else:
         await alert(bot,
             f"🟡 <b>GOING FLAT — {symbol}</b>\n"
             f"Exited {old_direction} but {new_direction} conditions not met "
-            f"(score {indicators['score']}/8 — need 5).\n"
+            f"(score {indicators['score']}/9 — need 6).\n"
             f"Bot watches and waits for next valid signal.")
 
 
@@ -2074,20 +2115,22 @@ async def _monitor_symbol_inner(symbol: str, bot, job_data: dict) -> None:
             continue
 
         # ── Health-score gate ────────────────────────────────────────────────
-        # Blocks or raises the bar for this direction based on the coin's
-        # LONG/SHORT health score (cached, ~1hr TTL — see _get_cached_health_scores).
+        # Never blocks a direction outright — raises the bar from 6/9 to
+        # 7/9 only when the OPPOSING direction's health clearly outweighs
+        # this one (see _apply_health_gate for full rationale).
         health = await _get_cached_health_scores(symbol)
-        health_score = health.get("long_score" if direction == "LONG" else "short_score", 50)
-        indicators = _apply_health_gate(indicators, direction, health_score)
+        own_score      = health.get("long_score" if direction == "LONG" else "short_score", 50)
+        opposing_score = health.get("short_score" if direction == "LONG" else "long_score", 50)
+        indicators = _apply_health_gate(indicators, direction, own_score, opposing_score)
         if not indicators["should_enter"]:
-            logger.info(f"[{symbol}] {direction} blocked by health gate: "
+            logger.info(f"[{symbol}] {direction} filtered by health gate: "
                         f"{indicators.get('health_gate_reason', '')}")
             continue
 
         indicators["regime"]            = current_regime
         indicators["regime_confidence"] = regime_conf
         logger.info(f"[{symbol}] {direction} confirmed (score {indicators['score']}) "
-                    f"regime={current_regime} health={health_score:.0f}")
+                    f"regime={current_regime} own_health={own_score:.0f}")
         await open_trade(symbol, direction, indicators, bot)
         return
 
@@ -2134,7 +2177,7 @@ async def _maybe_send_status_report(
             f"   TP1    : {'✅' if pos['tp1_hit'] else '⬜'} <code>{pos['tp1_price']:.4f}</code>\n"
             f"   TP2    : {'✅' if pos['tp2_hit'] else '⬜'} <code>{pos['tp2_price']:.4f}</code>\n"
             f"   {pnl_label}: {pnl:+.2f} USDT  |  Open: {days:.1f}d\n"
-            f"   Score  : {pos['score']}/8"
+            f"   Score  : {pos['score']}/9"
         )
     else:
         trade_info = "⏳ No open position — watching for entry signal"
@@ -2160,7 +2203,7 @@ async def _maybe_send_status_report(
                     f"   Cloud top: <code>{d.get('cloud_top','?'):.0f}</code>  "
                     f"bot: <code>{d.get('cloud_bot','?'):.0f}</code>\n"
                     f"   MACD hist: <code>{d.get('macd',{}).get('hist','?')}</code>\n"
-                    f"   LONG score : {ind['score']}/8 — "
+                    f"   LONG score : {ind['score']}/9 — "
                     f"{'🚀 SIGNAL!' if ind['should_enter'] else 'waiting'}"
                 )
                 break
@@ -2288,15 +2331,26 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "<b>📋 Strategy Rules — PsychologyBot</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
 
-        "<b>Entry Filters (5/8 required — #5 &amp; #8 mandatory):</b>\n"
-        "1. ADX &gt; 20 (trending market)\n"
+        "<b>Entry Filters (6/9 required — #1, #5 &amp; #9 mandatory):</b>\n"
+        "1. ✅ MANDATORY: ADX above coin's OWN 90-period baseline (4H) — "
+        "trend strength relative to that coin's typical state, not a fixed number\n"
         "2. Price above/below Ichimoku Cloud (Daily)\n"
         "3. RSI not extreme (not &gt;70 long / not &lt;30 short) (4H)\n"
         "4. Supertrend green=LONG / red=SHORT (4H)\n"
         "5. ✅ MANDATORY: EMA 20&gt;50&gt;100&gt;200 stack (Daily)\n"
         "6. MACD histogram green=LONG / red=SHORT (Daily)\n"
         "7. Price pulled back to 4H EMA 50 or 100\n"
-        "8. ✅ MANDATORY: Bullish/Bearish 1H candle trigger\n\n"
+        "8. Bullish/Bearish 1H candle trigger (optional — a single "
+        "candle is noisier than trend/strength/volume)\n"
+        "9. ✅ MANDATORY: Volume Confirmation (4H) — current volume ≥1.2x "
+        "the 20-period average, confirms real participation behind the move\n\n"
+
+        "<b>Health-score gate (never blocks, only raises the bar):</b>\n"
+        "Each coin gets independent LONG and SHORT health scores (0-100, "
+        "see /health). If the OPPOSING direction's score clearly beats "
+        "this direction's, the requirement rises from 6/9 to 7/9 — a "
+        "coin favoring shorts doesn't forbid longs, it just demands a "
+        "stronger long setup.\n\n"
 
         "<b>Market Regime Gate (on top of filters):</b>\n"
         "📈 Strong Uptrend → LONG only\n"
@@ -2441,7 +2495,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 f"   SL:{pos['sl_price']:.4f}\n"
                 f"   TP1:{'✅' if pos['tp1_hit'] else '⬜'} {pos['tp1_price']:.4f}  "
                 f"TP2:{'✅' if pos['tp2_hit'] else '⬜'} {pos['tp2_price']:.4f}\n"
-                f"   PnL({pnl_src}):{pnl:+.2f} USDT  Open:{days:.1f}d  Score:{pos['score']}/8"
+                f"   PnL({pnl_src}):{pnl:+.2f} USDT  Open:{days:.1f}d  Score:{pos['score']}/9"
             )
     else:
         lines.append("No open positions.")
@@ -2478,7 +2532,7 @@ async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
             await update.message.reply_text(
                 f"{e} <b>{symbol} — {direction}</b>  {status}\n"
-                f"Score: <b>{ind['score']}/8</b>\n"
+                f"Score: <b>{ind['score']}/9</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"<b>Passed:</b>\n   {p_str}\n"
                 f"<b>Failed:</b>\n   {f_str}\n"
@@ -4325,8 +4379,9 @@ def _sync_run_backtest(symbol: str, days: int, start_balance: float = 10000.0) -
                     health_cache["scores"] = _compute_health_scores_from_window(
                         df_1d_window, df_btc_window[df_btc_window["timestamp"] < day_end_ms] if df_btc_window is not None else None)
                 hs = health_cache.get("scores", {})
-                health_score = hs.get("long_score" if direction=="LONG" else "short_score", 50)
-                ind = _apply_health_gate(ind, direction, health_score)
+                own_score      = hs.get("long_score" if direction=="LONG" else "short_score", 50)
+                opposing_score = hs.get("short_score" if direction=="LONG" else "long_score", 50)
+                ind = _apply_health_gate(ind, direction, own_score, opposing_score)
                 if not ind["should_enter"]:
                     continue
 
@@ -4417,17 +4472,23 @@ def _compute_indicators_with_stack(df_1d_window, df_4h_window, df_1h_day, direct
     """
     Wraps _compute_indicators, optionally overriding ONLY Filter 5 with the
     Adaptive Confirmed Stack instead of the classic EMA 20/50/100/200 stack.
-    Filters 1-4, 6-8 are computed identically either way — this isolates
+    Filters 1-4, 6-9 are computed identically either way — this isolates
     the comparison to Filter 5's effect alone, which is the actual point
     of the comparison (does the better Filter 5 alone improve results,
     not some incidental difference elsewhere).
+
+    Mandatory set is F1 (ADX-relative), F5 (EMA/adaptive stack), F9 (Volume
+    Confirmation) — matching the current _compute_indicators structure.
+    Base requirement: all 3 mandatory + at least 3 more of the remaining
+    6 optional filters = 6 of 9 total (health gate may raise this to 7).
     """
     ind = _compute_indicators(df_1d_window, df_4h_window, df_1h_day, direction)
     if stack_mode == "classic":
         return ind
 
+    m1 = "ADX>Baseline"
     m5 = "EMA_Bullish_Stack" if direction == "LONG" else "EMA_Bearish_Stack"
-    m8 = "Bullish1HCandle"   if direction == "LONG" else "Bearish1HCandle"
+    m9 = "VolumeConfirmed"
 
     classic_m5_passed  = m5 in ind["passed"]
     adaptive_m5_passed = _get_adaptive_f5_state(adaptive_state_series, full_idx, direction)
@@ -4440,8 +4501,8 @@ def _compute_indicators_with_stack(df_1d_window, df_4h_window, df_1h_day, direct
         failed.remove(m5); passed.append(m5)
     # if they already agree, no change needed
 
-    opt = [p for p in passed if p not in (m5, m8)]
-    should_enter = (m5 in passed) and (m8 in passed) and len(opt) >= 3
+    mandatory_ok = all(m in passed for m in (m1, m5, m9))
+    should_enter = mandatory_ok and len(passed) >= 6
 
     new_ind = dict(ind)
     new_ind["passed"] = passed
@@ -4570,8 +4631,9 @@ def _run_single_stack_backtest(symbol: str, stack_mode: str, backtest_days: pd.D
                             if df_btc_window is not None else None)
                 health_cache["scores"] = _compute_health_scores_from_window(df_1d_window, btc_slice)
             hs = health_cache.get("scores", {})
-            health_score = hs.get("long_score" if direction=="LONG" else "short_score", 50)
-            ind = _apply_health_gate(ind, direction, health_score)
+            own_score      = hs.get("long_score" if direction=="LONG" else "short_score", 50)
+            opposing_score = hs.get("short_score" if direction=="LONG" else "long_score", 50)
+            ind = _apply_health_gate(ind, direction, own_score, opposing_score)
             if not ind["should_enter"]:
                 continue
 
@@ -4856,7 +4918,7 @@ def _format_backtest_results(r: dict) -> list[str]:
         trade_lines.append(
             f"{emoji} #{i+1} {t['direction']} {entry_d}→{exit_d} "
             f"@ {t['entry']:.4f} | {t.get('exit_reason','?')} | "
-            f"Score:{t['score']}/8 | PnL:{t['pnl']:+.2f}"
+            f"Score:{t['score']}/9 | PnL:{t['pnl']:+.2f}"
         )
     
     if len(trades) > 20:
@@ -5244,42 +5306,61 @@ def _compute_health_scores_from_window(df_1d_window: pd.DataFrame, df_btc_window
         return {"error": str(e), "long_score": 0, "short_score": 0}
 
 
-def _apply_health_gate(ind: dict, direction: str, health_score: float) -> dict:
+def _apply_health_gate(ind: dict, direction: str, own_score: float, opposing_score: float) -> dict:
     """
     Adjusts an already-computed indicators dict's should_enter decision
-    based on the coin's LONG or SHORT health score (whichever matches
-    the trade direction). Works on the output of _compute_indicators or
-    _compute_indicators_with_stack — decoupled from HOW the health score
-    was obtained (live cache vs backtest window) so both live trading and
-    the backtest engine can share this exact same gating logic.
+    based on how this direction's health score compares to the OPPOSITE
+    direction's score. Works on the output of _compute_indicators or
+    _compute_indicators_with_stack — decoupled from HOW the scores were
+    obtained (live cache vs backtest window) so live trading and both
+    backtest engines share this exact same gating logic.
 
-      score < HEALTH_BLOCK_BELOW (35)      -> direction blocked entirely
-      score < HEALTH_RAISE_BAR_BELOW (55)  -> require 4 of 6 optional
-                                               filters instead of normal 3
-      score >= HEALTH_RAISE_BAR_BELOW      -> unchanged (normal 3 of 6 bar)
+    DESIGN (per explicit instruction): health score NEVER blocks a
+    direction outright. A coin's health favoring SHORT does not mean
+    LONG is forbidden, and vice versa — a genuinely strong LONG setup can
+    still occur on a coin whose broader structure favors shorts, and
+    blocking it outright would throw away real signal. Instead: if the
+    OPPOSING direction's health score clearly outweighs this direction's
+    (opposing >= HEALTH_RAISE_BAR_BELOW AND opposing beats own by a
+    meaningful margin), the bar for THIS direction rises from the base
+    6-of-9 filters to 7-of-9 — a real but not absolute penalty. If health
+    is neutral or favors this direction, the normal 6-of-9 bar applies.
     """
     if ind.get("error"):
         return ind
-    m5 = "EMA_Bullish_Stack" if direction == "LONG" else "EMA_Bearish_Stack"
-    m8 = "Bullish1HCandle"   if direction == "LONG" else "Bearish1HCandle"
+
     passed = ind.get("passed", [])
-    opt = [p for p in passed if p not in (m5, m8)]
-
     new_ind = dict(ind)
-    new_ind["health_score_used"] = health_score
+    new_ind["own_health_score"] = own_score
+    new_ind["opposing_health_score"] = opposing_score
 
-    if health_score < HEALTH_BLOCK_BELOW:
-        new_ind["should_enter"] = False
-        new_ind["health_gate_reason"] = f"Blocked: {direction} health {health_score:.0f} < {HEALTH_BLOCK_BELOW}"
-    elif health_score < HEALTH_RAISE_BAR_BELOW:
-        required = (m5 in passed) and (m8 in passed) and len(opt) >= 4  # raised from 3
-        new_ind["should_enter"] = required
+    HEALTH_GAP_MARGIN = 10   # opposing must beat own by at least this much
+    opposing_clearly_favored = (
+        opposing_score >= HEALTH_RAISE_BAR_BELOW and
+        (opposing_score - own_score) >= HEALTH_GAP_MARGIN
+    )
+
+    required_total = 7 if opposing_clearly_favored else 6
+
+    # Mandatory filters (F1, F5, F9) must always pass regardless of health —
+    # health only ever affects the TOTAL bar, never bypasses the mandatory set.
+    m1 = "ADX>Baseline"
+    m5 = "EMA_Bullish_Stack" if direction == "LONG" else "EMA_Bearish_Stack"
+    m9 = "VolumeConfirmed"
+    mandatory_ok = all(m in passed for m in (m1, m5, m9))
+
+    new_ind["should_enter"] = mandatory_ok and len(passed) >= required_total
+
+    if opposing_clearly_favored:
         new_ind["health_gate_reason"] = (
-            f"Raised bar (need 4/6 optional): {direction} health {health_score:.0f}, "
-            f"had {len(opt)}/6 optional passed"
-            if not required else f"Passed raised bar: {direction} health {health_score:.0f}")
+            f"Raised bar (7/9 required): opposing health {opposing_score:.0f} vs "
+            f"own {own_score:.0f} — had {len(passed)}/9"
+        )
     else:
-        new_ind["health_gate_reason"] = f"Normal bar: {direction} health {health_score:.0f}"
+        new_ind["health_gate_reason"] = (
+            f"Normal bar (6/9 required): own health {own_score:.0f} vs "
+            f"opposing {opposing_score:.0f} — had {len(passed)}/9"
+        )
     return new_ind
 
 
@@ -5496,31 +5577,32 @@ async def cmd_health(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         lines.append(f"  {d}")
     lines.append("")
 
-    # Direction-aware bias — the actual fix: a coin with LOW long score
-    # and LOW short score is CHOPPY (raise the bar on BOTH directions),
-    # not automatically a short candidate. Only a genuinely HIGH short
-    # score should favor shorts.
-    if long_score >= 75:
-        lines.append("✅ <b>LONG bias:</b> entries favoured, normal 5/8 filter bar.")
-    elif long_score >= 55:
-        lines.append("🟡 <b>LONG bias:</b> allowed, watch for confirmation.")
-    elif long_score >= 35:
-        lines.append("🟠 <b>LONG bias:</b> needs 7/8 score (raised bar).")
-    else:
-        lines.append("🔴 <b>LONG bias:</b> blocked or requires 8/8 score.")
+    # Direction-aware bias — health NEVER blocks a direction outright.
+    # The bar only rises from 6/9 to 7/9 when the OPPOSING direction's
+    # score clearly outweighs this one (opposing >=55 AND beats own by
+    # 10+ points). A coin with LOW scores on both sides is CHOPPY — both
+    # directions get the normal 6/9 bar since neither side is "favored."
+    HEALTH_GAP_MARGIN = 10
+    long_raised  = short_score >= 55 and (short_score - long_score) >= HEALTH_GAP_MARGIN
+    short_raised = long_score >= 55 and (long_score - short_score) >= HEALTH_GAP_MARGIN
 
-    if short_score >= 75:
-        lines.append("✅ <b>SHORT bias:</b> entries favoured, normal 5/8 filter bar.")
-    elif short_score >= 55:
-        lines.append("🟡 <b>SHORT bias:</b> allowed, watch for confirmation.")
-    elif short_score >= 35:
-        lines.append("🟠 <b>SHORT bias:</b> needs 7/8 score (raised bar).")
+    if long_raised:
+        lines.append(f"🟠 <b>LONG bias:</b> raised bar — needs 7/9 filters "
+                     f"(SHORT health {short_score} clearly outweighs LONG {long_score}).")
     else:
-        lines.append("🔴 <b>SHORT bias:</b> blocked or requires 8/8 score.")
+        lines.append(f"✅ <b>LONG bias:</b> normal bar — needs 6/9 filters.")
+
+    if short_raised:
+        lines.append(f"🟠 <b>SHORT bias:</b> raised bar — needs 7/9 filters "
+                     f"(LONG health {long_score} clearly outweighs SHORT {short_score}).")
+    else:
+        lines.append(f"✅ <b>SHORT bias:</b> normal bar — needs 6/9 filters.")
 
     if long_score < 35 and short_score < 35:
-        lines.append("\n⚠️ <i>Both scores low — this coin looks CHOPPY/directionless, "
-                     "not a confident trade in either direction.</i>")
+        lines.append("\n⚠️ <i>Both scores low — this coin looks CHOPPY/directionless. "
+                     "Neither direction is penalized by health alone, but the ADX-"
+                     "relative and Volume Confirmation mandatory filters (F1, F9) "
+                     "should naturally struggle to pass in genuine chop.</i>")
     elif long_score >= 55 and short_score >= 55:
         lines.append("\n⚠️ <i>Both scores elevated — mixed signals, check regime "
                      "detector for a tiebreaker.</i>")
@@ -6945,7 +7027,7 @@ def _build_cycle_conclusion(symbol: str, halving: dict, rsi: dict,
         conclusion["action"]  = "LONG entries favoured. Standard 8-filter strategy rules apply."
     elif "Early recovery" in conclusion["cycle_type"]:
         conclusion["outlook"] = "Uptrend confirmed but not yet momentum-confirmed — higher risk of failed breakout."
-        conclusion["action"]  = "LONG entries allowed but require full 8/8 filter score, not just 5/8."
+        conclusion["action"]  = "LONG entries allowed but require full 9/9 filter score, not just 6/9."
     elif "Bear phase with relief" in conclusion["cycle_type"]:
         conclusion["outlook"] = "Downtrend intact; current bounce is historically likely to fail and resume lower."
         conclusion["action"]  = "SHORT bias. Avoid LONG entries until EMA stack turns bullish."
