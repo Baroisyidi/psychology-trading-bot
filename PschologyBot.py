@@ -4218,15 +4218,23 @@ def _sync_fetch_paginated_klines(symbol: str, interval: str,
         return None
 
 
-def _sync_run_backtest(symbol: str, days: int, start_balance: float = 10000.0) -> dict:
+def _sync_run_backtest(symbol: str, days: int, start_balance: float = 10000.0,
+                        tp_mode: str = "none") -> dict:
     """
-    Full backtest engine. Runs in a background thread.
-    Returns a results dict with all trades and summary stats.
+    Full backtest engine for the original 9-filter strategy. Runs in a
+    background thread. Returns a results dict with all trades and
+    summary stats.
+
+    tp_mode: "none" (original spec — EMA structure inversion only),
+    "fixed_pct", "atr", or "vp" (Volume Profile measured move) — same 4
+    modes available on the experimental regime strategy, via the SAME
+    shared _calc_tp_target function, so results are directly comparable
+    across both strategies.
     """
     result = {
         "symbol": symbol, "days": days, "error": None,
         "trades": [], "balance_curve": [],
-        "start_balance": start_balance,
+        "start_balance": start_balance, "tp_mode": tp_mode,
     }
     
     try:
@@ -4285,11 +4293,31 @@ def _sync_run_backtest(symbol: str, days: int, start_balance: float = 10000.0) -
             
             # ── Manage open trade ─────────────────────────────────────────────
             # NO STOP LOSS, NO TP1/TP2, NO TRAILING, NO DEAD-TRADE TIMEOUT.
-            # The ONLY exit condition is Daily EMA structure inverting.
+            # Exit conditions: take profit (if tp_mode != "none") checked
+            # first using the day's intraday range, THEN Daily EMA
+            # structure inverting — same order used by the experimental
+            # regime strategy's backtest for consistency.
             if open_trade:
                 t = open_trade
                 entry = t["entry"]
                 dir_  = t["direction"]
+
+                tp = t.get("tp")
+                tp_hit = False
+                if tp is not None:
+                    tp_hit = (dir_ == "LONG" and day_high >= tp) or \
+                             (dir_ == "SHORT" and day_low <= tp)
+
+                if tp_hit:
+                    rem = t["qty"]
+                    pnl = (tp - entry) * rem if dir_ == "LONG" else (entry - tp) * rem
+                    t.update({"exit_price": tp, "exit_reason": "TP_HIT",
+                              "exit_day": day_ts, "pnl": round(pnl, 2)})
+                    balance += pnl
+                    result["trades"].append(t)
+                    open_trade = None
+                    result["balance_curve"].append({"ts": day_ts, "bal": round(balance, 2)})
+                    continue
 
                 # Check EMA exit (using completed daily candles up to yesterday)
                 df_for_exit = df_1d.iloc[:full_i]
@@ -4359,11 +4387,20 @@ def _sync_run_backtest(symbol: str, days: int, start_balance: float = 10000.0) -
                 # Entry found — simulate the trade
                 entry_price = day_close   # enter at day's close
                 
-                # NO SL, NO TP — position sizing reverts to simple fixed %
+                # NO SL — position sizing reverts to simple fixed %
                 # of balance (matches live open_trade's new sizing, since
                 # there's no SL distance to solve risk-based qty against).
                 qty = (balance * POSITION_PCT * LEVERAGE) / entry_price
-                
+
+                # Take profit (if tp_mode != "none") — shared calculation
+                # with the experimental regime strategy so both are
+                # directly comparable on the same 4 TP mechanisms.
+                atr_val = ind.get("atr", 0.0)
+                vp_for_tp = None
+                if tp_mode == "vp":
+                    vp_for_tp = _compute_volume_profile(df_1d_window, lookback=90)
+                tp = _calc_tp_target(entry_price, direction, tp_mode, atr=atr_val, vp=vp_for_tp)
+
                 trade = {
                     "symbol":       symbol,
                     "direction":    direction,
@@ -4372,6 +4409,7 @@ def _sync_run_backtest(symbol: str, days: int, start_balance: float = 10000.0) -
                     "entry_bt_idx": bt_idx,
                     "qty":          qty,
                     "orig_qty":     qty,
+                    "tp":           tp,
                     "score":        ind["score"],
                     "passed":       ind["passed"],
                     # Will be filled on close:
@@ -4778,20 +4816,25 @@ async def cmd_backtest_compare(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -
 #  requested ("I want to test something").
 # =============================================================================
 
-def _calc_regime_strategy_tp(entry: float, direction: str, tp_mode: str,
-                              atr: float = 0.0, vp: dict = None,
-                              fixed_pct: float = 0.15, atr_mult: float = 4.0) -> Optional[float]:
+def _calc_tp_target(entry: float, direction: str, tp_mode: str,
+                     atr: float = 0.0, vp: dict = None,
+                     fixed_pct: float = 0.15, atr_mult: float = 4.0) -> Optional[float]:
     """
-    Take profit target for the experimental regime-based strategy.
-    Three modes, each producing a genuinely different target:
+    Take profit target — GENERIC, shared by both the original 9-filter
+    strategy backtest (_sync_run_backtest) and the experimental
+    regime-based strategy backtest (_sync_run_regime_strategy_backtest),
+    so the same 4 TP mechanisms can be directly compared across both.
+    Four modes, each producing a genuinely different target:
+      none      — no take profit at all (returns None)
       fixed_pct — entry ± fixed_pct (e.g. +15% LONG / -15% SHORT)
       atr       — entry ± atr_mult × ATR(14) — scales with volatility
       vp        — "measured move": projects the Value Area's height
                   (VAH − VAL at entry) from the entry price, the classic
-                  breakout target technique. Ties thematically to the
-                  Volume Profile confirmation already used for entry.
-    Returns None if tp_mode == "none" (no take profit at all) or if the
-    required inputs for the chosen mode aren't available.
+                  breakout target technique. Requires a volume profile
+                  to have been computed at entry.
+    Returns None if tp_mode == "none" or if the required inputs for the
+    chosen mode aren't available (caller should then treat the trade as
+    having no TP for that entry, not error out).
     """
     if tp_mode == "none":
         return None
@@ -4818,7 +4861,7 @@ def _sync_run_regime_strategy_backtest(symbol: str, days: int,
                                         tp_mode: str = "none") -> dict:
     """
     tp_mode: "none" (original spec, no TP), "fixed_pct", "atr", or "vp"
-    (Volume Profile measured move). See _calc_regime_strategy_tp.
+    (Volume Profile measured move). See _calc_tp_target.
     """
     result = {"symbol": symbol, "days": days, "error": None,
               "start_balance": start_balance, "tp_mode": tp_mode}
@@ -4942,7 +4985,7 @@ def _sync_run_regime_strategy_backtest(symbol: str, days: int,
             qty = (balance * POSITION_PCT * LEVERAGE) / entry_price   # no SL to size against
 
             atr_val = float(regime_result.get("indicators", {}).get("atr_pct", 0.0)) / 100 * entry_price
-            tp = _calc_regime_strategy_tp(entry_price, direction, tp_mode, atr=atr_val, vp=vp)
+            tp = _calc_tp_target(entry_price, direction, tp_mode, atr=atr_val, vp=vp)
 
             open_trade = {
                 "symbol": symbol, "direction": direction,
@@ -5225,12 +5268,19 @@ def _format_backtest_results(r: dict) -> list[str]:
             return datetime.fromtimestamp(ts/1000, tz=timezone.utc).strftime("%b %d")
         except:
             return "?"
-    
+
+    tp_mode = r.get("tp_mode", "none")
+    tp_label = {"none": "No TP (EMA structure inversion exit only)",
+                "fixed_pct": "Fixed % target (±15%)",
+                "atr": "ATR-based target (4×ATR)",
+                "vp": "Volume Profile measured move"}.get(tp_mode, tp_mode)
+
     # Message 1: Summary
     msg1 = (
         f"📊 <b>Backtest Results — {sym}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"Period       : Last {days} days\n"
+        f"Take profit  : {tp_label}\n"
         f"Start balance: ${start:,.2f}\n"
         f"Final balance: <b>${final:,.2f}</b>\n"
         f"Total PnL    : <b>{pnl:+,.2f} USDT ({ret_pct:+.1f}%)</b>\n"
@@ -5245,10 +5295,9 @@ def _format_backtest_results(r: dict) -> list[str]:
         f"Exit reasons : {reason_str}\n"
         f"\n"
         f"<b>Strategy used (live bot rules):</b>\n"
-        f"F5 EMA stack + F8 1H candle (mandatory)\n"
-        f"F7 4H EMA50/100 pullback (real 4H data)\n"
-        f"F1 ADX, F2 Ichimoku, F3 RSI, F4 Supertrend, F6 MACD\n"
-        f"SL: 4H EMA100 −2% | TP1: 1:1.5 | TP2: 1:3 | Trail last 20%\n"
+        f"F1 ADX-relative, F5 EMA stack, F9 Volume Confirmed (mandatory)\n"
+        f"6/9 filters minimum (7/9 if health gate raises the bar)\n"
+        f"No stop loss. Exit: {tp_label}, or Daily EMA structure inversion\n"
         f"10x leverage | 20% position | $10,000 starting"
     )
     
@@ -5276,20 +5325,23 @@ def _format_backtest_results(r: dict) -> list[str]:
 async def cmd_backtest(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Run a historical backtest for any symbol.
-    Usage: /backtest BTCUSDT 6m
+    Usage: /backtest BTCUSDT 6m [capital] [tp_mode]
     Periods: 1m=30d  3m=90d  6m=180d  1y=365d  2y=730d
+    tp_mode: none (default), fixed_pct, atr, vp
     """
     # Parse args
     args = ctx.args
     if len(args) < 2:
         await update.message.reply_text(
             "📊 <b>Backtest command</b>\n"
-            "Usage: <code>/backtest SYMBOL PERIOD</code>\n\n"
+            "Usage: <code>/backtest SYMBOL PERIOD [capital] [tp_mode]</code>\n\n"
             "Examples:\n"
             "  <code>/backtest BTCUSDT 6m</code>\n"
             "  <code>/backtest ETHUSDT 3m</code>\n"
-            "  <code>/backtest SOLUSDT 1y</code>\n\n"
-            "Periods: 1m (30d) · 3m (90d) · 6m (180d) · 1y (365d) · 2y (730d)\n\n"
+            "  <code>/backtest SOLUSDT 1y 10000 vp</code>\n\n"
+            "Periods: 1m (30d) · 3m (90d) · 6m (180d) · 1y (365d) · 2y (730d)\n"
+            "TP modes: none (default, EMA-exit only) · fixed_pct (±15%) · "
+            "atr (4×ATR) · vp (Volume Profile measured move)\n\n"
             "⏱ Takes 15-30 seconds (fetching real 4H+1H candles from Bybit)",
             parse_mode="HTML"
         )
@@ -5308,17 +5360,22 @@ async def cmd_backtest(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     
     start_balance = 10000.0
-    if len(args) >= 3:
-        try:
-            start_balance = float(args[2])
-        except ValueError:
-            pass
+    tp_mode = "none"
+    for extra in args[2:]:
+        if extra.lower() in ("none", "fixed_pct", "atr", "vp"):
+            tp_mode = extra.lower()
+        else:
+            try:
+                start_balance = float(extra)
+            except ValueError:
+                pass
     
     await update.message.reply_text(
         f"⏳ <b>Running backtest...</b>\n"
         f"Symbol  : {symbol}\n"
         f"Period  : {period_str} ({days} days)\n"
-        f"Capital : ${start_balance:,.0f}\n\n"
+        f"Capital : ${start_balance:,.0f}\n"
+        f"TP mode : {tp_mode}\n\n"
         f"Fetching real 4H and 1H candle data from Bybit...\n"
         f"This takes 15-30 seconds.",
         parse_mode="HTML"
@@ -5327,7 +5384,7 @@ async def cmd_backtest(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     # Run backtest in background thread — never blocks event loop
     try:
         result = await asyncio.to_thread(
-            _sync_run_backtest, symbol, days, start_balance)
+            _sync_run_backtest, symbol, days, start_balance, tp_mode)
         
         messages = _format_backtest_results(result)
         for msg in messages:
@@ -5337,6 +5394,100 @@ async def cmd_backtest(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         logger.error(f"[BACKTEST] cmd_backtest error: {e}", exc_info=True)
         await update.message.reply_text(
             f"❌ Backtest error: {e}\nCheck Render logs for details.")
+
+
+@public_command
+async def cmd_backtest_tp(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Runs the ORIGINAL 9-filter strategy FOUR times on the SAME real
+    historical data — no TP, fixed %, ATR-based, and Volume Profile
+    measured move — mirroring /backtest_regime_tp so the two strategies'
+    TP-mode comparisons can be placed side by side.
+    Usage: /backtest_tp SYMBOL PERIOD [capital]
+    """
+    if len(ctx.args) < 2:
+        await update.message.reply_text(
+            "Usage: /backtest_tp SYMBOL PERIOD [capital]\n"
+            "Example: /backtest_tp BTCUSDT 1y\n\n"
+            "Runs the ORIGINAL 9-filter strategy 4 times on the SAME real "
+            "data — no TP, fixed % (±15%), ATR-based (4×ATR), and Volume "
+            "Profile measured move — so you can see which TP mechanism "
+            "performs best on THIS strategy, and compare against "
+            "/backtest_regime_tp's results for the experimental strategy.\n\n"
+            "Periods: 1m/3m/6m/1y/2y. Takes 1-2 minutes (4 full backtests, "
+            "each fetching 4H+1H data).")
+        return
+
+    symbol = ctx.args[0].upper()
+    if not symbol.endswith("USDT"):
+        symbol += "USDT"
+    period_map = {"1m":30,"3m":90,"6m":180,"1y":365,"2y":730}
+    days = period_map.get(ctx.args[1].lower())
+    if not days:
+        await update.message.reply_text(f"Unknown period '{ctx.args[1]}'. Use: 1m, 3m, 6m, 1y, 2y")
+        return
+    start_balance = 10000.0
+    if len(ctx.args) >= 3:
+        try: start_balance = float(ctx.args[2])
+        except ValueError: pass
+
+    await update.message.reply_text(
+        f"⏳ Running ALL 4 TP variants for {symbol} ({ctx.args[1]}) on the "
+        f"ORIGINAL 9-filter strategy...\nRuns the full backtest 4 separate "
+        f"times (none, fixed_pct, atr, vp). Takes 1-2 minutes — please wait.")
+
+    modes = ["none", "fixed_pct", "atr", "vp"]
+    mode_labels = {"none": "No TP (EMA structure inversion only)",
+                   "fixed_pct": "Fixed % (±15%)", "atr": "ATR-based (4×ATR)",
+                   "vp": "Volume Profile measured move"}
+    results = {}
+    for mode in modes:
+        results[mode] = await asyncio.to_thread(
+            _sync_run_backtest, symbol, days, start_balance, mode)
+
+    lines = [
+        f"📊 <b>TP Comparison — {symbol} (Original 9-Filter Strategy)</b>",
+        f"━━━━━━━━━━━━━━━━━━━━",
+        f"Period: last {days} days | Start: ${start_balance:,.0f}",
+        f"Same F1/F5/F9 mandatory filters, 6/9 bar, health gate — ONLY the "
+        f"take-profit mechanism differs.",
+        f"",
+    ]
+
+    ranked = []
+    for mode in modes:
+        r = results[mode]
+        label = mode_labels[mode]
+        if r.get("error"):
+            lines.append(f"<b>{label}:</b> ❌ {r['error']}")
+            continue
+        trades = r.get("trades", [])
+        final = r.get("final_balance", start_balance)
+        pnl = final - start_balance
+        ret_pct = pnl / start_balance * 100
+        wins = [t for t in trades if t["pnl"] > 0]
+        win_rate = len(wins)/len(trades)*100 if trades else 0
+        tp_hits = sum(1 for t in trades if t.get("exit_reason") == "TP_HIT")
+        ranked.append((mode, ret_pct, final))
+        lines.append(
+            f"<b>{label}:</b>\n"
+            f"  Final: ${final:,.2f} | PnL: {pnl:+,.2f} ({ret_pct:+.1f}%)\n"
+            f"  Trades: {len(trades)} | Win rate: {win_rate:.1f}% | "
+            f"TP hits: {tp_hits}/{len(trades)}"
+        )
+
+    if ranked:
+        ranked.sort(key=lambda x: x[1], reverse=True)
+        winner_mode, winner_ret, winner_final = ranked[0]
+        lines.append(f"\n🏆 <b>Best on this data: {mode_labels[winner_mode]}</b> "
+                     f"({winner_ret:+.1f}% return)")
+        lines.append(f"<i>Compare against /backtest_regime_tp {symbol} "
+                     f"{ctx.args[1]} for the experimental strategy's results "
+                     f"on the same coin/period. Re-run on other coins before "
+                     f"trusting either winner — one symbol isn't proof of a "
+                     f"durable edge.</i>")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 # =============================================================================
 #  END OF BACKTEST ENGINE
@@ -7754,6 +7905,7 @@ async def main() -> None:
     app.add_handler(CommandHandler("regime",          cmd_regime))
     app.add_handler(CommandHandler("regime_all",      cmd_regime_all))
     app.add_handler(CommandHandler("backtest",         cmd_backtest))
+    app.add_handler(CommandHandler("backtest_tp",      cmd_backtest_tp))
     app.add_handler(CommandHandler("screen",           cmd_screen))
     app.add_handler(CommandHandler("health",           cmd_health))
     app.add_handler(CommandHandler("uptrendcoins",     cmd_uptrendcoins))
