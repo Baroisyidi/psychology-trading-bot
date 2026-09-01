@@ -1426,9 +1426,23 @@ def _sync_detect_regime(symbol: str,
     }
 
     try:
-        close = df_1d["close"]
-        high  = df_1d["high"]
-        low   = df_1d["low"]
+        # FIX: use only CLOSED daily candles for regime classification —
+        # matching the same fix applied to entry filters after the
+        # EIGENUSDT whipsaw bug. The last row of df_1d is Bybit's still-
+        # forming, currently-updating candle; reading it directly meant
+        # every one of the 11 regime signals (7 lagging + 4 leading) could
+        # flicker as today's price ticks up and down, especially the
+        # price-structure leading indicator (3-4 consecutive closes),
+        # which would count today's still-changing close as one of those
+        # closes. Regime classification is a structural read of completed
+        # market state, not a live-execution price — there's no reason
+        # for it to react to an incomplete candle the way order fills must.
+        df_1d_closed = df_1d.iloc[:-1] if len(df_1d) > 1 else df_1d
+
+        close = df_1d_closed["close"]
+        high  = df_1d_closed["high"]
+        low   = df_1d_closed["low"]
+        vol   = df_1d_closed["volume"]
 
         # ── Indicator 1: ADX (trend strength) ────────────────────────────────
         adx_s = ta.adx(high, low, close, length=14)
@@ -1471,7 +1485,7 @@ def _sync_detect_regime(symbol: str,
         rsi   = float(rsi_s.iloc[-1]) if rsi_s is not None else 50.0
 
         # ── Indicator 6: Volume ratio (current vs 20-period avg) ─────────────
-        vol     = df_1d["volume"]
+        # `vol` already set from df_1d_closed at the top of this function
         avg_vol = float(vol.iloc[-21:-1].mean()) if len(vol) > 21 else float(vol.mean())
         cur_vol = float(vol.iloc[-1])
         vol_ratio = cur_vol / avg_vol if avg_vol > 0 else 1.0
@@ -1687,6 +1701,47 @@ def _sync_detect_regime(symbol: str,
         winner  = max(scores, key=lambda k: scores[k])
         raw_score = scores[winner]
         confidence = min(100, int(raw_score / max_possible[winner] * 100))
+
+        # ── CPO cross-check ────────────────────────────────────────────────
+        # Independent confirmation from a second, differently-built signal
+        # (Kaufman adaptive means + volume-price coherence + cyclic-order
+        # prior — see _compute_cpo_from_series). Reuses the SAME already-
+        # fetched close/high/low/vol Series computed above — no extra
+        # Bybit API call. When CPO's high-confidence reading (validated
+        # ~82% accurate) agrees with the winning regime, confidence gets a
+        # small bounded boost. When it conflicts, confidence gets a small
+        # bounded penalty and the conflict is surfaced — CPO never
+        # silently overrides the primary 11-signal winner, it only adds or
+        # subtracts trust in a transparent, capped way.
+        cpo_result = _compute_cpo_from_series(close, high, low, vol)
+        cpo_agreement = "NEUTRAL"
+        cpo_note = None
+
+        if not cpo_result.get("error"):
+            cpo_phase = cpo_result["phase"]
+            cpo_conf  = cpo_result["confidence"]
+
+            # Map CPO phases to the regime(s) they'd confirm if genuinely aligned
+            bullish_confirm = winner == REGIME_STRONG_UPTREND and cpo_phase == "Expansion"
+            bearish_confirm = winner == REGIME_STRONG_DOWNTREND and cpo_phase == "Capitulation"
+            chop_confirm    = winner in (REGIME_CHOPPY_RANGING, REGIME_MEAN_REVERTING) and cpo_phase == "Compression"
+            bullish_conflict = winner == REGIME_STRONG_UPTREND and cpo_phase == "Capitulation"
+            bearish_conflict = winner == REGIME_STRONG_DOWNTREND and cpo_phase == "Expansion"
+
+            if cpo_conf >= 55 and (bullish_confirm or bearish_confirm or chop_confirm):
+                confidence = min(100, confidence + 5)
+                cpo_agreement = "AGREE"
+                cpo_note = f"CPO confirms via {cpo_phase} phase ({cpo_conf}% CPO confidence)"
+            elif cpo_conf >= 55 and (bullish_conflict or bearish_conflict):
+                confidence = max(10, confidence - 5)
+                cpo_agreement = "CONFLICT"
+                cpo_note = f"CPO reads {cpo_phase} phase ({cpo_conf}% CPO confidence) — disagrees with {winner}"
+            else:
+                cpo_note = f"CPO reads {cpo_phase} phase ({cpo_conf}% CPO confidence) — neutral vs {winner}"
+
+        result["cpo"] = cpo_result
+        result["cpo_agreement"] = cpo_agreement
+        result["cpo_note"] = cpo_note
 
         result["regime"]        = winner
         result["confidence"]    = confidence
@@ -3834,6 +3889,21 @@ async def cmd_regime(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     leading_text = ("\n".join(leading_lines)) if leading_lines else "No leading signals firing"
     accel_str = f"{ind.get('slope_accel',0):+.4f}"
 
+    # CPO cross-check section — independent second-opinion signal
+    cpo = r.get("cpo", {})
+    cpo_agreement = r.get("cpo_agreement", "NEUTRAL")
+    cpo_note = r.get("cpo_note")
+    if cpo.get("error") or not cpo_note:
+        cpo_section = "<b>CPO cross-check:</b>\nUnavailable (insufficient data for this coin)"
+    else:
+        agreement_emoji = {"AGREE": "✅", "CONFLICT": "⚠️", "NEUTRAL": "➖"}[cpo_agreement]
+        cpo_section = (
+            f"<b>CPO cross-check (independent signal):</b> {agreement_emoji}\n"
+            f"{cpo.get('phase_emoji','')} Phase: {cpo.get('phase','?')} "
+            f"({cpo.get('confidence','?')}% CPO confidence)\n"
+            f"{cpo_note}"
+        )
+
     await update.message.reply_text(
         f"{regime_emoji(reg)} <b>Market Regime — {symbol}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -3854,7 +3924,8 @@ async def cmd_regime(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"RSI(14)     : <code>{ind.get('rsi','?')}</code> "
         f"| Vol ratio: <code>{ind.get('vol_ratio','?')}x</code>\n"
         f"Price 3d    : <code>{ind.get('price_chg_3d','?')}%</code> "
-        f"| Hist vol: <code>{ind.get('hist_vol','?')}%</code>",
+        f"| Hist vol: <code>{ind.get('hist_vol','?')}%</code>\n\n"
+        f"{cpo_section}",
         parse_mode="HTML"
     )
 
@@ -3976,6 +4047,106 @@ def _sync_fetch_binance_klines(symbol: str, interval: str, days_back: int) -> Op
     except Exception as e:
         logger.error(f"_sync_fetch_binance_klines({symbol},{interval}): {e}", exc_info=True)
         return None
+
+
+def _compute_volume_profile(df: pd.DataFrame, lookback: int = 90, num_bins: int = 50) -> dict:
+    """
+    Volume Profile — a genuinely different indicator category from
+    volume-over-time (vol_ratio etc. already used elsewhere in the bot):
+    this is volume-BY-PRICE, showing how much total volume traded at each
+    price level over the lookback window.
+
+    DATA LIMITATION (disclosed honestly): Bybit's API only provides OHLCV
+    bars, not tick-level or footprint data. A true volume profile needs to
+    know how volume was distributed WITHIN each candle, which isn't
+    available. This uses the standard industry-approximation (same method
+    TradingView's built-in volume profile and most retail tools use):
+    each candle's volume is spread evenly across the price bins its
+    high-low range touches. This is an approximation, not the real thing,
+    but it's standard practice, not something exotic.
+
+    Returns:
+      poc  — Point of Control: the single price level with the most
+             traded volume (the "fair value" the market has agreed on)
+      vah  — Value Area High: upper bound of the range containing ~70%
+             of total volume
+      val  — Value Area Low: lower bound of that same range
+      position — where CURRENT price sits: ABOVE_VALUE_AREA (genuine
+             breakout territory, thin historical resistance),
+             BELOW_VALUE_AREA (genuine breakdown territory), or
+             INSIDE_VALUE_AREA (still within the established trading
+             range — the classic chop/mean-reversion signature)
+    """
+    try:
+        window = df.tail(lookback)
+        if len(window) < 20:
+            return {"error": "Insufficient data for volume profile"}
+
+        lo = float(window["low"].min())
+        hi = float(window["high"].max())
+        if hi <= lo:
+            return {"error": "Degenerate price range"}
+
+        bin_edges = np.linspace(lo, hi, num_bins + 1)
+        bin_volumes = np.zeros(num_bins)
+
+        lows  = window["low"].astype(float).values
+        highs = window["high"].astype(float).values
+        vols  = window["volume"].astype(float).values
+
+        for row_lo, row_hi, row_vol in zip(lows, highs, vols):
+            if row_hi <= row_lo or row_vol <= 0:
+                continue
+            start_idx = max(0, np.searchsorted(bin_edges, row_lo, side="right") - 1)
+            end_idx   = min(num_bins, np.searchsorted(bin_edges, row_hi, side="left"))
+            n_touched = max(1, end_idx - start_idx)
+            vol_per_bin = row_vol / n_touched
+            for b in range(start_idx, end_idx):
+                bin_volumes[b] += vol_per_bin
+
+        poc_idx = int(np.argmax(bin_volumes))
+        poc_price = float((bin_edges[poc_idx] + bin_edges[poc_idx + 1]) / 2)
+
+        # Expand outward from POC until ~70% of total volume is captured —
+        # standard Value Area construction
+        total_vol = float(bin_volumes.sum())
+        if total_vol <= 0:
+            return {"error": "No volume in profile window"}
+        target = total_vol * 0.70
+        lo_i = hi_i = poc_idx
+        captured = bin_volumes[poc_idx]
+        while captured < target and (lo_i > 0 or hi_i < num_bins - 1):
+            vol_below = bin_volumes[lo_i - 1] if lo_i > 0 else -1
+            vol_above = bin_volumes[hi_i + 1] if hi_i < num_bins - 1 else -1
+            if vol_below >= vol_above:
+                lo_i -= 1
+                captured += bin_volumes[lo_i]
+            else:
+                hi_i += 1
+                captured += bin_volumes[hi_i]
+
+        vah = float(bin_edges[hi_i + 1])
+        val = float(bin_edges[lo_i])
+
+        current_price = float(df["close"].iloc[-1])
+        if current_price > vah:
+            position = "ABOVE_VALUE_AREA"
+        elif current_price < val:
+            position = "BELOW_VALUE_AREA"
+        else:
+            position = "INSIDE_VALUE_AREA"
+
+        return {
+            "poc": round(poc_price, 6),
+            "vah": round(vah, 6),
+            "val": round(val, 6),
+            "current_price": round(current_price, 6),
+            "position": position,
+            "lookback": lookback,
+        }
+    except Exception as e:
+        logger.error(f"_compute_volume_profile: {e}", exc_info=True)
+        return {"error": str(e)}
 
 
 def _sync_fetch_paginated_klines(symbol: str, interval: str,
@@ -4584,6 +4755,260 @@ async def cmd_backtest_compare(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -
     result = await asyncio.to_thread(_sync_run_backtest_comparison, symbol, days, start_balance)
     messages = _format_stack_comparison(result)
     for msg in messages:
+        await update.message.reply_text(msg, parse_mode="HTML")
+
+
+# =============================================================================
+#  EXPERIMENTAL: REGIME-BASED STRATEGY BACKTEST
+#  A genuinely different strategy from the live 9-filter system, built to
+#  TEST an idea before deciding whether to promote it to live trading —
+#  same pattern used for CPO and the Adaptive Confirmed Stack.
+#
+#  Entry: LONG on confirmed Strong Uptrend regime, SHORT on confirmed
+#         Strong Downtrend regime, with Volume Profile confirmation
+#         (price must be OUTSIDE the Value Area — genuine breakout, not
+#         noise inside an established range). Choppy/Mean Reverting/
+#         Volatile Breakout/Unknown regimes are all blocked from entry.
+#  Exit:  LONG exits when Daily close < EMA50. SHORT exits when Daily
+#         close > EMA50. No stop loss, no take profit, no dead-trade
+#         timeout — this mirrors the live strategy's current no-SL design,
+#         just with a much simpler single-EMA exit instead of full 4-EMA-
+#         stack inversion.
+#  NOT wired into live trading — backtest/evaluation only, exactly as
+#  requested ("I want to test something").
+# =============================================================================
+
+def _sync_run_regime_strategy_backtest(symbol: str, days: int,
+                                        start_balance: float = 10000.0) -> dict:
+    result = {"symbol": symbol, "days": days, "error": None, "start_balance": start_balance}
+    try:
+        logger.info(f"[REGIME BACKTEST] Starting {symbol} {days}d...")
+        warmup = 220   # regime detector needs 200+ candles for EMA200/CPO rolling(60) etc.
+        total_days = days + warmup
+
+        df_1d = _sync_fetch_paginated_klines(symbol, "D",   total_days)
+        df_4h = _sync_fetch_paginated_klines(symbol, "240", total_days)
+
+        if df_1d is None or df_4h is None:
+            result["error"] = "Failed to fetch candle data from Bybit"
+            return result
+
+        cutoff_ms = (int(time.time()) - days * 86400) * 1000
+        backtest_days = df_1d[df_1d["timestamp"] >= cutoff_ms].copy()
+        if len(backtest_days) < 10:
+            result["error"] = f"Only {len(backtest_days)} daily candles — need at least 10"
+            return result
+
+        balance = start_balance
+        open_trade = None
+        trades = []
+        balance_curve = [{"ts": int(backtest_days.iloc[0]["timestamp"]), "bal": balance}]
+
+        for bt_idx, (_, day_row) in enumerate(backtest_days.iterrows()):
+            day_ts    = int(day_row["timestamp"])
+            day_close = float(day_row["close"])
+
+            full_idx_list = df_1d.index[df_1d["timestamp"] == day_ts].tolist()
+            if not full_idx_list:
+                continue
+            full_i = full_idx_list[0]
+            if full_i < warmup:
+                continue
+
+            # Cap the window at 300 rows, matching exactly what live trading
+            # passes to the regime detector — keeps backtest behaviour
+            # faithful to what the live bot would actually see, and keeps
+            # the regime detector (which internally also runs CPO) fast.
+            window_start = max(0, full_i - 299)
+            df_1d_window = df_1d.iloc[window_start:full_i + 1]
+            day_end_ms = day_ts + 86400000
+            df_4h_window = df_4h[df_4h["timestamp"] < day_end_ms].tail(300)
+            if len(df_4h_window) < 50:
+                continue
+
+            # ── Manage open trade — EMA50-only exit, no SL/TP/dead-trade ────────
+            if open_trade:
+                t = open_trade
+                dir_ = t["direction"]
+                # EMA50 computed on CLOSED daily candles only (drop the
+                # still-forming current row), matching the fix applied
+                # everywhere else in this bot to avoid live-candle flicker.
+                df_for_exit = df_1d.iloc[:full_i]
+                if len(df_for_exit) >= 51:
+                    ema50_exit = float(df_for_exit["close"].ewm(span=50, adjust=False).mean().iloc[-1])
+                    exit_now = (dir_ == "LONG" and day_close < ema50_exit) or \
+                               (dir_ == "SHORT" and day_close > ema50_exit)
+                    if exit_now:
+                        rem = t["qty"]
+                        pnl = (day_close - t["entry"]) * rem if dir_ == "LONG" else (t["entry"] - day_close) * rem
+                        t.update({"exit_price": day_close, "exit_reason": "EMA50_EXIT",
+                                  "exit_day": day_ts, "pnl": round(pnl, 2)})
+                        balance += pnl
+                        trades.append(t)
+                        open_trade = None
+                        balance_curve.append({"ts": day_ts, "bal": round(balance, 2)})
+                continue
+
+            # ── Look for new entry — regime-driven, volume-profile-confirmed ────
+            try:
+                regime_result = _sync_detect_regime(symbol, df_1d_window, df_4h_window)
+            except Exception as e:
+                logger.debug(f"[REGIME BACKTEST] regime error day {bt_idx}: {e}")
+                continue
+
+            regime = regime_result.get("regime", REGIME_UNKNOWN)
+            if regime not in (REGIME_STRONG_UPTREND, REGIME_STRONG_DOWNTREND):
+                continue   # Choppy/Mean Reverting/Volatile Breakout/Unknown all blocked
+
+            vp = _compute_volume_profile(df_1d_window, lookback=90)
+            if vp.get("error"):
+                continue
+
+            direction = None
+            if regime == REGIME_STRONG_UPTREND and vp["position"] == "ABOVE_VALUE_AREA":
+                direction = "LONG"
+            elif regime == REGIME_STRONG_DOWNTREND and vp["position"] == "BELOW_VALUE_AREA":
+                direction = "SHORT"
+
+            if direction is None:
+                continue   # regime confirmed but volume profile doesn't confirm breakout
+
+            entry_price = day_close
+            qty = (balance * POSITION_PCT * LEVERAGE) / entry_price   # no SL to size against
+
+            open_trade = {
+                "symbol": symbol, "direction": direction,
+                "entry": round(entry_price, 6), "entry_day": day_ts, "entry_bt_idx": bt_idx,
+                "qty": qty, "orig_qty": qty,
+                "regime": regime, "regime_confidence": regime_result.get("confidence", 0),
+                "vp_position": vp["position"], "vp_poc": vp["poc"],
+                "exit_price": None, "exit_reason": None, "exit_day": None, "pnl": 0.0,
+            }
+
+        if open_trade:
+            t = open_trade
+            last_close = float(backtest_days.iloc[-1]["close"])
+            rem = t["qty"]
+            pnl = (last_close - t["entry"]) * rem if t["direction"] == "LONG" else (t["entry"] - last_close) * rem
+            t.update({"exit_price": last_close, "exit_reason": "PERIOD_END",
+                      "exit_day": int(backtest_days.iloc[-1]["timestamp"]), "pnl": round(pnl, 2)})
+            balance += pnl
+            trades.append(t)
+
+        result["trades"] = trades
+        result["final_balance"] = round(balance, 2)
+        result["balance_curve"] = balance_curve
+        logger.info(f"[REGIME BACKTEST] Done: {len(trades)} trades, final ${balance:.2f}")
+
+    except Exception as e:
+        logger.error(f"[REGIME BACKTEST] failed: {e}", exc_info=True)
+        result["error"] = str(e)
+    return result
+
+
+def _format_regime_strategy_results(r: dict) -> list[str]:
+    if r.get("error"):
+        return [f"❌ Regime-strategy backtest failed: {r['error']}"]
+
+    trades = r["trades"]
+    sym, days, start = r["symbol"], r["days"], r["start_balance"]
+    final = r.get("final_balance", start)
+    pnl = final - start
+    ret_pct = pnl / start * 100
+
+    if not trades:
+        return [
+            f"📊 <b>Regime Strategy Backtest — {sym}</b>\n"
+            f"No trades in this period — either no Strong Uptrend/Downtrend "
+            f"regime occurred, or Volume Profile never confirmed a breakout "
+            f"outside the Value Area during one."
+        ]
+
+    wins   = [t for t in trades if t["pnl"] > 0]
+    losses = [t for t in trades if t["pnl"] <= 0]
+    win_rate = len(wins) / len(trades) * 100
+
+    def ts_to_date(ts):
+        try:
+            return datetime.fromtimestamp(ts/1000, tz=timezone.utc).strftime("%b %d, %Y")
+        except Exception:
+            return "?"
+
+    msg1 = (
+        f"📊 <b>Regime Strategy Backtest — {sym}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"<i>EXPERIMENTAL — not wired into live trading</i>\n\n"
+        f"Entry: LONG on Strong Uptrend + price above Value Area\n"
+        f"       SHORT on Strong Downtrend + price below Value Area\n"
+        f"Exit : Daily close crosses EMA50 (against position direction)\n"
+        f"No SL, no TP, no dead-trade timeout. Choppy/Mean Reverting/\n"
+        f"Volatile Breakout regimes blocked entirely.\n\n"
+        f"Period: last {days} days | Start: ${start:,.0f}\n"
+        f"Final balance: <b>${final:,.2f}</b>\n"
+        f"PnL: <b>{pnl:+,.2f} USDT ({ret_pct:+.1f}%)</b>\n"
+        f"Trades: {len(trades)} | Win rate: {win_rate:.1f}% ({len(wins)}W/{len(losses)}L)"
+    )
+
+    lines = [f"📋 <b>Trade Log — {sym}</b>", "━━━━━━━━━━━━━━━━━━━━"]
+    for i, t in enumerate(trades[:15]):
+        emoji = "🟢" if t["pnl"] > 0 else "🔴"
+        entry_d = ts_to_date(t["entry_day"])
+        exit_d  = ts_to_date(t["exit_day"]) if t["exit_day"] else "Open"
+        lines.append(
+            f"{emoji} #{i+1} {t['direction']} {entry_d}→{exit_d} "
+            f"@ {t['entry']:.4f} | regime {t.get('regime_confidence','?')}% | "
+            f"VP:{t.get('vp_position','?')} | {t['exit_reason']} | PnL:{t['pnl']:+.2f}"
+        )
+    if len(trades) > 15:
+        lines.append(f"... and {len(trades)-15} more trades")
+    msg2 = "\n".join(lines)
+
+    return [msg1, msg2]
+
+
+@public_command
+async def cmd_backtest_regime(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    EXPERIMENTAL strategy backtest: regime-driven entries (Strong Uptrend/
+    Downtrend only, Volume-Profile-confirmed breakout) with a simple
+    EMA50 exit, no SL/TP/dead-trade. NOT wired into live trading.
+    Usage: /backtest_regime SYMBOL PERIOD [capital]
+    """
+    if len(ctx.args) < 2:
+        await update.message.reply_text(
+            "Usage: /backtest_regime SYMBOL PERIOD [capital]\n"
+            "Example: /backtest_regime BTCUSDT 1y\n\n"
+            "EXPERIMENTAL strategy — NOT the live bot's 9-filter system:\n"
+            "• LONG on confirmed Strong Uptrend + price above Volume Profile "
+            "Value Area\n"
+            "• SHORT on confirmed Strong Downtrend + price below Value Area\n"
+            "• Exit: Daily close crosses EMA50 against the position\n"
+            "• No SL, no TP, no dead-trade timeout\n"
+            "• Choppy/Mean Reverting/Volatile Breakout regimes blocked\n\n"
+            "Periods: 1m/3m/6m/1y/2y. Takes 30-60s (runs full regime "
+            "detection + CPO cross-check every backtest day).")
+        return
+
+    symbol = ctx.args[0].upper()
+    if not symbol.endswith("USDT"):
+        symbol += "USDT"
+    period_map = {"1m":30,"3m":90,"6m":180,"1y":365,"2y":730}
+    days = period_map.get(ctx.args[1].lower())
+    if not days:
+        await update.message.reply_text(f"Unknown period '{ctx.args[1]}'. Use: 1m, 3m, 6m, 1y, 2y")
+        return
+    start_balance = 10000.0
+    if len(ctx.args) >= 3:
+        try: start_balance = float(ctx.args[2])
+        except ValueError: pass
+
+    await update.message.reply_text(
+        f"⏳ Running EXPERIMENTAL regime-strategy backtest for {symbol} "
+        f"({ctx.args[1]})...\nRuns full regime detection (incl. CPO cross-"
+        f"check) + volume profile every day. Takes 30-60 seconds.")
+
+    result = await asyncio.to_thread(_sync_run_regime_strategy_backtest, symbol, days, start_balance)
+    for msg in _format_regime_strategy_results(result):
         await update.message.reply_text(msg, parse_mode="HTML")
 
 
@@ -6278,65 +6703,23 @@ async def cmd_compare_stack(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
-def _sync_cycle_phase_oscillator(symbol: str, interval: str = "D",
-                                  lookback: int = 300, smooth: int = 6,
-                                  score_smooth: int = 8, hysteresis_bars: int = 2,
-                                  hysteresis_margin: float = 12,
-                                  order_prior_weight: float = 15) -> dict:
+def _compute_cpo_from_series(close: pd.Series, high: pd.Series, low: pd.Series,
+                              vol: pd.Series, smooth: int = 6, score_smooth: int = 8,
+                              hysteresis_bars: int = 2, hysteresis_margin: float = 12,
+                              order_prior_weight: float = 15) -> dict:
     """
-    CYCLE PHASE OSCILLATOR (CPO) v8 — custom-built indicator.
-
-    Unlike RSI, EMA, BB-width, or Fourier analysis (which all try to
-    measure cycle LENGTH — unreliable in non-stationary crypto markets),
-    the CPO measures cycle PHASE: where in the behavioral sequence a coin
-    currently sits. The sequence Compression → Expansion → Euphoria →
-    Capitulation is invariant regardless of whether a full cycle takes
-    3 weeks or 3 years, which is what makes phase more robust than length.
-
-    DESIGN (v8 — rule-based scoring, not geometric projection):
-    Each of the 4 phases gets an independently-computed 0-100+ score built
-    from 5 sub-signals, similar in spirit to the bot's own regime detector:
-      A) Volatility trend (z-scored ATR%, is energy building or releasing)
-      B) Volume-price coherence (do price and volume agree, or diverge —
-         divergence is the behavioral tell of distribution/Euphoria)
-      C) Displacement from an adaptive mean (Kaufman KAMA — self-adjusting
-         to trend speed, so "far from equilibrium" is regime-independent)
-      D) Momentum persistence + deceleration (directional consistency AND
-         whether that persistence is fading — the exhaustion signature)
-      E) Range contraction ratio (today's range vs 20-bar avg — independent
-         volatility-STRUCTURE check distinct from ATR trend)
-
-    Scores are smoothed over time, then a CYCLIC-ORDER PRIOR is applied:
-    since phases must progress in a fixed sequence, staying in the current
-    phase or advancing to the next one in sequence gets a small boost,
-    while "skipping" 2+ steps ahead gets a penalty — this encodes genuine
-    domain knowledge (the cycle can't skip Expansion and jump straight
-    from Compression to Euphoria) that no single raw indicator captures.
-    Finally, hysteresis requires a challenger phase to beat the current
-    phase by a margin for several consecutive bars before switching,
-    which prevents single-bar noise from flipping the reading.
-
-    VALIDATED (backtested on synthetic labelled data, 7 unseen test seeds
-    with varying noise levels 0.7x-1.5x, calibrated on 5 separate seeds):
-      - All-bar exact-phase match: ~60% avg (worst-case seed: 55%)
-      - Within-one-phase-step: ~91% avg
-      - HIGH-CONFIDENCE bars only (confidence≥55): ~82% avg exact match
-        (worst-case seed: 76%) — this is the number that matters for
-        trading decisions. When the CPO reports high confidence, trust it.
-        When confidence is low, treat the phase as informational only.
-
-    Returns current phase, a confidence score (0-100), and trading bias.
+    Core CPO v8 computation — operates on already-fetched Series, no
+    internal data fetch. This lets callers that already have candle data
+    in memory (like the regime detector, which already fetched df_1d for
+    its own 11 signals) reuse it directly instead of triggering a
+    duplicate Bybit API call every time CPO is consulted. See
+    _sync_cycle_phase_oscillator (thin fetch-wrapper around this) for
+    the full design rationale and validation results.
     """
     try:
-        df = _sync_get_klines(symbol, interval, lookback)
-        if df is None or len(df) < 90:
-            return {"error": "Insufficient data"}
-
-        close = df["close"].astype(float)
-        high  = df["high"].astype(float)
-        low   = df["low"].astype(float)
-        vol   = df["volume"].astype(float)
         n = len(close)
+        if n < 90:
+            return {"error": "Insufficient data"}
 
         # ── Sub-signal A: volatility trend (z-scored ATR%) ────────────────
         tr = pd.concat([
@@ -6491,7 +6874,6 @@ def _sync_cycle_phase_oscillator(symbol: str, interval: str = "D",
         }
         phase_emoji, bias = phase_meta[phase_name]
 
-        # Days in current phase (how long since last phase transition)
         days_in_phase = 0
         for lbl in reversed(final_phase_labels):
             if lbl == phase_name:
@@ -6507,6 +6889,42 @@ def _sync_cycle_phase_oscillator(symbol: str, interval: str = "D",
             "days_in_current_phase": days_in_phase,
             "score_margin": round(margin, 1),
         }
+    except Exception as e:
+        logger.error(f"_compute_cpo_from_series: {e}", exc_info=True)
+        return {"error": str(e)}
+
+
+def _sync_cycle_phase_oscillator(symbol: str, interval: str = "D",
+                                  lookback: int = 300, smooth: int = 6,
+                                  score_smooth: int = 8, hysteresis_bars: int = 2,
+                                  hysteresis_margin: float = 12,
+                                  order_prior_weight: float = 15) -> dict:
+    """
+    Thin fetch-wrapper: fetches candle data for `symbol` then delegates to
+    _compute_cpo_from_series for the actual CPO computation. Used by
+    /cycle and /compare_stack style commands that don't already have the
+    candle data in memory. See _compute_cpo_from_series for the full
+    design rationale and validation results (this docstring trimmed since
+    the math lives there now).
+
+    VALIDATED (backtested on synthetic labelled data, 7 unseen test seeds
+    with varying noise levels 0.7x-1.5x, calibrated on 5 separate seeds):
+      - HIGH-CONFIDENCE bars only (confidence≥55): ~82% avg exact match
+        (worst-case seed: 76%) — trust CPO when confidence is high,
+        treat as informational only when confidence is low.
+    """
+    try:
+        df = _sync_get_klines(symbol, interval, lookback)
+        if df is None or len(df) < 90:
+            return {"error": "Insufficient data"}
+
+        close = df["close"].astype(float)
+        high  = df["high"].astype(float)
+        low   = df["low"].astype(float)
+        vol   = df["volume"].astype(float)
+
+        return _compute_cpo_from_series(close, high, low, vol, smooth, score_smooth,
+                                         hysteresis_bars, hysteresis_margin, order_prior_weight)
     except Exception as e:
         logger.error(f"_sync_cycle_phase_oscillator({symbol}): {e}", exc_info=True)
         return {"error": str(e)}
@@ -7177,6 +7595,7 @@ async def main() -> None:
     app.add_handler(CommandHandler("cycle",             cmd_cycle))
     app.add_handler(CommandHandler("compare_stack",     cmd_compare_stack))
     app.add_handler(CommandHandler("backtest_compare",  cmd_backtest_compare))
+    app.add_handler(CommandHandler("backtest_regime",   cmd_backtest_regime))
     app.add_handler(CommandHandler("help",              cmd_help))
     app.add_error_handler(error_handler)
 
@@ -7340,4 +7759,4 @@ if __name__ == "__main__":
     except Exception as exc:
         print(f"Fatal startup error: {exc}")
         import traceback
-        traceback.pr
+        traceback.print_exc()
