@@ -4858,15 +4858,35 @@ def _calc_tp_target(entry: float, direction: str, tp_mode: str,
 
 def _sync_run_regime_strategy_backtest(symbol: str, days: int,
                                         start_balance: float = 10000.0,
-                                        tp_mode: str = "none") -> dict:
+                                        tp_mode: str = "none",
+                                        min_confidence: int = 0) -> dict:
     """
-    tp_mode: "none" (original spec, no TP), "fixed_pct", "atr", or "vp"
-    (Volume Profile measured move). See _calc_tp_target.
+    tp_mode: "none", "fixed_pct", "atr", "vp" (Volume Profile measured
+    move), or "ema20" (take profit when Daily close crosses the EMA20
+    against the position — the fastest of the three EMAs used here, so
+    it typically triggers before the EMA100 structural exit below).
+    See _calc_tp_target for the fixed-price modes.
+
+    STRUCTURAL DESIGN (three EMAs, layered by speed):
+      EMA20  — take profit trigger (tp_mode="ema20") — fastest, exits
+               early on momentum fade
+      EMA50  — entry filter (ALWAYS applied, not a tp_mode) — price must
+               already be on the correct side of EMA50 before entry is
+               allowed, on top of regime + Volume Profile confirmation
+      EMA100 — structural exit (ALWAYS applied) — the final, most
+               patient exit; replaces the earlier EMA50-based exit
+
+    min_confidence: minimum regime confidence (0-100) required to take an
+    entry. DEFAULT 0 (no filter). Diagnostic testing found raising this
+    threshold meaningfully improved results in synthetic testing — see
+    /backtest_regime_tp notes. NOT validated on real market data.
     """
     result = {"symbol": symbol, "days": days, "error": None,
-              "start_balance": start_balance, "tp_mode": tp_mode}
+              "start_balance": start_balance, "tp_mode": tp_mode,
+              "min_confidence": min_confidence}
     try:
-        logger.info(f"[REGIME BACKTEST] Starting {symbol} {days}d tp_mode={tp_mode}...")
+        logger.info(f"[REGIME BACKTEST] Starting {symbol} {days}d tp_mode={tp_mode} "
+                    f"min_confidence={min_confidence}...")
         warmup = 220   # regime detector needs 200+ candles for EMA200/CPO rolling(60) etc.
         total_days = days + warmup
 
@@ -4912,15 +4932,18 @@ def _sync_run_regime_strategy_backtest(symbol: str, days: int,
             if len(df_4h_window) < 50:
                 continue
 
-            # ── Manage open trade — TP check (if enabled) THEN EMA50 exit ───────
+            # ── Manage open trade — checked in order: fixed-price TP, EMA20
+            # take-profit (if enabled), THEN the EMA100 structural exit ──────
             if open_trade:
                 t = open_trade
                 dir_ = t["direction"]
 
-                # Take profit — checked first using the day's intraday range,
-                # same "did price touch this level" logic used by the live
-                # bot's SL/TP checks before we removed SL. Full close, single
-                # exit (no partial-then-ride, per the chosen TP behaviour).
+                # All EMA checks use CLOSED daily candles only (drop the
+                # still-forming current row) — same fix applied everywhere
+                # else in this bot to avoid live-candle flicker.
+                df_for_exit = df_1d.iloc[:full_i]
+
+                # 1) Fixed-price TP (fixed_pct/atr/vp modes) — intraday touch
                 tp = t.get("tp")
                 tp_hit = False
                 if tp is not None:
@@ -4938,18 +4961,34 @@ def _sync_run_regime_strategy_backtest(symbol: str, days: int,
                     balance_curve.append({"ts": day_ts, "bal": round(balance, 2)})
                     continue
 
-                # EMA50 exit — computed on CLOSED daily candles only (drop the
-                # still-forming current row), matching the fix applied
-                # everywhere else in this bot to avoid live-candle flicker.
-                df_for_exit = df_1d.iloc[:full_i]
-                if len(df_for_exit) >= 51:
-                    ema50_exit = float(df_for_exit["close"].ewm(span=50, adjust=False).mean().iloc[-1])
-                    exit_now = (dir_ == "LONG" and day_close < ema50_exit) or \
-                               (dir_ == "SHORT" and day_close > ema50_exit)
+                # 2) EMA20 take-profit (tp_mode == "ema20") — checked before
+                # the EMA100 structural exit since EMA20 is faster and will
+                # almost always trigger first on a normal pullback.
+                if tp_mode == "ema20" and len(df_for_exit) >= 21:
+                    ema20_val = float(df_for_exit["close"].ewm(span=20, adjust=False).mean().iloc[-1])
+                    tp_ema20_hit = (dir_ == "LONG" and day_close < ema20_val) or \
+                                   (dir_ == "SHORT" and day_close > ema20_val)
+                    if tp_ema20_hit:
+                        rem = t["qty"]
+                        pnl = (day_close - t["entry"]) * rem if dir_ == "LONG" else (t["entry"] - day_close) * rem
+                        t.update({"exit_price": day_close, "exit_reason": "TP_EMA20",
+                                  "exit_day": day_ts, "pnl": round(pnl, 2)})
+                        balance += pnl
+                        trades.append(t)
+                        open_trade = None
+                        balance_curve.append({"ts": day_ts, "bal": round(balance, 2)})
+                        continue
+
+                # 3) EMA100 structural exit — ALWAYS active regardless of
+                # tp_mode; the final, most patient exit condition.
+                if len(df_for_exit) >= 101:
+                    ema100_exit = float(df_for_exit["close"].ewm(span=100, adjust=False).mean().iloc[-1])
+                    exit_now = (dir_ == "LONG" and day_close < ema100_exit) or \
+                               (dir_ == "SHORT" and day_close > ema100_exit)
                     if exit_now:
                         rem = t["qty"]
                         pnl = (day_close - t["entry"]) * rem if dir_ == "LONG" else (t["entry"] - day_close) * rem
-                        t.update({"exit_price": day_close, "exit_reason": "EMA50_EXIT",
+                        t.update({"exit_price": day_close, "exit_reason": "EMA100_EXIT",
                                   "exit_day": day_ts, "pnl": round(pnl, 2)})
                         balance += pnl
                         trades.append(t)
@@ -4957,7 +4996,8 @@ def _sync_run_regime_strategy_backtest(symbol: str, days: int,
                         balance_curve.append({"ts": day_ts, "bal": round(balance, 2)})
                 continue
 
-            # ── Look for new entry — regime-driven, volume-profile-confirmed ────
+            # ── Look for new entry — regime-driven, volume-profile-confirmed,
+            # EMA50-filtered ──────────────────────────────────────────────────
             try:
                 regime_result = _sync_detect_regime(symbol, df_1d_window, df_4h_window)
             except Exception as e:
@@ -4967,6 +5007,10 @@ def _sync_run_regime_strategy_backtest(symbol: str, days: int,
             regime = regime_result.get("regime", REGIME_UNKNOWN)
             if regime not in (REGIME_STRONG_UPTREND, REGIME_STRONG_DOWNTREND):
                 continue   # Choppy/Mean Reverting/Volatile Breakout/Unknown all blocked
+
+            regime_confidence = regime_result.get("confidence", 0)
+            if regime_confidence < min_confidence:
+                continue   # regime confirmed but too weak/marginal — see min_confidence docstring
 
             vp = _compute_volume_profile(df_1d_window, lookback=90)
             if vp.get("error"):
@@ -4980,6 +5024,20 @@ def _sync_run_regime_strategy_backtest(symbol: str, days: int,
 
             if direction is None:
                 continue   # regime confirmed but volume profile doesn't confirm breakout
+
+            # EMA50 entry filter — price must ALREADY be on the correct side
+            # of EMA50 (closed candles) before the entry is allowed, on top
+            # of regime + Volume Profile confirmation. This is an ADDITIONAL
+            # gate, not a replacement for the other two conditions.
+            df_for_entry_filter = df_1d.iloc[:full_i]
+            if len(df_for_entry_filter) >= 51:
+                ema50_entry = float(df_for_entry_filter["close"].ewm(span=50, adjust=False).mean().iloc[-1])
+                if direction == "LONG" and day_close <= ema50_entry:
+                    continue   # regime+VP confirmed but price not above EMA50 yet
+                if direction == "SHORT" and day_close >= ema50_entry:
+                    continue   # regime+VP confirmed but price not below EMA50 yet
+            else:
+                continue   # not enough history for the EMA50 filter — skip rather than assume
 
             entry_price = day_close
             qty = (balance * POSITION_PCT * LEVERAGE) / entry_price   # no SL to size against
@@ -5027,15 +5085,21 @@ def _format_regime_strategy_results(r: dict) -> list[str]:
     pnl = final - start
     ret_pct = pnl / start * 100
     tp_mode = r.get("tp_mode", "none")
-    tp_label = {"none": "No TP (EMA50 exit only)", "fixed_pct": "Fixed % target (±15%)",
-                "atr": "ATR-based target (4×ATR)", "vp": "Volume Profile measured move"}.get(tp_mode, tp_mode)
+    tp_label = {"none": "None (EMA100 structural exit only)",
+                "fixed_pct": "Fixed % target (±15%)",
+                "atr": "ATR-based target (4×ATR)",
+                "vp": "Volume Profile measured move",
+                "ema20": "EMA20 cross (fast take-profit)"}.get(tp_mode, tp_mode)
+    min_conf = r.get("min_confidence", 0)
 
     if not trades:
         return [
-            f"📊 <b>Regime Strategy Backtest — {sym}</b> ({tp_label})\n"
+            f"📊 <b>Regime Strategy Backtest — {sym}</b> ({tp_label}, min conf {min_conf}%)\n"
             f"No trades in this period — either no Strong Uptrend/Downtrend "
-            f"regime occurred, or Volume Profile never confirmed a breakout "
-            f"outside the Value Area during one."
+            f"regime occurred, Volume Profile never confirmed a breakout "
+            f"outside the Value Area, price never confirmed above/below "
+            f"EMA50 for entry, or no regime reading met the {min_conf}% "
+            f"minimum confidence."
         ]
 
     wins   = [t for t in trades if t["pnl"] > 0]
@@ -5052,9 +5116,13 @@ def _format_regime_strategy_results(r: dict) -> list[str]:
         f"📊 <b>Regime Strategy Backtest — {sym}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"<i>EXPERIMENTAL — not wired into live trading</i>\n\n"
-        f"Entry: LONG on Strong Uptrend + price above Value Area\n"
-        f"       SHORT on Strong Downtrend + price below Value Area\n"
-        f"Exit : Daily close crosses EMA50, OR take profit hit\n"
+        f"Entry: LONG on Strong Uptrend + price above Value Area + "
+        f"price above EMA50\n"
+        f"       SHORT on Strong Downtrend + price below Value Area + "
+        f"price below EMA50\n"
+        f"       Min regime confidence required: {min_conf}%\n"
+        f"Exit : Daily close crosses EMA100 (structural, always active), "
+        f"OR take profit hit\n"
         f"Take profit: <b>{tp_label}</b>\n"
         f"No SL, no dead-trade timeout. Choppy/Mean Reverting/\n"
         f"Volatile Breakout regimes blocked entirely.\n\n"
@@ -5085,21 +5153,32 @@ def _format_regime_strategy_results(r: dict) -> list[str]:
 async def cmd_backtest_regime(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """
     EXPERIMENTAL strategy backtest: regime-driven entries (Strong Uptrend/
-    Downtrend only, Volume-Profile-confirmed breakout) with a simple
-    EMA50 exit, no SL/TP/dead-trade. NOT wired into live trading.
-    Usage: /backtest_regime SYMBOL PERIOD [capital]
+    Downtrend, Volume-Profile-confirmed breakout, EMA50 entry filter),
+    EMA100 structural exit, no SL/dead-trade. NOT wired into live trading.
+    Usage: /backtest_regime SYMBOL PERIOD [capital] [tp_mode] [min_conf]
+    Strict positional order — capital before tp_mode before min_conf.
     """
     if len(ctx.args) < 2:
         await update.message.reply_text(
-            "Usage: /backtest_regime SYMBOL PERIOD [capital]\n"
-            "Example: /backtest_regime BTCUSDT 1y\n\n"
-            "EXPERIMENTAL strategy — NOT the live bot's 9-filter system:\n"
-            "• LONG on confirmed Strong Uptrend + price above Volume Profile "
-            "Value Area\n"
-            "• SHORT on confirmed Strong Downtrend + price below Value Area\n"
-            "• Exit: Daily close crosses EMA50 against the position\n"
-            "• No SL, no TP, no dead-trade timeout\n"
-            "• Choppy/Mean Reverting/Volatile Breakout regimes blocked\n\n"
+            "Usage: /backtest_regime SYMBOL PERIOD [capital] [tp_mode] [min_conf]\n"
+            "Example: /backtest_regime BTCUSDT 1y 10000 ema20 60\n\n"
+            "EXPERIMENTAL strategy — NOT the live bot's 9-filter system.\n"
+            "Three EMAs layered by speed:\n"
+            "• EMA20  — take profit trigger (tp_mode=ema20)\n"
+            "• EMA50  — entry filter: price must already be above EMA50 "
+            "(LONG) or below EMA50 (SHORT) before entry is allowed\n"
+            "• EMA100 — structural exit, always active regardless of tp_mode\n\n"
+            "Entry: confirmed Strong Uptrend/Downtrend regime + Volume "
+            "Profile breakout confirmation + EMA50 filter, all three required\n"
+            "No SL, no dead-trade timeout\n"
+            "Choppy/Mean Reverting/Volatile Breakout regimes blocked\n\n"
+            "tp_mode: none (EMA100 exit only) · fixed_pct (±15%) · "
+            "atr (4×ATR) · vp (Volume Profile measured move) · "
+            "ema20 (fast EMA20 cross take-profit)\n"
+            "min_conf: minimum regime confidence 0-100 required to enter "
+            "(default 0 = no filter)\n"
+            "Arguments are STRICTLY POSITIONAL: capital, then tp_mode, then "
+            "min_conf — you cannot skip one and provide the next.\n\n"
             "Periods: 1m/3m/6m/1y/2y. Takes 30-60s (runs full regime "
             "detection + CPO cross-check every backtest day).")
         return
@@ -5112,21 +5191,27 @@ async def cmd_backtest_regime(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
     if not days:
         await update.message.reply_text(f"Unknown period '{ctx.args[1]}'. Use: 1m, 3m, 6m, 1y, 2y")
         return
-    tp_mode = "none"
+
     start_balance = 10000.0
-    for extra in ctx.args[2:]:
-        if extra.lower() in ("none","fixed_pct","atr","vp"):
-            tp_mode = extra.lower()
-        else:
-            try: start_balance = float(extra)
-            except ValueError: pass
+    tp_mode = "none"
+    min_confidence = 0
+    if len(ctx.args) >= 3:
+        try: start_balance = float(ctx.args[2])
+        except ValueError: pass
+    if len(ctx.args) >= 4 and ctx.args[3].lower() in ("none","fixed_pct","atr","vp","ema20"):
+        tp_mode = ctx.args[3].lower()
+    if len(ctx.args) >= 5:
+        try: min_confidence = max(0, min(100, int(float(ctx.args[4]))))
+        except ValueError: pass
 
     await update.message.reply_text(
         f"⏳ Running EXPERIMENTAL regime-strategy backtest for {symbol} "
-        f"({ctx.args[1]}, TP mode: {tp_mode})...\nRuns full regime detection "
-        f"(incl. CPO cross-check) + volume profile every day. Takes 30-60 seconds.")
+        f"({ctx.args[1]}, TP mode: {tp_mode}, min confidence: {min_confidence}%)...\n"
+        f"Runs full regime detection (incl. CPO cross-check) + volume "
+        f"profile every day. Takes 30-60 seconds.")
 
-    result = await asyncio.to_thread(_sync_run_regime_strategy_backtest, symbol, days, start_balance, tp_mode)
+    result = await asyncio.to_thread(
+        _sync_run_regime_strategy_backtest, symbol, days, start_balance, tp_mode, min_confidence)
     for msg in _format_regime_strategy_results(result):
         await update.message.reply_text(msg, parse_mode="HTML")
 
@@ -5134,22 +5219,23 @@ async def cmd_backtest_regime(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
 @public_command
 async def cmd_backtest_regime_tp(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Runs the experimental regime-based strategy FOUR times on the SAME
-    real historical data — no TP, fixed %, ATR-based, and Volume Profile
-    measured move — to empirically answer which TP mechanism performs
-    best. Everything else (entries, EMA50 exit, regime/VP confirmation)
-    is held identical across all four runs.
+    Runs the experimental regime-based strategy FIVE times on the SAME
+    real historical data — no TP, fixed %, ATR-based, Volume Profile
+    measured move, and EMA20 cross — to empirically answer which TP
+    mechanism performs best. Everything else (entries with EMA50 filter,
+    EMA100 structural exit, regime/VP confirmation) is held identical
+    across all five runs.
     Usage: /backtest_regime_tp SYMBOL PERIOD [capital]
     """
     if len(ctx.args) < 2:
         await update.message.reply_text(
             "Usage: /backtest_regime_tp SYMBOL PERIOD [capital]\n"
             "Example: /backtest_regime_tp BTCUSDT 1y\n\n"
-            "Runs the experimental regime strategy 4 times on the SAME "
-            "real data — no TP, fixed % (±15%), ATR-based (4×ATR), and "
-            "Volume Profile measured move — so you can see which TP "
-            "mechanism actually performs best, empirically.\n\n"
-            "Periods: 1m/3m/6m/1y/2y. Takes 2-4 minutes (4 full backtests).")
+            "Runs the experimental regime strategy 5 times on the SAME "
+            "real data — no TP, fixed % (±15%), ATR-based (4×ATR), Volume "
+            "Profile measured move, and EMA20 cross — so you can see "
+            "which TP mechanism actually performs best, empirically.\n\n"
+            "Periods: 1m/3m/6m/1y/2y. Takes 3-5 minutes (5 full backtests).")
         return
 
     symbol = ctx.args[0].upper()
@@ -5166,13 +5252,15 @@ async def cmd_backtest_regime_tp(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
         except ValueError: pass
 
     await update.message.reply_text(
-        f"⏳ Running ALL 4 TP variants for {symbol} ({ctx.args[1]})...\n"
-        f"This runs the full regime-strategy backtest 4 separate times "
-        f"(none, fixed_pct, atr, vp). Takes 2-4 minutes — please wait.")
+        f"⏳ Running ALL 5 TP variants for {symbol} ({ctx.args[1]})...\n"
+        f"This runs the full regime-strategy backtest 5 separate times "
+        f"(none, fixed_pct, atr, vp, ema20). Takes 3-5 minutes — please wait.")
 
-    modes = ["none", "fixed_pct", "atr", "vp"]
-    mode_labels = {"none": "No TP (EMA50 only)", "fixed_pct": "Fixed % (±15%)",
-                   "atr": "ATR-based (4×ATR)", "vp": "Volume Profile measured move"}
+    modes = ["none", "fixed_pct", "atr", "vp", "ema20"]
+    mode_labels = {"none": "No TP (EMA100 structural exit only)",
+                   "fixed_pct": "Fixed % (±15%)", "atr": "ATR-based (4×ATR)",
+                   "vp": "Volume Profile measured move",
+                   "ema20": "EMA20 cross (fast take-profit)"}
     results = {}
     for mode in modes:
         results[mode] = await asyncio.to_thread(
@@ -5183,8 +5271,9 @@ async def cmd_backtest_regime_tp(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
         f"━━━━━━━━━━━━━━━━━━━━",
         f"<i>EXPERIMENTAL — not wired into live trading</i>",
         f"Period: last {days} days | Start: ${start_balance:,.0f}",
-        f"Same entries, same EMA50 exit, same regime/VP confirmation in "
-        f"all 4 runs — ONLY the take-profit mechanism differs.",
+        f"Same entries (regime + VP + EMA50 filter), same EMA100 "
+        f"structural exit, in all 5 runs — ONLY the take-profit "
+        f"mechanism differs.",
         f"",
     ]
 
@@ -5201,7 +5290,7 @@ async def cmd_backtest_regime_tp(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
         ret_pct = pnl / start_balance * 100
         wins = [t for t in trades if t["pnl"] > 0]
         win_rate = len(wins)/len(trades)*100 if trades else 0
-        tp_hits = sum(1 for t in trades if t.get("exit_reason") == "TP_HIT")
+        tp_hits = sum(1 for t in trades if t.get("exit_reason") in ("TP_HIT", "TP_EMA20"))
         ranked.append((mode, ret_pct, final))
         lines.append(
             f"<b>{label}:</b>\n"
