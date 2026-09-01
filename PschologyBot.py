@@ -1088,24 +1088,27 @@ async def open_trade(symbol: str, direction: str, indicators: dict, bot) -> None
         await alert(bot, f"⚠️ [{symbol}] Cannot fetch balance — trade skipped.")
         return
 
-    atr_val  = indicators.get("atr", 0.0)
     current_regime = indicators.get("regime", REGIME_UNKNOWN)
-    sl       = _calc_sl(entry, direction, indicators["e100_4h"], regime=current_regime, atr=atr_val)
-    tp1, tp2 = _calc_tps(entry, sl, direction)
     min_q, max_q, step, min_notional, max_lev = await get_instrument_constraints(symbol)
     effective_lev = actual_lev
 
-    # ── REGIME ADAPTATION — leverage cap + extra caution multiplier ─────────
-    # Base sizing is now RISK-BASED (see _calc_risk_based_qty): position
-    # size is solved from the volatility-scaled SL distance so that
-    # RISK_PCT of balance is at stake regardless of which coin/how wide
-    # the ATR-based SL turned out to be. Volatile Breakout regime still
-    # applies extra caution on TOP of that (leverage cap + 0.5x multiplier)
-    # since an active breakout is a different risk than merely elevated ATR.
+    # ── NO STOP LOSS — EMA-inversion-only exit strategy ──────────────────────
+    # This position will NOT have a stop loss order placed on Bybit, and will
+    # NOT take partial profit at any price target. The ONLY exit condition is
+    # Daily EMA structure inverting (checked in manage_position). Since there
+    # is no SL distance to size risk against, position sizing reverts to a
+    # simple fixed % of balance rather than the risk-based ATR sizing used
+    # elsewhere — there is no "risk if SL hit" to solve for anymore.
+    #
+    # IMPORTANT RISK NOTE: removing the bot's own stop does not remove risk.
+    # With leverage active, a large enough adverse move before the Daily EMA
+    # structure inverts (which only evaluates fully-closed candles and can
+    # take days) may reach Bybit's own liquidation price first — liquidation
+    # is a worse outcome than a controlled stop (forced closure + penalty),
+    # not a safer one.
     if current_regime == REGIME_VOLATILE_BREAKOUT:
-        regime_lev = min(effective_lev, 5)  # hard cap 5x
+        regime_lev = min(effective_lev, 5)
         if regime_lev < effective_lev:
-            import math
             try:
                 bybit_session.set_leverage(
                     category="linear", symbol=symbol,
@@ -1118,13 +1121,15 @@ async def open_trade(symbol: str, direction: str, indicators: dict, bot) -> None
         regime_lev = effective_lev
         regime_size_mult = 1.0
 
-    raw_qty = _calc_risk_based_qty(balance, entry, sl, regime_lev) * regime_size_mult
-    raw_qty = max(raw_qty, min_notional / entry)
+    target_margin   = balance * POSITION_PCT * regime_size_mult
+    target_notional = target_margin * regime_lev
+    raw_qty         = target_notional / entry
+    raw_qty         = max(raw_qty, min_notional / entry)
 
     qty = _round_qty(raw_qty, min_q, step)
 
-    logger.info(f"[{symbol}] Sizing: regime={current_regime} risk_pct={RISK_PCT*100:.0f}% "
-                f"sl_dist={abs(entry-sl)/entry*100:.2f}% lev={effective_lev}x qty={qty}")
+    logger.info(f"[{symbol}] Sizing (no-SL strategy): regime={current_regime} "
+                f"pos_pct={POSITION_PCT*100:.0f}% lev={effective_lev}x qty={qty}")
 
     if qty <= 0:
         await alert(bot, f"⚠️ [{symbol}] Position size too small.")
@@ -1156,31 +1161,17 @@ async def open_trade(symbol: str, direction: str, indicators: dict, bot) -> None
     real_entry = await asyncio.to_thread(_sync_get_position_entry, symbol)
     fill_price = real_entry if real_entry else entry
 
-    # Recalculate SL/TP from actual fill — regime-aware
-    atr_val  = indicators.get("atr", 0.0)
-    sl       = _calc_sl(fill_price, direction, indicators["e100_4h"],
-                        regime=current_regime, atr=atr_val)
-    tp1, tp2 = _calc_tps(fill_price, sl, direction)
-    await set_sl(symbol, sl)
-
     pos = {
         "symbol":         symbol,
         "direction":      direction,
         "entry_price":    fill_price,
-        "sl_price":       sl,
-        "tp1_price":      tp1,
-        "tp2_price":      tp2,
         "original_qty":   qty,
         "remaining_qty":  qty,
-        "tp1_hit":        False,
-        "tp2_hit":        False,
         "entry_time":     time.time(),
         "score":          indicators["score"],
         "filters_passed": indicators["passed"],
-        # Regime context — used by manage_position to adapt exit behaviour
         "entry_regime":   current_regime,
         "regime_conf":    indicators.get("regime_confidence", 0),
-        "entry_atr":      atr_val,
     }
     symbol_positions[symbol] = pos
     consec_losses = 0
@@ -1190,45 +1181,24 @@ async def open_trade(symbol: str, direction: str, indicators: dict, bot) -> None
     f_str  = " ".join([f"✅{p}" for p in indicators["passed"]])
     fail_s = " ".join([f"❌{p}" for p in indicators["failed"]])
 
-    # Build regime-specific trade plan lines
     re = indicators.get("regime", REGIME_UNKNOWN)
     rc = indicators.get("regime_confidence", 0)
-    if re == REGIME_VOLATILE_BREAKOUT:
-        tp_lines = (
-            f"🎯 TP1    : <code>{tp1:.4f}</code>  (close 40% — tight SL 0.8×ATR)\n"
-            f"🎯 TP2    : <code>{tp2:.4f}</code>  (close 40%)\n"
-            f"🌊 TP3    : Trailing last 20%\n"
-            f"⚡ Size   : HALF (10% bal, 5× lev) — breakout sizing"
-        )
-    elif re == REGIME_MEAN_REVERTING:
-        tp_lines = (
-            f"🎯 TP1    : <code>{tp1:.4f}</code>  (close 100% — full exit)\n"
-            f"⛔ TP2/TP3: SKIPPED — mean-reverting markets don't run\n"
-            f"🔄 Exit   : Take all profit at TP1, go flat"
-        )
-    else:
-        tp_lines = (
-            f"🎯 TP1    : <code>{tp1:.4f}</code>  (close 40%)\n"
-            f"🎯 TP2    : <code>{tp2:.4f}</code>  (close 40%)\n"
-            f"🌊 TP3    : Trailing last 20%"
-        )
-
-    sl_type = "0.8×ATR (tight)" if re == REGIME_VOLATILE_BREAKOUT and atr_val > 0 else "4H EMA100 −2%"
     lev_note = f"\n⚠️ Leverage capped at {effective_lev}x (symbol max, requested {LEVERAGE}x)" if effective_lev < LEVERAGE else ""
 
     await alert(bot,
         f"{emoji} <b>TRADE OPENED — {symbol} {direction}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📌 Entry  : <code>{fill_price:.4f}</code>\n"
-        f"🛡 SL     : <code>{sl:.4f}</code>  ({sl_type})\n"
-        f"{tp_lines}\n"
+        f"🚫 SL     : NONE — this strategy has no stop loss\n"
+        f"🚫 TP     : NONE — no partial profit taking\n"
+        f"🔚 Exit   : ONLY on Daily EMA structure inversion\n"
         f"📊 Score  : {indicators['score']}/9\n"
         f"✅ Passed : {f_str}\n"
         f"❌ Failed : {fail_s}\n"
         f"{regime_emoji(re)} Regime: {regime_label(re)} ({rc}%)\n"
-        f"📋 Action : {regime_action(re)}\n"
-        f"⚡ Qty    : {qty}  |  Leverage: {effective_lev}x  |  Balance: {balance:.2f} USDT{lev_note}"
-    )
+        f"⚡ Qty    : {qty}  |  Leverage: {effective_lev}x  |  Balance: {balance:.2f} USDT{lev_note}\n\n"
+        f"⚠️ <b>No bot-side stop — an adverse move before EMA inversion "
+        f"triggers may reach exchange liquidation instead.</b>")
     logger.info(f"[{symbol}] Trade opened {direction} @ {fill_price}")
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1240,13 +1210,11 @@ async def manage_position(pos: dict, bot) -> None:
     direction = pos["direction"]
 
     # ── CRITICAL: Verify position still exists on Bybit FIRST ────────────────
-    # If Bybit closed it via SL/TP while bot was offline or missed the trigger,
-    # the bot's internal state will be stale. Sync it here before doing anything.
+    # No SL/TP orders are placed anymore (EMA-inversion-only exit strategy),
+    # so this check now primarily catches manual closes or liquidation.
     actual_size = await asyncio.to_thread(_sync_get_position_size, symbol)
 
     if actual_size == 0.0:
-        # Position is GONE on Bybit — closed by SL, TP, or manually
-        # Calculate estimated PnL from last known price vs entry
         last_price  = pos.get("_last_price", pos.get("entry_price", 0))
         entry_price = pos.get("entry_price", 0)
         qty         = pos.get("original_qty", 0)
@@ -1255,40 +1223,33 @@ async def manage_position(pos: dict, bot) -> None:
         else:
             est_pnl = (entry_price - last_price) * qty
 
-        # Determine likely exit reason
-        sl  = pos.get("sl_price", 0)
-        tp1 = pos.get("tp1_price", 0)
-        if direction == "LONG":
-            exit_reason = "SL" if last_price <= sl * 1.005 else "TP1" if last_price >= tp1 * 0.995 else "BYBIT_CLOSED"
-        else:
-            exit_reason = "SL" if last_price >= sl * 0.995 else "TP1" if last_price <= tp1 * 1.005 else "BYBIT_CLOSED"
-
         logger.warning(f"[{symbol}] Position gone on Bybit! "
-                       f"Clearing internal state. Est PnL: {est_pnl:.2f} exit={exit_reason}")
+                       f"Clearing internal state. Est PnL: {est_pnl:.2f}")
 
         await alert(bot,
-            "POSITION SYNC — " + symbol + " " + direction + "\n"
+            "⚠️ POSITION SYNC — " + symbol + " " + direction + "\n"
             "Bybit shows NO open position — closed externally.\n"
+            "No SL/TP orders exist on this strategy, so this was either a "
+            "MANUAL close or a LIQUIDATION (leverage + no bot-side stop "
+            "means an adverse move can hit Bybit's liquidation price "
+            "before Daily EMA structure ever inverts).\n\n"
             f"Entry     : {entry_price:.4f}\n"
             f"Last price: {last_price:.4f}\n"
-            f"Est. PnL  : {est_pnl:+.2f} USDT\n"
-            f"Likely reason: {exit_reason}\n\n"
+            f"Est. PnL  : {est_pnl:+.2f} USDT\n\n"
             f"Bot state cleared. Watching for next signal on {symbol}.")
         if est_pnl < 0:
             consec_losses += 1
             daily_loss    += est_pnl
             weekly_loss   += est_pnl
-        _record_trade(pos, last_price, est_pnl, exit_reason, bot_type="psych")
+        _record_trade(pos, last_price, est_pnl, "EXTERNAL_CLOSE", bot_type="psych")
         _close_pos(symbol, est_pnl)
         return
 
     elif actual_size < 0:
-        # API error — don't clear state, try again next cycle
         logger.warning(f"[{symbol}] Could not verify position size (API error). Skipping cycle.")
         return
 
     # Position confirmed open on Bybit — proceed with normal management
-    # Fetch price, daily candles, 4H candles concurrently in background threads
     price, df_1d, df_4h = await asyncio.gather(
         asyncio.to_thread(_sync_get_price, symbol),
         asyncio.to_thread(_sync_get_klines, symbol, "D", 100),
@@ -1299,92 +1260,34 @@ async def manage_position(pos: dict, bot) -> None:
         return
 
     current_price = price
-    pos["_last_price"] = current_price   # track for sync recovery
+    pos["_last_price"] = current_price
 
-    # ── Live regime re-check ─────────────────────────────────────────────────
-    # Regime can shift WHILE a trade is open. Re-evaluate every cycle.
-    # If it shifts, alert owner and update behaviour accordingly.
+    # ── Live regime re-check (informational only — no SL to adapt anymore) ───
     live_regime_result = await detect_regime(symbol, df_1d, df_4h)
     live_regime        = live_regime_result["regime"]
     live_regime_conf   = live_regime_result["confidence"]
     entry_regime       = pos.get("entry_regime", REGIME_UNKNOWN)
 
-    # Alert if regime has changed since trade was opened
     if live_regime != entry_regime and live_regime != pos.get("_last_alerted_regime"):
         pos["_last_alerted_regime"] = live_regime
-        re_emoji = regime_emoji(live_regime)
-        entry_re_label = regime_label(entry_regime)
         await alert(bot,
             f"🔀 <b>REGIME SHIFT DURING OPEN TRADE — {symbol}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Trade opened as : {regime_emoji(entry_regime)} {entry_re_label}\n"
-            f"Current regime  : {re_emoji} <b>{regime_label(live_regime)}</b> ({live_regime_conf}%)\n\n"
-            f"<b>What changes:</b>\n"
-            f"{regime_action(live_regime)}\n\n"
-            f"<b>What stays the same:</b>\n"
-            f"SL, TP prices, and position size are locked from entry.\n"
-            f"Only future TP behaviour adapts to the new regime.")
+            f"Trade opened as : {regime_emoji(entry_regime)} {regime_label(entry_regime)}\n"
+            f"Current regime  : {regime_emoji(live_regime)} <b>{regime_label(live_regime)}</b> ({live_regime_conf}%)\n\n"
+            f"This position exits ONLY on Daily EMA inversion — regime "
+            f"shifts are informational and do not change exit behaviour "
+            f"on this strategy.")
 
-    # If regime is now VOLATILE_BREAKOUT and SL hasn't been tightened yet,
-    # tighten it using ATR to protect against whipsaw
-    if (live_regime == REGIME_VOLATILE_BREAKOUT and
-        not pos.get("_vol_sl_tightened") and
-        not pos["tp1_hit"]):
-        atr_series = ta.atr(df_4h["high"], df_4h["low"], df_4h["close"], length=14)
-        if atr_series is not None:
-            atr_val = float(atr_series.iloc[-1])
-            if direction == "LONG":
-                tight_sl = round(current_price - atr_val * 0.8, 6)
-                if tight_sl > pos["sl_price"]:   # only tighten, never widen
-                    pos["sl_price"] = tight_sl
-                    await set_sl(symbol, tight_sl)
-                    pos["_vol_sl_tightened"] = True
-                    save_state()
-                    await alert(bot,
-                        f"💥 <b>VOLATILE BREAKOUT — SL tightened — {symbol}</b>\n"
-                        f"Regime shifted to Volatile Breakout during open trade.\n"
-                        f"SL tightened to 0.8×ATR: <code>{tight_sl:.4f}</code>\n"
-                        f"Protects against breakout failure / whipsaw.")
-            else:
-                tight_sl = round(current_price + atr_val * 0.8, 6)
-                if tight_sl < pos["sl_price"]:
-                    pos["sl_price"] = tight_sl
-                    await set_sl(symbol, tight_sl)
-                    pos["_vol_sl_tightened"] = True
-                    save_state()
-                    await alert(bot,
-                        f"💥 <b>VOLATILE BREAKOUT — SL tightened — {symbol}</b>\n"
-                        f"Regime shifted to Volatile Breakout during open trade.\n"
-                        f"SL tightened to 0.8×ATR: <code>{tight_sl:.4f}</code>\n"
-                        f"Protects against breakout failure / whipsaw.")
-
-    # Update pos with live regime for TP/trailing logic below
     pos["live_regime"] = live_regime
 
-    # ── Dead trade ───────────────────────────────────────────────────────────
-    # Mean Reverting: dead trade timeout is 3 days (not 7) — ranging markets
-    # don't need 7 days to prove they're not working
-    dead_days = 3 if live_regime == REGIME_MEAN_REVERTING else DEAD_TRADE_DAYS
-    if not pos["tp1_hit"] and (time.time() - pos["entry_time"]) / 86400 >= dead_days:
-        await close_full(symbol, direction)
-        pnl = _est_pnl(pos, current_price)
-        await alert(bot,
-            f"⏱ <b>DEAD TRADE CLOSED — {symbol} {direction}</b>\n"
-            f"No TP1 after {dead_days} days.\n"
-            f"Regime at close: {regime_emoji(live_regime)} {regime_label(live_regime)}\n"
-            f"Closed @ <code>{current_price:.4f}</code>\n"
-            f"Est. PnL: {pnl:+.2f} USDT\n"
-            f"Bot goes FLAT on {symbol}. Watching for next signal.")
-        _close_pos(symbol, pnl, exit_price=current_price, exit_reason="DEAD")
-        return
-
-    # ── EMA inversion exit ───────────────────────────────────────────────────
-    # SAFETY NET: never allow this exit within the first 15 minutes of a
-    # fresh entry, regardless of what the indicator says. This protects
-    # against any residual data-timing edge case (not just the live-vs-closed
-    # candle mismatch that was the root cause here) causing an immediate
-    # open->close whipsaw. A genuine EMA structure inversion persists for
-    # hours/days — it will still be there 15 minutes later if it's real.
+    # ── EMA inversion exit — the ONLY exit condition on this strategy ────────
+    # No SL, no TP1/TP2, no trailing, no dead-trade timeout. The position
+    # holds until Daily EMA structure inverts, full stop. SAFETY NET: never
+    # allow this exit within the first 15 minutes of a fresh entry — a
+    # genuine structural inversion persists for hours/days and will still
+    # be there 15 minutes later if it's real; this only guards against a
+    # residual data-timing edge case flipping the reading momentarily.
     trade_age_minutes = (time.time() - pos["entry_time"]) / 60
     if trade_age_minutes < 15:
         ema_exit = False
@@ -1400,9 +1303,6 @@ async def manage_position(pos: dict, bot) -> None:
             f"Closed @ <code>{current_price:.4f}</code>\n"
             f"Est. PnL: {pnl:+.2f} USDT\n"
             f"Bot goes FLAT on {symbol}. Checking for reversal entry...")
-        # Close bookkeeping FIRST — must happen before checking for a
-        # reversal entry, otherwise a freshly-opened reversal position
-        # would get its data wiped by this same close call afterward.
         whipsaw = _close_pos(symbol, pnl, exit_price=current_price, exit_reason="EMA_EXIT")
         if whipsaw:
             await alert(bot,
@@ -1416,124 +1316,10 @@ async def manage_position(pos: dict, bot) -> None:
                 f"choppy/borderline signal. Use /resume to override early "
                 f"if you believe this is a false positive.")
         else:
-            # Only check for reversal if this wasn't flagged as a whipsaw —
-            # no point immediately re-entering right after a rapid flip.
             await check_reversal_after_exit(symbol, direction, bot)
         return
-
-    # ── Stop loss hit ────────────────────────────────────────────────────────
-    sl = pos["sl_price"]
-    sl_hit = (direction == "LONG" and current_price <= sl) or \
-             (direction == "SHORT" and current_price >= sl)
-    if sl_hit:
-        await close_full(symbol, direction)
-        pnl = _est_pnl(pos, current_price)
-        consec_losses += 1
-        loss_warn = f"\n⚠️ {consec_losses} consecutive losses! Bot will pause after 3." if consec_losses >= 2 else ""
-        await alert(bot,
-            f"🛑 <b>STOP LOSS HIT — {symbol} {direction}</b>\n"
-            f"SL  : <code>{sl:.4f}</code>\n"
-            f"Price: <code>{current_price:.4f}</code>\n"
-            f"Est. PnL: {pnl:+.2f} USDT\n"
-            f"Consecutive losses: {consec_losses}{loss_warn}\n"
-            f"Bot goes FLAT on {symbol}. Waiting for next valid signal.")
-        whipsaw = _close_pos(symbol, pnl, exit_price=current_price, exit_reason="SL")
-        if whipsaw:
-            await alert(bot,
-                f"🚨 <b>WHIPSAW DETECTED — {symbol}</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"{QUICK_EXIT_THRESHOLD_MIN}+ minute trades closed rapidly "
-                f"{WHIPSAW_TRIGGER_COUNT}+ times within {WHIPSAW_WINDOW_MIN} minutes.\n"
-                f"⏸ {symbol} PAUSED for {WHIPSAW_COOLDOWN_MIN} minutes — "
-                f"no new entries until cooldown expires.\n"
-                f"This protects your balance from repeated fee-bleed on a "
-                f"choppy/borderline signal. Use /resume to override early "
-                f"if you believe this is a false positive.")
-        return
-
-    # ── Regime context for this position ────────────────────────────────────
-    # Use LIVE regime for exit decisions — the market may have changed
-    # since the trade was opened. Live regime = current market reality.
-    entry_regime = pos.get("entry_regime", REGIME_UNKNOWN)
-    effective_regime = live_regime   # use live, not entry, for exit behaviour
-    is_mean_rev  = effective_regime == REGIME_MEAN_REVERTING
-
-    # ── TP1 ──────────────────────────────────────────────────────────────────
-    if not pos["tp1_hit"]:
-        tp1_hit = (direction == "LONG"  and current_price >= pos["tp1_price"]) or \
-                  (direction == "SHORT" and current_price <= pos["tp1_price"])
-        if tp1_hit:
-            min_q, _, step, _, _ = await get_instrument_constraints(symbol)
-            if is_mean_rev:
-                # MEAN REVERTING: close 100% at TP1 — these markets don't run to TP2
-                close_qty = _round_qty(pos["remaining_qty"], min_q, step)
-            else:
-                # Normal: close 40% at TP1
-                close_qty = _round_qty(pos["original_qty"] * 0.40, min_q, step)
-            await place_order(symbol, "Sell" if direction == "LONG" else "Buy",
-                              close_qty, reduce_only=True)
-            consec_losses = 0
-            pnl_p = abs(pos["tp1_price"] - pos["entry_price"]) * close_qty * LEVERAGE
-            save_state()
-            if is_mean_rev:
-                # Close fully — record and remove position
-                _close_pos(symbol, pnl_p, exit_price=current_price, exit_reason="TP1_MEAN_REV")
-                await alert(bot,
-                    f"🎯 <b>TP1 HIT (MEAN REVERTING) — {symbol} {direction}</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"Closed 100% @ <code>{current_price:.4f}</code>\n"
-                    f"Est. PnL: +{pnl_p:.2f} USDT\n"
-                    f"🔄 Mean Reverting regime — taking all profit at TP1\n"
-                    f"No trailing in oscillating markets. Going FLAT.")
-            else:
-                pos["remaining_qty"] = round(pos["original_qty"] * 0.60, 8)
-                pos["tp1_hit"]  = True
-                pos["sl_price"] = pos["entry_price"]
-                await set_sl(symbol, pos["entry_price"])
-                await alert(bot,
-                    f"🎯 <b>TP1 HIT — {symbol} {direction}</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"Closed 40% @ <code>{current_price:.4f}</code>\n"
-                    f"Est. partial PnL: +{pnl_p:.2f} USDT\n"
-                    f"🔒 SL moved to breakeven: <code>{pos['entry_price']:.4f}</code>\n"
-                    f"Remaining qty: {pos['remaining_qty']}\n"
-                    f"Riding to TP2 @ <code>{pos['tp2_price']:.4f}</code>")
-            return
-
-    # ── TP2 ──────────────────────────────────────────────────────────────────
-    # Skipped entirely in Mean Reverting regime (position closed at TP1 above)
-    if pos["tp1_hit"] and not pos["tp2_hit"]:
-        tp2_hit = (direction == "LONG"  and current_price >= pos["tp2_price"]) or \
-                  (direction == "SHORT" and current_price <= pos["tp2_price"])
-        if tp2_hit:
-            min_q, _, step, _, _ = await get_instrument_constraints(symbol)
-            close_qty = _round_qty(pos["original_qty"] * 0.40, min_q, step)
-            await place_order(symbol, "Sell" if direction == "LONG" else "Buy",
-                              close_qty, reduce_only=True)
-            pos["remaining_qty"] = round(pos["original_qty"] * 0.20, 8)
-            pos["tp2_hit"] = True
-            pnl_p = abs(pos["tp2_price"] - pos["entry_price"]) * close_qty * LEVERAGE
-            save_state()
-            await alert(bot,
-                f"🎯 <b>TP2 HIT — {symbol} {direction}</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"Closed 40% @ <code>{current_price:.4f}</code>\n"
-                f"Est. partial PnL: +{pnl_p:.2f} USDT\n"
-                f"🌊 Trailing stop now active on last 20%\n"
-                f"Remaining qty: {pos['remaining_qty']}")
-            return
-
-    # ── Trailing SL after TP2 ────────────────────────────────────────────────
-    # Skipped in Mean Reverting regime (never reaches here — closed at TP1)
-    if pos["tp2_hit"]:
-        new_sl = await asyncio.to_thread(
-            _compute_trailing_sl, df_4h, direction, pos["sl_price"])
-        if new_sl:
-            old_sl = pos["sl_price"]
-            pos["sl_price"] = new_sl
-            await set_sl(symbol, new_sl)
-            save_state()
-            logger.info(f"[{symbol}] Trailing SL {old_sl:.4f} → {new_sl:.4f}")
+    # No other exit condition exists. Position holds indefinitely until
+    # Daily EMA structure inverts, manual close, or exchange liquidation.
 
 def _close_pos(symbol: str, pnl: float, exit_price: float = 0.0,
                exit_reason: str = "UNKNOWN") -> None:
@@ -2173,9 +1959,7 @@ async def _maybe_send_status_report(
             f"{emoji} <b>Open {pos['direction']} position</b>\n"
             f"   Entry  : <code>{pos['entry_price']:.4f}</code>\n"
             f"   Current: <code>{current_price:.4f}</code>\n"
-            f"   SL     : <code>{pos['sl_price']:.4f}</code>\n"
-            f"   TP1    : {'✅' if pos['tp1_hit'] else '⬜'} <code>{pos['tp1_price']:.4f}</code>\n"
-            f"   TP2    : {'✅' if pos['tp2_hit'] else '⬜'} <code>{pos['tp2_price']:.4f}</code>\n"
+            f"   Exit   : Daily EMA inversion only (no SL/TP)\n"
             f"   {pnl_label}: {pnl:+.2f} USDT  |  Open: {days:.1f}d\n"
             f"   Score  : {pos['score']}/9"
         )
@@ -2308,6 +2092,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "/remove_symbol SYM — Stop monitoring a coin\n"
         "/add_meme SYM — Start monitoring a coin (MemeBot)\n"
         "/remove_meme SYM — Stop monitoring a meme coin\n"
+        "/close SYM — Manually close an open position now "
+        "(bypasses EMA-inversion-only exit; PsychologyBot has no SL/TP)\n"
         "/pause — Pause all new entries\n"
         "/resume — Resume + reset circuit breaker\n"
         "/meme_pause / /meme_resume — Same for MemeBot\n"
@@ -2356,33 +2142,41 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "📈 Strong Uptrend → LONG only\n"
         "📉 Strong Downtrend → SHORT only\n"
         "↔️ Choppy/Ranging → ALL entries blocked\n"
-        "💥 Volatile Breakout → Position halved, 5x lev cap, tight SL\n"
-        "🔄 Mean Reverting → TP1 closes 100%, no trailing\n\n"
+        "💥 Volatile Breakout → Position halved (5x lev cap)\n"
+        "🔄 Mean Reverting → informational only (no SL/TP behaviour to adapt)\n\n"
 
-        "<b>Stop Loss (Tiered):</b>\n"
-        "Tier 1: 4H EMA100 −2% (long) / +2% (short) — or 0.8×ATR in Volatile Breakout\n"
-        "Tier 2: After TP1 hit → SL moves to entry (breakeven)\n"
-        "Tier 3: After TP2 hit → Trailing below/above each 4H candle\n\n"
+        "<b>Stop Loss / Take Profit — NONE:</b>\n"
+        "This strategy has no stop loss and no take profit. No stop order "
+        "is placed on Bybit at entry. No partial closes happen at any "
+        "price target.\n\n"
 
-        "<b>Take Profit:</b>\n"
-        "TP1: 1:1.5 RR → close 40% → SL to breakeven\n"
-        "TP2: 1:3 RR → close 40% → start trailing\n"
-        "TP3: Trailing last 20% until trend ends\n\n"
-
-        "<b>Exit Rules:</b>\n"
-        "Exit immediately when Daily EMA structure inverts\n"
-        "Dead trade: close if TP1 not hit after 7 days (3 days in Choppy/Mean Reverting)\n\n"
+        "<b>Exit Rules — ONE rule only:</b>\n"
+        "Exit immediately when Daily EMA structure inverts (checked on "
+        "fully closed candles only, 15-min minimum hold after entry to "
+        "avoid data-timing noise). No dead-trade timeout — a position "
+        "holds indefinitely until the EMA structure flips, a manual "
+        "/close, or exchange liquidation.\n\n"
+        "⚠️ With leverage active and no bot-side stop, a large adverse "
+        "move before EMA inversion triggers may hit Bybit's own "
+        "liquidation price first — that is a worse outcome than a "
+        "controlled stop, not a safer one.\n\n"
+        "Use <code>/close SYMBOL</code> (owner-only, requires confirm) to "
+        "manually exit a position early without waiting for EMA inversion.\n\n"
 
         "<b>Position Sizing:</b>\n"
-        "PsychologyBot: 20% balance, up to 10x leverage\n"
-        "MemeBot: 8% balance, up to 5x leverage, max 2 open positions\n\n"
+        "PsychologyBot: 20% balance, up to 10x leverage (fixed % — no SL "
+        "to size risk against)\n"
+        "MemeBot: 8% balance, up to 5x leverage, max 2 open positions "
+        "(MemeBot is unaffected by any of the above — separate strategy, "
+        "still has its own SL/TP)\n\n"
 
         "<b>Infrastructure:</b>\n"
         "WebSocket real-time prices + REST fallback\n"
         "All Bybit/pandas calls run in background threads (never freezes)\n"
         "30-min status reports per symbol\n"
         "State persists across redeploys via /var/data persistent disk\n"
-        "Position sync check every 10s — catches SL/TP hits even if bot was offline",
+        "Position sync check every 10s — catches manual closes/liquidation "
+        "even if bot was offline",
         parse_mode="HTML",
     )
 
@@ -2492,9 +2286,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             lines.append(
                 f"{e} <b>{sym}</b> {pos['direction']}\n"
                 f"   Entry:{pos['entry_price']:.4f}  Now:{price:.4f}\n"
-                f"   SL:{pos['sl_price']:.4f}\n"
-                f"   TP1:{'✅' if pos['tp1_hit'] else '⬜'} {pos['tp1_price']:.4f}  "
-                f"TP2:{'✅' if pos['tp2_hit'] else '⬜'} {pos['tp2_price']:.4f}\n"
+                f"   Exit: Daily EMA inversion only (no SL/TP)\n"
                 f"   PnL({pnl_src}):{pnl:+.2f} USDT  Open:{days:.1f}d  Score:{pos['score']}/9"
             )
     else:
@@ -2561,8 +2353,82 @@ async def cmd_pause(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     save_state()
     await update.message.reply_text(
         "⏸ <b>Bot paused.</b>\n"
-        "No new trade entries. Existing positions continue to be managed (SL/TP).",
+        "No new trade entries. Existing positions continue to be managed "
+        "(exit only on Daily EMA structure inversion — no SL/TP on this strategy).",
         parse_mode="HTML")
+
+@owner_only
+async def cmd_close(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Manually close an open PsychologyBot position immediately, bypassing
+    the EMA-inversion-only exit rule. Owner-only since this places a real
+    market order. Requires an explicit "confirm" to avoid accidental
+    closes from a mistyped command — this strategy has no bot-side stop,
+    so a manual close may be the only way to exit before liquidation risk
+    builds on an adverse move.
+    Usage: /close SYMBOL          -> shows current PnL, asks to confirm
+           /close SYMBOL confirm  -> actually closes
+    """
+    if not ctx.args:
+        open_syms = ", ".join(symbol_positions.keys()) or "None"
+        await update.message.reply_text(
+            "Usage: <code>/close SYMBOL</code>\n"
+            "Manually closes an open position immediately — bypasses the "
+            "EMA-inversion-only exit rule (this strategy has no SL/TP).\n\n"
+            f"Open positions: {open_syms}",
+            parse_mode="HTML")
+        return
+
+    symbol = ctx.args[0].upper()
+    if not symbol.endswith("USDT"):
+        symbol += "USDT"
+
+    pos = symbol_positions.get(symbol)
+    if not pos:
+        await update.message.reply_text(
+            f"No open PsychologyBot position on {symbol}.\n"
+            f"Open positions: {', '.join(symbol_positions.keys()) or 'None'}")
+        return
+
+    direction = pos["direction"]
+    current_price = await get_price(symbol)
+    pnl = _est_pnl(pos, current_price) if current_price else 0.0
+    confirmed = len(ctx.args) >= 2 and ctx.args[1].lower() == "confirm"
+
+    if not confirmed:
+        days = (time.time() - pos["entry_time"]) / 86400
+        pnl_str = f"{pnl:+.2f} USDT" if current_price else "unavailable"
+        await update.message.reply_text(
+            f"⚠️ <b>Confirm manual close — {symbol} {direction}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"Entry     : <code>{pos['entry_price']:.4f}</code>\n"
+            f"Current   : <code>{current_price:.4f}</code>\n"
+            f"Est. PnL  : {pnl_str}\n"
+            f"Open      : {days:.1f}d\n\n"
+            f"This closes the position IMMEDIATELY on Bybit, bypassing "
+            f"the EMA-inversion-only exit rule.\n\n"
+            f"Type <code>/close {symbol} confirm</code> to proceed.",
+            parse_mode="HTML")
+        return
+
+    await close_full(symbol, direction)
+    await update.message.reply_text(
+        f"✅ <b>MANUAL CLOSE — {symbol} {direction}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Closed @ <code>{current_price:.4f}</code>\n"
+        f"Est. PnL: {pnl:+.2f} USDT\n"
+        f"Bot goes FLAT on {symbol}. Watching for next signal.",
+        parse_mode="HTML")
+    whipsaw = _close_pos(symbol, pnl, exit_price=current_price or pos["entry_price"], exit_reason="MANUAL_CLOSE")
+    if whipsaw:
+        await update.message.reply_text(
+            f"🚨 <b>WHIPSAW DETECTED — {symbol}</b>\n"
+            f"This close combined with an earlier quick exit within "
+            f"{WHIPSAW_WINDOW_MIN} minutes.\n"
+            f"⏸ {symbol} PAUSED for {WHIPSAW_COOLDOWN_MIN} minutes — "
+            f"no new entries until cooldown expires. Use /resume to "
+            f"override early.",
+            parse_mode="HTML")
 
 @owner_only
 async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4247,94 +4113,28 @@ def _sync_run_backtest(symbol: str, days: int, start_balance: float = 10000.0) -
                 continue
             
             # ── Manage open trade ─────────────────────────────────────────────
+            # NO STOP LOSS, NO TP1/TP2, NO TRAILING, NO DEAD-TRADE TIMEOUT.
+            # The ONLY exit condition is Daily EMA structure inverting.
             if open_trade:
                 t = open_trade
-                entry   = t["entry"]
-                sl      = t["sl"]
-                tp1     = t["tp1"]
-                tp2     = t["tp2"]
-                dir_    = t["direction"]
-                
-                # Check SL hit (using day's range)
-                sl_hit = (dir_ == "LONG"  and day_low  <= sl) or                          (dir_ == "SHORT" and day_high >= sl)
-                
-                # Check TP1 hit
-                tp1_hit = (dir_ == "LONG"  and day_high >= tp1) or                           (dir_ == "SHORT" and day_low  <= tp1)
-                
-                # Check TP2 hit
-                tp2_hit = (dir_ == "LONG"  and day_high >= tp2) or                           (dir_ == "SHORT" and day_low  <= tp2)
-                
+                entry = t["entry"]
+                dir_  = t["direction"]
+
                 # Check EMA exit (using completed daily candles up to yesterday)
                 df_for_exit = df_1d.iloc[:full_i]
                 ema_exit = _check_ema_exit(df_for_exit, dir_)
-                
-                # Dead trade: 7 days
-                trade_age = bt_idx - t["entry_bt_idx"]
-                dead = trade_age >= 7 and not t.get("tp1_hit")
-                
-                closed = False
-                qty    = t["qty"]
-                
-                if sl_hit and not t.get("tp1_hit"):
-                    # Full SL
-                    pnl = (sl - entry) * qty if dir_ == "LONG" else (entry - sl) * qty
-                    t.update({"exit_price": sl, "exit_reason": "SL",
-                              "exit_day": day_ts, "pnl": round(pnl, 2)})
-                    balance += pnl
-                    closed = True
-                    
-                elif not t.get("tp1_hit") and tp1_hit:
-                    # TP1: close 40%, move SL to breakeven
-                    close_qty = qty * 0.4
-                    pnl_tp1   = (tp1 - entry) * close_qty if dir_ == "LONG" else (entry - tp1) * close_qty
-                    t["qty"]  = qty * 0.6
-                    t["sl"]   = entry   # breakeven
-                    t["tp1_hit"] = True
-                    t["pnl_partial"] = round(pnl_tp1, 2)
-                    balance += pnl_tp1
-                    
-                elif t.get("tp1_hit") and not t.get("tp2_hit") and tp2_hit:
-                    # TP2: close 40% of original (67% of remaining)
-                    close_qty = qty * 0.4    # original qty reference
-                    rem_qty   = t["qty"]
-                    close_now = rem_qty * (2/3)
-                    pnl_tp2   = (tp2 - entry) * close_now if dir_ == "LONG" else (entry - tp2) * close_now
-                    t["qty"]  = rem_qty - close_now
-                    t["tp2_hit"] = True
-                    t["pnl_partial"] = t.get("pnl_partial", 0) + round(pnl_tp2, 2)
-                    balance += pnl_tp2
-                    
-                elif t.get("tp2_hit") and t["qty"] > 0:
-                    # Trail last 20% on 4H lows/highs — use day low/high as proxy
-                    new_sl = day_low  if dir_ == "LONG"  else day_high
-                    if dir_ == "LONG"  and new_sl > t["sl"]: t["sl"] = new_sl
-                    if dir_ == "SHORT" and new_sl < t["sl"]: t["sl"] = new_sl
-                    # Check if trailing SL hit
-                    if (dir_ == "LONG"  and day_low  <= t["sl"]) or                        (dir_ == "SHORT" and day_high >= t["sl"]):
-                        pnl_trail = (t["sl"] - entry) * t["qty"] if dir_ == "LONG"                                     else (entry - t["sl"]) * t["qty"]
-                        total_pnl = t.get("pnl_partial", 0) + round(pnl_trail, 2)
-                        t.update({"exit_price": t["sl"], "exit_reason": "TP2_TRAIL",
-                                  "exit_day": day_ts, "pnl": total_pnl})
-                        balance += pnl_trail
-                        closed = True
-                
-                if not closed and (ema_exit or dead):
-                    # Close at day's close price
+
+                if ema_exit:
                     rem = t["qty"]
                     exit_p = day_close
-                    pnl_rem = (exit_p - entry) * rem if dir_ == "LONG" else (entry - exit_p) * rem
-                    total_pnl = t.get("pnl_partial", 0) + round(pnl_rem, 2)
-                    reason = "DEAD" if dead else "EMA_EXIT"
-                    t.update({"exit_price": exit_p, "exit_reason": reason,
-                              "exit_day": day_ts, "pnl": total_pnl})
-                    balance += pnl_rem
-                    closed = True
-                
-                if closed:
+                    pnl = (exit_p - entry) * rem if dir_ == "LONG" else (entry - exit_p) * rem
+                    t.update({"exit_price": exit_p, "exit_reason": "EMA_EXIT",
+                              "exit_day": day_ts, "pnl": round(pnl, 2)})
+                    balance += pnl
                     result["trades"].append(t)
                     open_trade = None
                     result["balance_curve"].append({"ts": day_ts, "bal": round(balance, 2)})
-                
+
                 # Don't look for new entries while in a trade
                 continue
             
@@ -4387,15 +4187,11 @@ def _sync_run_backtest(symbol: str, days: int, start_balance: float = 10000.0) -
 
                 # Entry found — simulate the trade
                 entry_price = day_close   # enter at day's close
-                e100_4h     = ind["e100_4h"]
-                atr_val     = ind.get("atr", 0.0)
-                sl  = _calc_sl(entry_price, direction, e100_4h, atr=atr_val)
-                tp1, tp2 = _calc_tps(entry_price, sl, direction)
                 
-                # Risk-based position sizing (was fixed POSITION_PCT — now
-                # solved from the volatility-scaled SL distance, see
-                # _calc_risk_based_qty for full rationale)
-                qty = _calc_risk_based_qty(balance, entry_price, sl, LEVERAGE)
+                # NO SL, NO TP — position sizing reverts to simple fixed %
+                # of balance (matches live open_trade's new sizing, since
+                # there's no SL distance to solve risk-based qty against).
+                qty = (balance * POSITION_PCT * LEVERAGE) / entry_price
                 
                 trade = {
                     "symbol":       symbol,
@@ -4403,16 +4199,10 @@ def _sync_run_backtest(symbol: str, days: int, start_balance: float = 10000.0) -
                     "entry":        round(entry_price, 6),
                     "entry_day":    day_ts,
                     "entry_bt_idx": bt_idx,
-                    "sl":           round(sl, 6),
-                    "tp1":          round(tp1, 6),
-                    "tp2":          round(tp2, 6),
                     "qty":          qty,
                     "orig_qty":     qty,
                     "score":        ind["score"],
                     "passed":       ind["passed"],
-                    "tp1_hit":      False,
-                    "tp2_hit":      False,
-                    "pnl_partial":  0.0,
                     # Will be filled on close:
                     "exit_price":   None,
                     "exit_reason":  None,
@@ -4430,6 +4220,7 @@ def _sync_run_backtest(symbol: str, days: int, start_balance: float = 10000.0) -
             pnl_rem = (last_close - t["entry"]) * rem if t["direction"] == "LONG"                       else (t["entry"] - last_close) * rem
             total_pnl = t.get("pnl_partial", 0) + round(pnl_rem, 2)
             t.update({"exit_price": last_close, "exit_reason": "PERIOD_END",
+                      "exit_day": int(backtest_days.iloc[-1]["timestamp"]),
                       "pnl": total_pnl})
             balance += pnl_rem
             result["trades"].append(t)
@@ -4544,13 +4335,12 @@ def _run_single_stack_backtest(symbol: str, stack_mode: str, backtest_days: pd.D
             continue
 
         # ── Manage open trade ─────────────────────────────────────────────
+        # NO STOP LOSS, NO TP1/TP2, NO TRAILING, NO DEAD-TRADE TIMEOUT.
+        # The ONLY exit condition is Daily EMA structure inverting (classic
+        # or adaptive stack, matching stack_mode).
         if open_trade:
             t = open_trade
-            entry, sl, tp1, tp2, dir_ = t["entry"], t["sl"], t["tp1"], t["tp2"], t["direction"]
-
-            sl_hit  = (dir_=="LONG" and day_low<=sl) or (dir_=="SHORT" and day_high>=sl)
-            tp1_hit = (dir_=="LONG" and day_high>=tp1) or (dir_=="SHORT" and day_low<=tp1)
-            tp2_hit = (dir_=="LONG" and day_high>=tp2) or (dir_=="SHORT" and day_low<=tp2)
+            entry, dir_ = t["entry"], t["direction"]
 
             if stack_mode == "classic":
                 df_for_exit = df_1d.iloc[:full_i]
@@ -4558,45 +4348,11 @@ def _run_single_stack_backtest(symbol: str, stack_mode: str, backtest_days: pd.D
             else:
                 ema_exit = _get_adaptive_exit(adaptive_state_series, full_i, dir_)
 
-            trade_age = bt_idx - t["entry_bt_idx"]
-            dead = trade_age >= 7 and not t.get("tp1_hit")
-
-            closed = False
-            qty = t["qty"]
-
-            if sl_hit and not t.get("tp1_hit"):
-                pnl = (sl-entry)*qty if dir_=="LONG" else (entry-sl)*qty
-                t.update({"exit_price":sl,"exit_reason":"SL","exit_day":day_ts,"pnl":round(pnl,2)})
-                balance += pnl; closed = True
-            elif not t.get("tp1_hit") and tp1_hit:
-                close_qty = qty*0.4
-                pnl_tp1 = (tp1-entry)*close_qty if dir_=="LONG" else (entry-tp1)*close_qty
-                t["qty"]=qty*0.6; t["sl"]=entry; t["tp1_hit"]=True
-                t["pnl_partial"]=round(pnl_tp1,2); balance += pnl_tp1
-            elif t.get("tp1_hit") and not t.get("tp2_hit") and tp2_hit:
-                rem_qty = t["qty"]; close_now = rem_qty*(2/3)
-                pnl_tp2 = (tp2-entry)*close_now if dir_=="LONG" else (entry-tp2)*close_now
-                t["qty"]=rem_qty-close_now; t["tp2_hit"]=True
-                t["pnl_partial"]=t.get("pnl_partial",0)+round(pnl_tp2,2); balance += pnl_tp2
-            elif t.get("tp2_hit") and t["qty"]>0:
-                new_sl = day_low if dir_=="LONG" else day_high
-                if dir_=="LONG" and new_sl>t["sl"]: t["sl"]=new_sl
-                if dir_=="SHORT" and new_sl<t["sl"]: t["sl"]=new_sl
-                if (dir_=="LONG" and day_low<=t["sl"]) or (dir_=="SHORT" and day_high>=t["sl"]):
-                    pnl_trail=(t["sl"]-entry)*t["qty"] if dir_=="LONG" else (entry-t["sl"])*t["qty"]
-                    total_pnl=t.get("pnl_partial",0)+round(pnl_trail,2)
-                    t.update({"exit_price":t["sl"],"exit_reason":"TP2_TRAIL","exit_day":day_ts,"pnl":total_pnl})
-                    balance += pnl_trail; closed = True
-
-            if not closed and (ema_exit or dead):
+            if ema_exit:
                 rem = t["qty"]; exit_p = day_close
-                pnl_rem = (exit_p-entry)*rem if dir_=="LONG" else (entry-exit_p)*rem
-                total_pnl = t.get("pnl_partial",0)+round(pnl_rem,2)
-                reason = "DEAD" if dead else "EMA_EXIT"
-                t.update({"exit_price":exit_p,"exit_reason":reason,"exit_day":day_ts,"pnl":total_pnl})
-                balance += pnl_rem; closed = True
-
-            if closed:
+                pnl = (exit_p-entry)*rem if dir_=="LONG" else (entry-exit_p)*rem
+                t.update({"exit_price":exit_p,"exit_reason":"EMA_EXIT","exit_day":day_ts,"pnl":round(pnl,2)})
+                balance += pnl
                 result["trades"].append(t)
                 open_trade = None
                 result["balance_curve"].append({"ts":day_ts,"bal":round(balance,2)})
@@ -4638,18 +4394,13 @@ def _run_single_stack_backtest(symbol: str, stack_mode: str, backtest_days: pd.D
                 continue
 
             entry_price = day_close
-            e100_4h = ind["e100_4h"]
-            atr_val = ind.get("atr", 0.0)
-            sl = _calc_sl(entry_price, direction, e100_4h, atr=atr_val)
-            tp1, tp2 = _calc_tps(entry_price, sl, direction)
-            qty = _calc_risk_based_qty(balance, entry_price, sl, LEVERAGE)
+            # NO SL, NO TP — simple fixed % sizing (matches live open_trade)
+            qty = (balance * POSITION_PCT * LEVERAGE) / entry_price
 
             open_trade = {
                 "symbol": symbol, "direction": direction,
                 "entry": round(entry_price,6), "entry_day": day_ts, "entry_bt_idx": bt_idx,
-                "sl": round(sl,6), "tp1": round(tp1,6), "tp2": round(tp2,6),
                 "qty": qty, "orig_qty": qty, "score": ind["score"], "passed": ind["passed"],
-                "tp1_hit": False, "tp2_hit": False, "pnl_partial": 0.0,
                 "exit_price": None, "exit_reason": None, "exit_day": None, "pnl": 0.0,
             }
             break
@@ -4660,7 +4411,8 @@ def _run_single_stack_backtest(symbol: str, stack_mode: str, backtest_days: pd.D
         rem = t["qty"]
         pnl_rem = (last_close-t["entry"])*rem if t["direction"]=="LONG" else (t["entry"]-last_close)*rem
         total_pnl = t.get("pnl_partial",0)+round(pnl_rem,2)
-        t.update({"exit_price":last_close,"exit_reason":"PERIOD_END","pnl":total_pnl})
+        t.update({"exit_price":last_close,"exit_reason":"PERIOD_END",
+                  "exit_day": int(backtest_days.iloc[-1]["timestamp"]), "pnl":total_pnl})
         balance += pnl_rem
         result["trades"].append(t)
 
@@ -7397,6 +7149,7 @@ async def main() -> None:
     app.add_handler(CommandHandler("status",         cmd_status))
     app.add_handler(CommandHandler("scan",           cmd_scan))
     app.add_handler(CommandHandler("pause",          cmd_pause))
+    app.add_handler(CommandHandler("close",          cmd_close))
     app.add_handler(CommandHandler("resume",         cmd_resume))
     app.add_handler(CommandHandler("balance",        cmd_balance))
     # ── MemeBot commands ──────────────────────────────────────────────────────
