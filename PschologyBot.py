@@ -7340,4 +7340,4 @@ if __name__ == "__main__":
     except Exception as exc:
         print(f"Fatal startup error: {exc}")
         import traceback
-        traceback.print_exc()
+        traceback.pr
