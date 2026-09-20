@@ -277,6 +277,21 @@ news_enabled:       bool                  = True    # can be paused with /news_p
 NEWS_POLL_INTERVAL: int                   = 120     # check every 2 minutes
 NEWS_MAX_AGE_HOURS: int                   = 1       # ignore news older than 1 hour
 
+# ── Regime Strategy (LIVE) global state ─────────────────────────────────────
+# Trades a MANUALLY CURATED symbol list — add symbols with /add_symbol_regime,
+# remove with /remove_symbol_regime — same pattern as monitored_symbols
+# (PsychologyBot) and meme_symbols (MemeBot). Entirely separate position
+# tracking from those two so it can operate independently even on a symbol
+# they also trade (though see the collision guard in regime_scan_for_entry).
+regime_symbols:    list[str]              = []   # curated list — user opts in per symbol
+regime_positions:  dict[str, dict]        = {}   # symbol -> regime-strategy position
+regime_paused:     bool                   = False
+REGIME_SCAN_INTERVAL_SEC = 600     # 10 minutes between scan cycles — signals
+    # are Daily-candle-based and cannot change more than once a day, so
+    # unlike PsychologyBot/MemeBot's 10-second polling, this doesn't need
+    # to be fast. Every symbol in regime_symbols is checked every cycle
+    # (no batching/rotation needed for a curated, human-sized list).
+
 # ── Trade history global state ─────────────────────────────────────────────────
 HISTORY_FILE      = STATE_FILE.replace("bot_state.json", "trade_history.json")
 HISTORY_KEEP_DAYS = 60    # keep last 60 days of trade records
@@ -303,6 +318,10 @@ def save_state() -> None:
             "meme_paused":       meme_paused,
             "meme_daily_loss":   meme_daily_loss,
             "meme_consec_losses":meme_consec_losses,
+            # Regime Strategy (live) state
+            "regime_symbols":    regime_symbols,
+            "regime_positions":  regime_positions,
+            "regime_paused":     regime_paused,
         }
         with open(STATE_FILE, "w") as f:
             json.dump(state, f, indent=2, default=str)
@@ -315,6 +334,7 @@ def load_state() -> bool:
     global monitored_symbols, symbol_positions, bot_paused
     global daily_loss, weekly_loss, consec_losses, last_reset_day, last_reset_week
     global meme_symbols, meme_positions, meme_paused, meme_daily_loss, meme_consec_losses
+    global regime_symbols, regime_positions, regime_paused
     if not os.path.exists(STATE_FILE):
         logger.info("[STATE] No state file found — starting fresh")
         return False
@@ -336,8 +356,14 @@ def load_state() -> bool:
         meme_paused       = s.get("meme_paused",       False)
         meme_daily_loss   = s.get("meme_daily_loss",   0.0)
         meme_consec_losses= s.get("meme_consec_losses",0)
+        # Regime Strategy (live) state
+        regime_symbols    = s.get("regime_symbols",    [])
+        regime_positions  = s.get("regime_positions",  {})
+        regime_paused     = s.get("regime_paused",     False)
         logger.info(f"[STATE] Loaded — psych:{len(monitored_symbols)} symbols, "
-                    f"meme:{len(meme_symbols)} symbols")
+                    f"meme:{len(meme_symbols)} symbols, "
+                    f"regime:{len(regime_symbols)} symbols "
+                    f"({len(regime_positions)} open positions)")
         return True
     except Exception as e:
         logger.error(f"[STATE] load failed: {e}")
@@ -5294,6 +5320,303 @@ async def cmd_backtest_regime_dates(update: Update, ctx: ContextTypes.DEFAULT_TY
         await update.message.reply_text(msg, parse_mode="HTML")
 
 
+# =============================================================================
+#  REGIME STRATEGY — LIVE TRADING
+#  Trades a MANUALLY CURATED symbol list (add with /add_symbol_regime,
+#  remove with /remove_symbol_regime) — NOT all Bybit symbols automatically.
+#  Same rules as the backtest:
+#    Entry LONG : Daily close > EMA100, regime not Choppy/Mean Reverting/Unknown
+#    Entry SHORT: Daily close < EMA100, same regime gate
+#    Exit       : Daily close crosses back over EMA100 — the ONLY exit
+#    No stop loss, no take profit.
+#  SAFETY NOTE: if a symbol already has an open position under the
+#  PsychologyBot (9-filter) or MemeBot strategies, this strategy SKIPS
+#  entering on it — Bybit nets positions per symbol in one-way mode, so two
+#  independent strategies opening on the same symbol would blend into one
+#  ambiguous position rather than being tracked separately. This is a
+#  deliberate, conservative choice, not an oversight.
+# =============================================================================
+
+async def regime_open_trade(symbol: str, direction: str, regime: str, bot) -> None:
+    """
+    Open a live regime-strategy position. Mirrors the mechanics of the
+    9-filter strategy's open_trade (same leverage/sizing/order helpers)
+    but with this strategy's simplified no-SL/no-TP rules — fixed % of
+    balance sizing since there's no SL distance to size risk against.
+    """
+    try:
+        actual_lev = await asyncio.to_thread(_sync_set_leverage, symbol)
+        entry = await get_price(symbol)
+        if not entry:
+            return
+        balance = await get_balance()
+        if not balance:
+            return
+        min_q, max_q, step, min_notional, max_lev = await get_instrument_constraints(symbol)
+
+        target_margin   = balance * POSITION_PCT
+        target_notional = target_margin * actual_lev
+        raw_qty = target_notional / entry
+        raw_qty = max(raw_qty, min_notional / entry)
+        qty = _round_qty(raw_qty, min_q, step)
+        if qty <= 0:
+            return
+
+        side = "Buy" if direction == "LONG" else "Sell"
+        result = await place_order(symbol, side, qty)
+        if not result or "__error__" in result:
+            err_msg = result.get("__error__", "Unknown") if result else "No response from Bybit"
+            logger.warning(f"[REGIME LIVE] Order failed {symbol} {direction}: {err_msg}")
+            return
+
+        await asyncio.sleep(1)
+        real_entry = await asyncio.to_thread(_sync_get_position_entry, symbol)
+        fill_price = real_entry if real_entry else entry
+
+        pos = {
+            "symbol": symbol, "direction": direction,
+            "entry_price": fill_price, "original_qty": qty,
+            "entry_time": time.time(), "entry_regime": regime,
+        }
+        regime_positions[symbol] = pos
+        save_state()
+
+        emoji = "🟢" if direction == "LONG" else "🔴"
+        await alert(bot,
+            f"{emoji} <b>REGIME STRATEGY — TRADE OPENED — {symbol} {direction}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📌 Entry  : <code>{fill_price:.4f}</code>\n"
+            f"🚫 SL/TP  : NONE — this strategy exits only on an EMA100 cross\n"
+            f"{regime_emoji(regime)} Regime at entry: {regime_label(regime)}\n"
+            f"⚡ Qty: {qty}  |  Leverage: {actual_lev}x  |  Balance: {balance:.2f} USDT\n\n"
+            f"⚠️ No bot-side stop — an adverse move before the EMA100 cross "
+            f"may reach exchange liquidation instead.")
+        logger.info(f"[REGIME LIVE] {symbol} {direction} opened @ {fill_price}")
+    except Exception as e:
+        logger.error(f"[REGIME LIVE] regime_open_trade({symbol}) failed: {e}", exc_info=True)
+
+
+async def regime_close_trade(symbol: str, pos: dict, exit_price: float, bot) -> None:
+    """Close a live regime-strategy position on an EMA100 cross."""
+    try:
+        direction = pos["direction"]
+        await close_full(symbol, direction)
+        qty   = pos.get("original_qty", 0)
+        entry = pos.get("entry_price", 0)
+        pnl = (exit_price - entry) * qty if direction == "LONG" else (entry - exit_price) * qty
+
+        regime_positions.pop(symbol, None)
+        save_state()
+
+        emoji = "🟢" if pnl > 0 else "🔴"
+        await alert(bot,
+            f"{emoji} <b>REGIME STRATEGY — EMA100 EXIT — {symbol} {direction}</b>\n"
+            f"Daily close crossed back over EMA100 — the only exit condition.\n"
+            f"Closed @ <code>{exit_price:.4f}</code>\n"
+            f"Est. PnL: {pnl:+.2f} USDT\n"
+            f"Bot goes flat on {symbol}. Watching for the next signal.")
+        logger.info(f"[REGIME LIVE] {symbol} {direction} closed @ {exit_price}, pnl={pnl:.2f}")
+    except Exception as e:
+        logger.error(f"[REGIME LIVE] regime_close_trade({symbol}) failed: {e}", exc_info=True)
+
+
+async def regime_manage_open_position(symbol: str, pos: dict, bot) -> None:
+    """Check ONE open regime-strategy position for the EMA100 exit, and
+    detect if it was closed externally (manual close or liquidation)."""
+    try:
+        actual_size = await asyncio.to_thread(_sync_get_position_size, symbol)
+
+        if actual_size == 0.0:
+            last_price = await get_price(symbol) or pos.get("entry_price", 0)
+            entry = pos.get("entry_price", 0)
+            qty   = pos.get("original_qty", 0)
+            direction = pos["direction"]
+            pnl = (last_price - entry) * qty if direction == "LONG" else (entry - last_price) * qty
+            regime_positions.pop(symbol, None)
+            save_state()
+            await alert(bot,
+                f"⚠️ <b>REGIME STRATEGY — POSITION SYNC — {symbol} {direction}</b>\n"
+                f"Bybit shows NO open position — closed externally (manual "
+                f"close or liquidation, since this strategy places no "
+                f"bot-side stop).\n"
+                f"Entry: {entry:.4f} | Last: {last_price:.4f} | "
+                f"Est. PnL: {pnl:+.2f} USDT\n"
+                f"Bot state cleared for {symbol}.")
+            return
+        if actual_size < 0:
+            return   # API error this cycle — try again next cycle
+
+        df_1d = await get_klines(symbol, "D", 110)
+        if df_1d is None or len(df_1d) < 101:
+            return
+
+        df_closed = df_1d.iloc[:-1]   # closed candles only, avoid live-candle flicker
+        ema100_val = float(df_closed["close"].ewm(span=100, adjust=False).mean().iloc[-1])
+        price = await get_price(symbol)
+        if not price:
+            return
+
+        direction = pos["direction"]
+        exit_now = (direction == "LONG" and price < ema100_val) or \
+                   (direction == "SHORT" and price > ema100_val)
+        if exit_now:
+            await regime_close_trade(symbol, pos, price, bot)
+    except Exception as e:
+        logger.error(f"[REGIME LIVE] regime_manage_open_position({symbol}) failed: {e}", exc_info=True)
+
+
+async def regime_scan_for_entry(symbol: str, bot) -> None:
+    """Check ONE universe symbol for a new regime-strategy entry."""
+    if symbol in regime_positions:
+        return
+    # Avoid colliding with the 9-filter or MemeBot strategies on the same
+    # symbol — see module docstring above for why.
+    if symbol in symbol_positions or symbol in meme_positions:
+        return
+
+    try:
+        df_1d, df_4h = await asyncio.gather(
+            get_klines(symbol, "D", 300),
+            get_klines(symbol, "240", 300),
+        )
+        if df_1d is None or df_4h is None or len(df_1d) < 101:
+            return   # not enough history yet — common for newer memecoins
+
+        df_closed = df_1d.iloc[:-1]
+        ema100_val = float(df_closed["close"].ewm(span=100, adjust=False).mean().iloc[-1])
+        price = float(df_1d["close"].iloc[-1])
+
+        regime_result = await detect_regime(symbol, df_1d, df_4h)
+        regime = regime_result.get("regime", REGIME_UNKNOWN)
+        if regime in (REGIME_CHOPPY_RANGING, REGIME_MEAN_REVERTING, REGIME_UNKNOWN):
+            return
+
+        if price > ema100_val:
+            direction = "LONG"
+        elif price < ema100_val:
+            direction = "SHORT"
+        else:
+            return
+
+        await regime_open_trade(symbol, direction, regime, bot)
+    except Exception as e:
+        logger.debug(f"[REGIME LIVE] regime_scan_for_entry({symbol}) error: {e}")
+
+
+async def regime_batch_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Single periodic job (see REGIME_SCAN_INTERVAL_SEC): manages every open
+    regime-strategy position, then checks every symbol in the curated
+    regime_symbols list for a new entry. No batching/rotation needed here —
+    that was only necessary for the earlier "all Bybit symbols" design;
+    a manually curated list is small enough to check in full each cycle.
+    """
+    if regime_paused:
+        return
+    bot = context.bot
+    try:
+        for symbol, pos in list(regime_positions.items()):
+            await regime_manage_open_position(symbol, pos, bot)
+
+        for symbol in regime_symbols:
+            await regime_scan_for_entry(symbol, bot)
+    except Exception as e:
+        logger.error(f"[REGIME LIVE] regime_batch_scan failed: {e}", exc_info=True)
+
+
+@public_command
+async def cmd_regime_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show the live regime strategy's current state: paused/running,
+    the curated symbol list, and any open positions with estimated PnL."""
+    lines = [
+        f"🌐 <b>Regime Strategy (Live) — Status</b>",
+        f"━━━━━━━━━━━━━━━━━━━━",
+        f"Status: {'⏸ PAUSED (no new entries)' if regime_paused else '▶️ RUNNING'}",
+        f"Watching: {', '.join(regime_symbols) if regime_symbols else 'None — use /add_symbol_regime SYMBOL'}",
+        f"Open positions: {len(regime_positions)}",
+    ]
+    if regime_positions:
+        lines.append("")
+        for sym, pos in regime_positions.items():
+            price = await get_price(sym) or pos["entry_price"]
+            entry = pos["entry_price"]
+            qty   = pos.get("original_qty", 0)
+            direction = pos["direction"]
+            pnl = (price - entry) * qty if direction == "LONG" else (entry - price) * qty
+            emoji = "🟢" if pnl >= 0 else "🔴"
+            lines.append(f"{emoji} {direction} {sym} @ {entry:.4f} → now {price:.4f} "
+                         f"| PnL~{pnl:+.2f}")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+@owner_only
+async def cmd_add_symbol_regime(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Add a symbol to the regime strategy's curated watchlist.
+    Usage: /add_symbol_regime BTCUSDT"""
+    if not ctx.args:
+        await update.message.reply_text("Usage: /add_symbol_regime BTCUSDT")
+        return
+    symbol = ctx.args[0].upper()
+    if not symbol.endswith("USDT"):
+        symbol += "USDT"
+    if symbol in regime_symbols:
+        await update.message.reply_text(f"⚠️ {symbol} is already on the regime strategy watchlist.")
+        return
+    regime_symbols.append(symbol)
+    save_state()
+    await update.message.reply_text(
+        f"✅ <b>{symbol}</b> added to the regime strategy.\n"
+        f"Checked every {REGIME_SCAN_INTERVAL_SEC//60} minutes — entries need "
+        f"at least 101 closed daily candles of history, so very new listings "
+        f"won't trade immediately.",
+        parse_mode="HTML")
+
+
+@owner_only
+async def cmd_remove_symbol_regime(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Remove a symbol from the regime strategy's curated watchlist.
+    Usage: /remove_symbol_regime BTCUSDT"""
+    if not ctx.args:
+        await update.message.reply_text("Usage: /remove_symbol_regime BTCUSDT")
+        return
+    symbol = ctx.args[0].upper()
+    if not symbol.endswith("USDT"):
+        symbol += "USDT"
+    if symbol not in regime_symbols:
+        await update.message.reply_text(f"⚠️ {symbol} isn't on the regime strategy watchlist.")
+        return
+    regime_symbols.remove(symbol)
+    if symbol in regime_positions:
+        await update.message.reply_text(
+            f"⚠️ {symbol} has an open regime-strategy position — removed "
+            f"from the watchlist but the position stays open on Bybit and "
+            f"will still be checked for its EMA100 exit.")
+    save_state()
+    await update.message.reply_text(f"✅ <b>{symbol}</b> removed from the regime strategy.",
+                                     parse_mode="HTML")
+
+
+@owner_only
+async def cmd_regime_pause(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Pause the regime strategy — no new entries. Existing open positions
+    are still managed for their EMA100 exit (they don't get stranded)."""
+    global regime_paused
+    regime_paused = True
+    save_state()
+    await update.message.reply_text(
+        "⏸ <b>Regime strategy PAUSED</b> — no new entries.\n"
+        f"{len(regime_positions)} open position(s) still managed for exit.",
+        parse_mode="HTML")
+
+
+@owner_only
+async def cmd_regime_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    global regime_paused
+    regime_paused = False
+    save_state()
+    await update.message.reply_text("▶️ <b>Regime strategy RESUMED</b>.", parse_mode="HTML")
+
+
 
 def _format_backtest_results(r: dict) -> list[str]:
     """
@@ -7989,6 +8312,11 @@ async def main() -> None:
     app.add_handler(CommandHandler("backtest_compare",  cmd_backtest_compare))
     app.add_handler(CommandHandler("backtest_regime",   cmd_backtest_regime))
     app.add_handler(CommandHandler("backtest_regime_dates", cmd_backtest_regime_dates))
+    app.add_handler(CommandHandler("regime_status", cmd_regime_status))
+    app.add_handler(CommandHandler("add_symbol_regime", cmd_add_symbol_regime))
+    app.add_handler(CommandHandler("remove_symbol_regime", cmd_remove_symbol_regime))
+    app.add_handler(CommandHandler("regime_pause",  cmd_regime_pause))
+    app.add_handler(CommandHandler("regime_resume", cmd_regime_resume))
     app.add_handler(CommandHandler("help",              cmd_help))
     app.add_error_handler(error_handler)
 
@@ -8045,6 +8373,22 @@ async def main() -> None:
             print(f"[STARTUP] NewsBot active — polling every {NEWS_POLL_INTERVAL}s")
         else:
             print("[STARTUP] NewsBot INACTIVE — set CRYPTOPANIC_TOKEN in Render env vars")
+
+        # Regime Strategy (live) — single job checking the CURATED
+        # regime_symbols watchlist (add/remove via /add_symbol_regime and
+        # /remove_symbol_regime). Starts enabled by default (regime_paused=
+        # False unless previously paused and persisted).
+        app.job_queue.run_repeating(
+            callback=regime_batch_scan,
+            interval=REGIME_SCAN_INTERVAL_SEC,
+            first=45,   # let the other startup jobs settle first
+            chat_id=CHAT_ID,
+            name="regime_strategy_scan",
+        )
+        print(f"[STARTUP] Regime strategy (live) active — checking "
+              f"{len(regime_symbols)} watchlisted symbol(s) every "
+              f"{REGIME_SCAN_INTERVAL_SEC}s "
+              f"({'PAUSED' if regime_paused else 'RUNNING'})")
 
     # Webhook
     base_url    = os.environ.get("RENDER_EXTERNAL_HOSTNAME",
