@@ -294,7 +294,7 @@ REGIME_SCAN_INTERVAL_SEC = 600     # 10 minutes between scan cycles — signals
 
 # ── Trade history global state ─────────────────────────────────────────────────
 HISTORY_FILE      = STATE_FILE.replace("bot_state.json", "trade_history.json")
-HISTORY_KEEP_DAYS = 60    # keep last 60 days of trade records
+HISTORY_KEEP_DAYS = 21    # keep last 3 weeks of trade records — Render disk safeguard
 trade_history:    list    = []   # list of closed trade dicts
 
 def save_state() -> None:
@@ -388,7 +388,9 @@ def _load_history() -> None:
         trade_history = []
 
 def _save_history() -> None:
-    """Persist trade history to disk. Prunes records older than 60 days."""
+    """Persist trade history to disk. Prunes records older than
+    HISTORY_KEEP_DAYS (3 weeks) — see cleanup_old_data for the periodic
+    job that enforces this independent of trade activity."""
     global trade_history
     try:
         from datetime import timezone as _tz, datetime as _dt, timedelta as _td
@@ -399,6 +401,34 @@ def _save_history() -> None:
             json.dump(trade_history, f, indent=2, default=str)
     except Exception as e:
         logger.error(f"[HISTORY] save failed: {e}")
+
+
+CLEANUP_INTERVAL_SEC = 6 * 3600   # run the disk-retention sweep every 6 hours
+
+async def cleanup_old_data(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Render disk-usage safeguard: prunes trade_history.json down to
+    HISTORY_KEEP_DAYS (3 weeks), running on a fixed schedule INDEPENDENT
+    of trade activity. _save_history() already prunes on every trade
+    close, but during a quiet stretch with no closes, old records would
+    otherwise sit on disk unpruned until the next trade — this job closes
+    that gap. bot_state.json (positions, symbol lists) isn't included
+    here since it only ever holds currently-open positions and small
+    curated symbol lists — it doesn't grow unbounded the way an
+    append-only trade log does.
+    """
+    try:
+        before = len(trade_history)
+        await asyncio.to_thread(_save_history)
+        after = len(trade_history)
+        if before != after:
+            logger.info(f"[CLEANUP] Trade history trimmed: {before} → {after} records "
+                        f"(older than {HISTORY_KEEP_DAYS} days removed)")
+        else:
+            logger.debug(f"[CLEANUP] Trade history checked — {after} records, none old enough to prune")
+    except Exception as e:
+        logger.error(f"[CLEANUP] cleanup_old_data failed: {e}", exc_info=True)
+
 
 def _record_trade(pos: dict, exit_price: float, pnl: float,
                   exit_reason: str, bot_type: str = "psych") -> None:
@@ -5524,6 +5554,47 @@ async def regime_batch_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.error(f"[REGIME LIVE] regime_batch_scan failed: {e}", exc_info=True)
 
 
+REGIME_REPORT_INTERVAL_SEC = 45 * 60   # 2700s — periodic heartbeat, separate
+    # from regime_batch_scan's entry/exit event alerts. Any symbol currently
+    # in an open regime-strategy trade gets a status update on this fixed
+    # cadence regardless of whether anything actually changed, so an open
+    # position is never silent for a long stretch.
+
+async def regime_position_report(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Every REGIME_REPORT_INTERVAL_SEC (45 min), send a status update for
+    EVERY currently open regime-strategy position — entry/current price,
+    estimated PnL, and time held. This is independent of regime_batch_scan,
+    which only alerts on state changes (opens/exits); this job reports
+    on a fixed cadence even when nothing has changed.
+    """
+    if not regime_positions:
+        return
+    bot = context.bot
+    for symbol, pos in list(regime_positions.items()):
+        try:
+            price = await get_price(symbol)
+            if not price:
+                continue
+            entry     = pos.get("entry_price", 0)
+            qty       = pos.get("original_qty", 0)
+            direction = pos["direction"]
+            pnl = (price - entry) * qty if direction == "LONG" else (entry - price) * qty
+            pnl_pct = (pnl / (entry * qty) * 100) if entry and qty else 0.0
+            hours_held = (time.time() - pos.get("entry_time", time.time())) / 3600
+            regime = pos.get("entry_regime", REGIME_UNKNOWN)
+            emoji = "🟢" if pnl >= 0 else "🔴"
+
+            await alert(bot,
+                f"{emoji} <b>REGIME STRATEGY — 45min UPDATE — {symbol} {direction}</b>\n"
+                f"Entry: <code>{entry:.4f}</code> | Now: <code>{price:.4f}</code>\n"
+                f"Est. PnL: {pnl:+.2f} USDT ({pnl_pct:+.2f}%)\n"
+                f"Held: {hours_held:.1f}h | Entered on: {regime_label(regime)}\n"
+                f"Exit only on an EMA100 cross — no SL/TP on this strategy.")
+        except Exception as e:
+            logger.error(f"[REGIME LIVE] 45min report failed for {symbol}: {e}", exc_info=True)
+
+
 @public_command
 async def cmd_regime_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Show the live regime strategy's current state: paused/running,
@@ -8389,6 +8460,30 @@ async def main() -> None:
               f"{len(regime_symbols)} watchlisted symbol(s) every "
               f"{REGIME_SCAN_INTERVAL_SEC}s "
               f"({'PAUSED' if regime_paused else 'RUNNING'})")
+
+        # Regime Strategy — 45-minute status report for any OPEN position,
+        # independent of the entry/exit event alerts above.
+        app.job_queue.run_repeating(
+            callback=regime_position_report,
+            interval=REGIME_REPORT_INTERVAL_SEC,
+            first=REGIME_REPORT_INTERVAL_SEC,   # first report 45 min after startup
+            chat_id=CHAT_ID,
+            name="regime_strategy_45min_report",
+        )
+        print(f"[STARTUP] Regime strategy 45-min position reports active "
+              f"(every {REGIME_REPORT_INTERVAL_SEC//60} min)")
+
+        # Disk-usage safeguard — trims trade_history.json to the last
+        # HISTORY_KEEP_DAYS (3 weeks), independent of trade activity.
+        app.job_queue.run_repeating(
+            callback=cleanup_old_data,
+            interval=CLEANUP_INTERVAL_SEC,
+            first=120,   # run once shortly after startup, then every 6h
+            chat_id=CHAT_ID,
+            name="disk_cleanup",
+        )
+        print(f"[STARTUP] Disk cleanup active — trims trade history older "
+              f"than {HISTORY_KEEP_DAYS} days, every {CLEANUP_INTERVAL_SEC//3600}h")
 
     # Webhook
     base_url    = os.environ.get("RENDER_EXTERNAL_HOSTNAME",
