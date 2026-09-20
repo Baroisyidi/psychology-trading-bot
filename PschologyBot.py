@@ -2149,74 +2149,143 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 @public_command
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Complete command reference — every registered command, what it does,
+    and who can use it. Split into several messages to stay under
+    Telegram's length limit. Kept in sync manually with the actual
+    CommandHandler registrations at the bottom of this file — if a
+    command is added/removed there, update this list too.
+    """
     is_owner = update.effective_chat.id == CHAT_ID
 
-    # ── Message 1: Welcome + Core commands ────────────────────────────────
+    # ── Message 1: Welcome + Monitoring/Status + Analysis tools ───────────
     await update.message.reply_text(
-        "🤖 <b>PsychologyBot v3 — Ready!</b>\n"
+        "🤖 <b>PsychologyBot v3 — Command Reference</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "Multi-symbol algorithmic trading bot on Bybit — "
-        "PsychologyBot (trend-following) + MemeBot (momentum) + NewsBot (alerts).\n"
+        "Three independent trading strategies on Bybit:\n"
+        "📊 <b>PsychologyBot</b> — 9-filter trend-following (Daily/4H/1H)\n"
+        "⚡ <b>MemeBot</b> — fast momentum (5m/3m)\n"
+        "🌐 <b>Regime Strategy</b> — EMA100 trend + regime gate, curated watchlist\n"
+        "📰 <b>NewsBot</b> — CryptoPanic high-impact alerts\n\n"
         "Public bot — anyone can check status &amp; run analysis. "
         "Trading controls are owner-only.\n\n"
 
-        "<b>📊 MONITORING &amp; STATUS</b>\n"
-        "/start — This message\n"
-        "/status — Open positions, balance, circuit breaker state\n"
-        "/scan — Run live 8-filter scan on all monitored symbols now\n"
+        "<b>📊 MONITORING &amp; STATUS (public)</b>\n"
+        "/start — This command reference\n"
+        "/status — PsychologyBot open positions, balance, circuit breaker\n"
+        "/scan — Run a live 9-filter scan on all PsychologyBot symbols now\n"
         "/balance — Current USDT balance on Bybit\n"
-        "/history [days] — Closed trade log (60-day rolling window)\n"
-        "/backup — Show monitored symbols + restore commands\n\n"
+        "/history [days] — Closed trade log (3-week rolling window)\n"
+        "/backup — Full state snapshot: symbols, positions, disk status "
+        "across all three strategies\n\n"
 
-        "<b>🔄 MARKET REGIME</b>\n"
-        "/regime SYMBOL — Full regime breakdown for one coin\n"
-        "/regime_all — Regime summary for all monitored symbols\n\n"
+        "<b>🔄 MARKET REGIME (public, analysis only)</b>\n"
+        "/regime SYMBOL — Full regime breakdown for one coin (11 signals "
+        "+ CPO cross-check)\n"
+        "/regime_all — Regime summary for all PsychologyBot symbols\n\n"
 
-        "<b>🔍 COIN ANALYSIS</b>\n"
-        "/screen [period] — Rank monitored coins by alpha vs BTC\n"
-        "/health SYMBOL — 0-100 health score (5-factor breakdown)\n"
+        "<b>🔍 COIN ANALYSIS (public)</b>\n"
+        "/screen [period] — Rank PsychologyBot symbols by alpha vs BTC\n"
+        "/health SYMBOL — 0-100 health score (5-factor breakdown, LONG+SHORT)\n"
         "/uptrendcoins [period] — Top 15 Bybit coins beating BTC\n"
         "/downtrendcoins [period] — Top 15 Bybit coins lagging BTC\n"
-        "/cycle SYMBOL — Full cycle analysis (halving/RSI/EMA/BB)\n\n"
+        "/cycle SYMBOL — Cycle Phase Oscillator analysis (Compression/"
+        "Expansion/Euphoria/Capitulation)\n\n"
 
-        "<b>📈 BACKTESTING</b>\n"
-        "/backtest SYMBOL PERIOD [capital] — Real 4H+1H historical test\n"
-        "   e.g. /backtest BTCUSDT 6m\n\n"
-
-        "<i>Use /help for MemeBot, NewsBot, and owner-only commands ➜</i>",
+        "<i>Continued in the next message ➜</i>",
         parse_mode="HTML",
     )
 
-    # ── Message 2: MemeBot, NewsBot, Owner commands ───────────────────────
+    # ── Message 2: Backtesting ─────────────────────────────────────────────
     await update.message.reply_text(
+        "<b>📈 BACKTESTING (public)</b>\n"
+        "<i>PsychologyBot (9-filter) strategy:</i>\n"
+        "/backtest SYMBOL PERIOD [capital] [tp_mode] — historical test on "
+        "real 4H+1H data\n"
+        "   e.g. <code>/backtest BTCUSDT 6m</code>\n"
+        "/backtest_tp SYMBOL PERIOD [capital] — runs all 4 TP mechanisms "
+        "side by side (none/fixed_pct/atr/vp)\n"
+        "/compare_stack SYMBOL [days] — classic vs adaptive EMA stack, "
+        "one coin\n"
+        "/backtest_compare SYMBOL PERIOD [capital] — classic vs adaptive "
+        "stack, full backtest\n\n"
+
+        "<i>Regime Strategy (EXPERIMENTAL — not live-traded until you add "
+        "a symbol with /add_symbol_regime):</i>\n"
+        "/backtest_regime SYMBOL PERIOD [capital] — LONG above EMA100, "
+        "SHORT below, exit on the opposite cross\n"
+        "   e.g. <code>/backtest_regime BTCUSDT 1y</code>\n"
+        "/backtest_regime_dates SYMBOL DD.MM.YYYY DD.MM.YYYY [capital] — "
+        "same, but an explicit date range instead of a relative period\n"
+        "   e.g. <code>/backtest_regime_dates BTCUSDT 19.08.2026 20.09.2027</code>\n\n"
+
+        "<i>Continued in the next message ➜</i>",
+        parse_mode="HTML",
+    )
+
+    # ── Message 3: The three live strategies (overview + owner controls) ──
+    await update.message.reply_text(
+        "<b>📊 PSYCHOLOGYBOT (9-filter, Daily/4H/1H)</b>\n"
+        "/status, /scan — see Monitoring section above\n"
+        "🔒 <i>Owner-only:</i>\n"
+        "/add_symbol SYM — start monitoring a coin\n"
+        "/remove_symbol SYM — stop monitoring a coin\n"
+        "/close SYM — manually close an open position now (no bot-side "
+        "SL/TP on this strategy — only Daily EMA structure inversion exits "
+        "automatically)\n"
+        "/pause — pause all new entries\n"
+        "/resume — resume + reset circuit breaker\n\n"
+
         "<b>⚡ MEMEBOT (fast momentum, 5m/3m)</b>\n"
-        "/memebot — MemeBot overview\n"
-        "/meme_status — Open meme positions\n"
-        "/scan_meme — Live scan on meme symbols\n\n"
+        "/memebot — overview\n"
+        "/meme_status — open meme positions\n"
+        "/scan_meme — live scan on meme symbols\n"
+        "🔒 <i>Owner-only:</i>\n"
+        "/add_meme SYM — start monitoring a coin\n"
+        "/remove_meme SYM — stop monitoring a coin\n"
+        "/meme_pause / /meme_resume — pause / resume\n\n"
 
-        "<b>📰 NEWSBOT (CryptoPanic alerts, score ≥6)</b>\n"
-        "/news_status — NewsBot status\n"
-        "/news_scan — Manual news scan now\n\n"
+        "<b>📰 NEWSBOT (CryptoPanic, high-impact only)</b>\n"
+        "/news_status — status + articles seen\n"
+        "/news_scan — manual scan now\n"
+        "🔒 <i>Owner-only:</i>\n"
+        "/news_pause / /news_resume — pause / resume\n\n"
 
-        "<b>🔒 OWNER-ONLY — Trading Controls</b>\n"
-        "/add_symbol SYM — Start monitoring a coin (PsychologyBot)\n"
-        "/remove_symbol SYM — Stop monitoring a coin\n"
-        "/add_meme SYM — Start monitoring a coin (MemeBot)\n"
-        "/remove_meme SYM — Stop monitoring a meme coin\n"
-        "/close SYM — Manually close an open position now "
-        "(bypasses EMA-inversion-only exit; PsychologyBot has no SL/TP)\n"
-        "/pause — Pause all new entries\n"
-        "/resume — Resume + reset circuit breaker\n"
-        "/meme_pause / /meme_resume — Same for MemeBot\n"
-        "/news_pause / /news_resume — Same for NewsBot\n\n"
+        "<i>Continued in the next message ➜</i>",
+        parse_mode="HTML",
+    )
+
+    # ── Message 4: Regime Strategy (live) + examples ───────────────────────
+    await update.message.reply_text(
+        "<b>🌐 REGIME STRATEGY (live) — curated watchlist</b>\n"
+        "Entry: LONG when Daily close &gt; EMA100, SHORT when &lt; EMA100 "
+        "(closed candles) — blocked during Choppy/Mean Reverting/Unknown "
+        "regime. Exit: only when price crosses back over EMA100. No stop "
+        "loss, no take profit — the EMA100 cross covers both. Checked "
+        "every 10 min; open positions get a status report every 45 min.\n"
+        "/regime_status — watchlist, running/paused, open positions + PnL\n"
+        "🔒 <i>Owner-only:</i>\n"
+        "/add_symbol_regime SYM — add a coin to the regime strategy "
+        "watchlist (needs 101+ days of history before it can trade)\n"
+        "/remove_symbol_regime SYM — remove a coin (open positions still "
+        "get managed to exit)\n"
+        "/regime_pause — pause new entries (open positions still managed)\n"
+        "/regime_resume — resume\n\n"
 
         "<b>Examples:</b>\n"
         "<code>/add_symbol BTCUSDT</code>\n"
-        "<code>/health SOLUSDT</code>\n"
+        "<code>/add_symbol_regime SOLUSDT</code>\n"
+        "<code>/health ETHUSDT</code>\n"
         "<code>/cycle ETHUSDT</code>\n"
-        "<code>/backtest AVAXUSDT 3m</code>\n\n"
+        "<code>/backtest AVAXUSDT 3m</code>\n"
+        "<code>/backtest_regime BTCUSDT 1y</code>\n\n"
 
-        "<i>Use /help for full strategy rules (filters, SL/TP, exits) ➜</i>",
+        "All symbol lists and open positions across all three strategies "
+        "persist to disk and restore automatically after a restart. Trade "
+        "history is kept for 3 weeks.\n\n"
+
+        "<i>Use /help for full PsychologyBot strategy rules (filters, "
+        "exits) ➜</i>",
         parse_mode="HTML",
     )
 
@@ -3840,10 +3909,12 @@ async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 @owner_only
 async def cmd_backup(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Show current state as text so owner can copy/save it."""
-    psych = ", ".join(monitored_symbols) if monitored_symbols else "none"
-    meme  = ", ".join(meme_symbols) if meme_symbols else "none"
+    psych  = ", ".join(monitored_symbols) if monitored_symbols else "none"
+    meme   = ", ".join(meme_symbols) if meme_symbols else "none"
+    regime = ", ".join(regime_symbols) if regime_symbols else "none"
     open_p = len(symbol_positions)
     open_m = len(meme_positions)
+    open_r = len(regime_positions)
 
     lines = [
         "💾 <b>Bot State Backup</b>",
@@ -3853,20 +3924,38 @@ async def cmd_backup(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "",
         f"<b>PsychologyBot symbols:</b> <code>{psych}</code>",
         f"<b>MemeBot symbols:</b> <code>{meme}</code>",
-        f"Open positions: {open_p} psych + {open_m} meme",
-        f"Trade history : {len(trade_history)} records",
+        f"<b>Regime Strategy symbols:</b> <code>{regime}</code>",
+        f"Open positions: {open_p} psych + {open_m} meme + {open_r} regime",
+        f"Trade history : {len(trade_history)} records (kept {HISTORY_KEEP_DAYS} days)",
         f"Daily loss    : {daily_loss:.2f} USDT",
         f"Consec losses : {consec_losses}",
         "",
-        "<b>To restore after a fresh start:</b>",
     ]
+
+    if regime_positions:
+        lines.append("<b>Open Regime Strategy positions:</b>")
+        for sym, pos in regime_positions.items():
+            lines.append(f"  {pos['direction']} {sym} @ {pos.get('entry_price',0):.4f}")
+        lines.append("")
+
+    lines.append("<b>To restore after a fresh start (usually automatic — "
+                  "see note below):</b>")
     for sym in monitored_symbols:
         lines.append(f"<code>/add_symbol {sym}</code>")
     for sym in meme_symbols:
         lines.append(f"<code>/add_meme {sym}</code>")
+    for sym in regime_symbols:
+        lines.append(f"<code>/add_symbol_regime {sym}</code>")
 
-    if not monitored_symbols and not meme_symbols:
-        lines.append("No symbols currently monitored.")
+    if not monitored_symbols and not meme_symbols and not regime_symbols:
+        lines.append("No symbols currently monitored on any strategy.")
+
+    lines.append("")
+    lines.append("<i>Symbol lists and open positions across all three "
+                  "strategies (PsychologyBot, MemeBot, Regime Strategy) "
+                  "persist to disk automatically and restore themselves "
+                  "on restart — the commands above are a manual fallback "
+                  "only, in case the persistent disk was ever unavailable.</i>")
 
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
@@ -8525,11 +8614,28 @@ async def main() -> None:
     now_str = _dt.now(_tz.utc).strftime("%Y-%m-%d %H:%M UTC")
     disk_ok = os.path.isdir("/var/data")
 
-    if state_existed and (monitored_symbols or meme_symbols):
+    # BUG FIX: this condition previously only checked monitored_symbols and
+    # meme_symbols — a bot with ONLY regime-strategy symbols/positions open
+    # would fall through to the "started fresh" branch below and be told
+    # to manually re-add symbols, even though everything had actually
+    # restored correctly in memory and was already being managed by the
+    # regime_strategy_scan job. Now checks all three strategies.
+    had_any_state = (monitored_symbols or meme_symbols or
+                      regime_symbols or regime_positions)
+
+    if state_existed and had_any_state:
         # State was restored successfully
-        psych_syms = ", ".join(monitored_symbols) if monitored_symbols else "none"
-        meme_syms  = ", ".join(meme_symbols) if meme_symbols else "none"
-        open_pos   = len(symbol_positions) + len(meme_positions)
+        psych_syms  = ", ".join(monitored_symbols) if monitored_symbols else "none"
+        meme_syms   = ", ".join(meme_symbols) if meme_symbols else "none"
+        regime_syms = ", ".join(regime_symbols) if regime_symbols else "none"
+        open_pos    = len(symbol_positions) + len(meme_positions) + len(regime_positions)
+
+        regime_pos_lines = ""
+        if regime_positions:
+            regime_pos_lines = "\n" + "\n".join(
+                f"   {pos['direction']} {sym} @ {pos.get('entry_price',0):.4f}"
+                for sym, pos in regime_positions.items())
+
         startup_msg = (
             f"🔄 <b>Bot restarted &amp; state restored!</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -8539,20 +8645,23 @@ async def main() -> None:
             f"<b>Restored:</b>\n"
             f"📊 PsychologyBot: {psych_syms}\n"
             f"⚡ MemeBot: {meme_syms}\n"
-            f"📈 Open positions: {open_pos}\n"
+            f"🌐 Regime Strategy: {regime_syms}{regime_pos_lines}\n"
+            f"📈 Open positions: {open_pos} total "
+            f"({len(symbol_positions)} psych, {len(meme_positions)} meme, "
+            f"{len(regime_positions)} regime)\n"
             f"📋 Trade history: {len(trade_history)} records\n\n"
-            f"✅ All monitoring jobs restarted automatically.\n"
-            f"No action needed — bot is watching your symbols."
+            f"✅ All monitoring jobs restarted automatically across all "
+            f"three strategies.\nNo action needed — bot is watching your symbols."
         )
     else:
-        # Fresh start — no state file or empty
+        # Fresh start — no state file, or genuinely nothing to restore
         using_tmp = STATE_FILE.startswith("/tmp")
         startup_msg = (
             f"🚀 <b>Bot started fresh</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🕒 Time: {now_str}\n"
             f"💾 State file: <code>{STATE_FILE}</code>\n"
-            f"💾 State: {'⚠️ No state file found' if not state_existed else '📭 State file empty'}\n"
+            f"💾 State: {'⚠️ No state file found' if not state_existed else '📭 State file empty — nothing to restore'}\n"
             f"💽 Disk: {'⚠️ /var/data not writable — using /tmp (state lost on redeploy)' if using_tmp else '✅ /var/data (persistent disk mounted)'}\n\n"
             + (
             f"<b>⚠️ State will NOT survive redeploys</b>\n"
@@ -8561,9 +8670,9 @@ async def main() -> None:
             if using_tmp else ""
             ) +
             f"<b>Add your symbols:</b>\n"
-            f"• /add_symbol BTCUSDT\n"
-            f"• /add_symbol SOLUSDT\n"
-            f"• /add_meme PEPEUSDT\n"
+            f"• /add_symbol BTCUSDT — PsychologyBot (9-filter)\n"
+            f"• /add_meme PEPEUSDT — MemeBot\n"
+            f"• /add_symbol_regime SOLUSDT — Regime Strategy\n"
             f"(State will save automatically and survive future redeploys)"
         )
 
