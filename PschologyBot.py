@@ -2147,17 +2147,16 @@ async def monitor_symbol(context: ContextTypes.DEFAULT_TYPE) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 #  TELEGRAM COMMAND HANDLERS
 # ─────────────────────────────────────────────────────────────────────────────
-@public_command
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def _send_full_command_reference(update: Update) -> None:
     """
     Complete command reference — every registered command, what it does,
     and who can use it. Split into several messages to stay under
-    Telegram's length limit. Kept in sync manually with the actual
-    CommandHandler registrations at the bottom of this file — if a
-    command is added/removed there, update this list too.
+    Telegram's length limit. Shared by /start and /commands so the two
+    can never drift out of sync with each other — though this text is
+    still kept in sync MANUALLY with the actual CommandHandler
+    registrations at the bottom of this file; if a command is added or
+    removed there, update this function too.
     """
-    is_owner = update.effective_chat.id == CHAT_ID
-
     # ── Message 1: Welcome + Monitoring/Status + Analysis tools ───────────
     await update.message.reply_text(
         "🤖 <b>PsychologyBot v3 — Command Reference</b>\n"
@@ -2171,7 +2170,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "Trading controls are owner-only.\n\n"
 
         "<b>📊 MONITORING &amp; STATUS (public)</b>\n"
-        "/start — This command reference\n"
+        "/start, /commands — This command reference\n"
         "/status — PsychologyBot open positions, balance, circuit breaker\n"
         "/scan — Run a live 9-filter scan on all PsychologyBot symbols now\n"
         "/balance — Current USDT balance on Bybit\n"
@@ -2223,7 +2222,30 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         parse_mode="HTML",
     )
 
-    # ── Message 3: The three live strategies (overview + owner controls) ──
+    # ── Message 3: Bulk regime-strategy backtest rankings ──────────────────
+    await update.message.reply_text(
+        "<b>🏆 BULK REGIME BACKTEST RANKINGS (public)</b>\n"
+        "Same regime-strategy rules as above, run across MANY symbols at "
+        "once and ranked by return %. All three run as background tasks — "
+        "the bot stays fully responsive to every other command while they "
+        "work, and results arrive as they finish.\n"
+        "/backtest_regime_all_dates DD.MM.YYYY DD.MM.YYYY [capital] — "
+        "EVERY Bybit USDT symbol (400+), shows the top 50. Expect "
+        "20-60+ minutes.\n"
+        "/backtest_regime_50_up_dates DD.MM.YYYY DD.MM.YYYY [capital] — "
+        "top 50 outperformers vs BTC (last 90d), ranks all 50. Expect "
+        "several minutes.\n"
+        "/backtest_regime_50_down_dates DD.MM.YYYY DD.MM.YYYY [capital] — "
+        "same but top 50 underperformers vs BTC.\n"
+        "   e.g. <code>/backtest_regime_50_up_dates 23.10.2025 20.09.2026</code>\n\n"
+        "<i>\"from\"/\"to\" filler words are tolerated in all three, e.g. "
+        "\"...50_up_dates from 23.10.2025 to 20.09.2026\".</i>\n\n"
+
+        "<i>Continued in the next message ➜</i>",
+        parse_mode="HTML",
+    )
+
+    # ── Message 4: The three live strategies (overview + owner controls) ──
     await update.message.reply_text(
         "<b>📊 PSYCHOLOGYBOT (9-filter, Daily/4H/1H)</b>\n"
         "/status, /scan — see Monitoring section above\n"
@@ -2255,7 +2277,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         parse_mode="HTML",
     )
 
-    # ── Message 4: Regime Strategy (live) + examples ───────────────────────
+    # ── Message 5: Regime Strategy (live) + examples ───────────────────────
     await update.message.reply_text(
         "<b>🌐 REGIME STRATEGY (live) — curated watchlist</b>\n"
         "Entry: LONG when Daily close &gt; EMA100, SHORT when &lt; EMA100 "
@@ -2278,7 +2300,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "<code>/health ETHUSDT</code>\n"
         "<code>/cycle ETHUSDT</code>\n"
         "<code>/backtest AVAXUSDT 3m</code>\n"
-        "<code>/backtest_regime BTCUSDT 1y</code>\n\n"
+        "<code>/backtest_regime BTCUSDT 1y</code>\n"
+        "<code>/backtest_regime_50_up_dates 23.10.2025 20.09.2026</code>\n\n"
 
         "All symbol lists and open positions across all three strategies "
         "persist to disk and restore automatically after a restart. Trade "
@@ -2288,6 +2311,18 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "exits) ➜</i>",
         parse_mode="HTML",
     )
+
+
+@public_command
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await _send_full_command_reference(update)
+
+
+@public_command
+async def cmd_commands(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Alias of /start's command reference — same content, different
+    entry point for whenever "commands" is the more natural thing to type."""
+    await _send_full_command_reference(update)
 
 
 @public_command
@@ -5440,6 +5475,407 @@ async def cmd_backtest_regime_dates(update: Update, ctx: ContextTypes.DEFAULT_TY
 
 
 # =============================================================================
+#  BULK REGIME STRATEGY BACKTEST — ALL BYBIT SYMBOLS, RANKED
+#  Backtests every available Bybit USDT symbol over a date range and ranks
+#  by return %. Genuinely expensive (400+ symbols × full regime detection
+#  incl. CPO, per simulated day) — this bot's Telegram Application processes
+#  updates SEQUENTIALLY by default (concurrent_updates not enabled), so
+#  running this directly inside the command handler would freeze the ENTIRE
+#  bot — no /status, /pause, nothing — for however long it takes. Instead
+#  this launches as a genuinely DETACHED background task (asyncio.create_task)
+#  so the command handler returns immediately and the bot stays fully
+#  responsive to every other command while the bulk backtest runs.
+# =============================================================================
+
+BULK_REGIME_BACKTEST_CONCURRENCY = 6   # concurrent symbol backtests at once —
+    # deliberately conservative: the shared thread pool (32 workers) also
+    # serves live trading jobs (9-filter scan, MemeBot, regime live scan)
+    # the whole time this runs, and each backtest's own klines fetches hit
+    # Bybit's REST API directly (not through the async wrappers' shared
+    # rate-limit semaphore), so keeping this modest avoids both starving
+    # live trading of thread-pool capacity AND bursting past Bybit's rate
+    # limits with many symbols fetching simultaneously.
+
+async def _bulk_backtest_one_symbol(symbol: str, start_date_str: str, end_date_str: str,
+                                     start_balance: float, semaphore: asyncio.Semaphore) -> tuple:
+    async with semaphore:
+        try:
+            result = await asyncio.to_thread(
+                _sync_run_regime_strategy_backtest_dates, symbol,
+                start_date_str, end_date_str, start_balance)
+            return symbol, result
+        except Exception as e:
+            logger.debug(f"[BULK REGIME BACKTEST] {symbol} failed: {e}")
+            return symbol, {"error": str(e)}
+
+
+async def _run_bulk_regime_backtest_task(chat_id: int, bot, start_date_str: str,
+                                          end_date_str: str, start_balance: float) -> None:
+    """
+    The actual background task — runs detached from the triggering command
+    handler via asyncio.create_task, so it never blocks the bot's normal
+    update processing. Sends its own progress updates and final ranking
+    directly via bot.send_message, since by the time this runs the
+    original Update object's short-lived handler has already returned.
+    """
+    try:
+        symbols = await asyncio.to_thread(_sync_get_all_usdt_symbols)
+        if not symbols:
+            await bot.send_message(chat_id=chat_id,
+                text="❌ Could not fetch the Bybit USDT symbol list — aborting bulk backtest.")
+            return
+
+        await bot.send_message(chat_id=chat_id,
+            text=f"⏳ Bulk regime-strategy backtest started: {len(symbols)} Bybit "
+                 f"USDT symbols, {start_date_str} → {end_date_str}.\n"
+                 f"The bot stays fully responsive to other commands while this "
+                 f"runs in the background. Progress update every 50 symbols.")
+
+        semaphore = asyncio.Semaphore(BULK_REGIME_BACKTEST_CONCURRENCY)
+        tasks = [_bulk_backtest_one_symbol(sym, start_date_str, end_date_str, start_balance, semaphore)
+                 for sym in symbols]
+
+        results = {}
+        completed = 0
+        errors = 0
+        start_time = time.time()
+
+        for coro in asyncio.as_completed(tasks):
+            symbol, result = await coro
+            results[symbol] = result
+            completed += 1
+            if result.get("error"):
+                errors += 1
+            if completed % 50 == 0 or completed == len(symbols):
+                elapsed_min = (time.time() - start_time) / 60
+                await bot.send_message(chat_id=chat_id,
+                    text=f"⏳ Bulk backtest progress: {completed}/{len(symbols)} symbols "
+                         f"done ({errors} errors/skipped) — {elapsed_min:.1f} min elapsed.")
+
+        # ── Rank by return % ─────────────────────────────────────────────
+        ranked = []
+        for symbol, r in results.items():
+            if r.get("error"):
+                continue
+            trades = r.get("trades", [])
+            if not trades:
+                continue   # no trades on this symbol/period — nothing to rank
+            final = r.get("final_balance", start_balance)
+            ret_pct = (final - start_balance) / start_balance * 100
+            wins = sum(1 for t in trades if t["pnl"] > 0)
+            win_rate = wins / len(trades) * 100 if trades else 0
+            ranked.append({"symbol": symbol, "ret_pct": ret_pct, "final": final,
+                            "trades": len(trades), "win_rate": win_rate})
+
+        ranked.sort(key=lambda x: x["ret_pct"], reverse=True)
+        top50 = ranked[:50]
+        total_elapsed_min = (time.time() - start_time) / 60
+
+        if not top50:
+            await bot.send_message(chat_id=chat_id,
+                text=f"❌ Bulk backtest finished ({total_elapsed_min:.1f} min) — "
+                     f"no symbol produced any trades in this date range. "
+                     f"Nothing to rank.")
+            return
+
+        header = (
+            f"🏆 <b>Top {len(top50)} Regime Strategy Performers</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"Period: {start_date_str} → {end_date_str} | Start: ${start_balance:,.0f}\n"
+            f"Backtested {len(symbols)} symbols in {total_elapsed_min:.1f} min | "
+            f"{len(ranked)} produced trades | {errors} errors/skipped\n"
+            f"Ranked by total return %. Same rules as /backtest_regime_dates: "
+            f"LONG above EMA100, SHORT below, exit on the opposite cross, "
+            f"no SL/TP, blocked during Choppy/Mean Reverting/Unknown regime.\n\n"
+        )
+
+        # Split into chunks that stay under Telegram's 4096-char limit
+        chunk_lines = []
+        current = header
+        for i, r in enumerate(top50, 1):
+            line = (f"{i}. <b>{r['symbol']}</b> — {r['ret_pct']:+.1f}% "
+                    f"(${r['final']:,.0f}) | {r['trades']} trades | "
+                    f"{r['win_rate']:.0f}% WR\n")
+            if len(current) + len(line) > 3900:
+                chunk_lines.append(current)
+                current = line
+            else:
+                current += line
+        chunk_lines.append(current)
+
+        for chunk in chunk_lines:
+            await bot.send_message(chat_id=chat_id, text=chunk, parse_mode="HTML")
+
+        await bot.send_message(chat_id=chat_id,
+            text="<i>Past performance on a backtest isn't a guarantee — "
+                 "re-check the top few on a different date range before "
+                 "adding any of them with /add_symbol_regime.</i>",
+            parse_mode="HTML")
+
+    except Exception as e:
+        logger.error(f"[BULK REGIME BACKTEST] task failed: {e}", exc_info=True)
+        try:
+            await bot.send_message(chat_id=chat_id,
+                text=f"❌ Bulk backtest crashed: {e}")
+        except Exception:
+            pass
+
+
+@public_command
+async def cmd_backtest_regime_all_dates(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Backtests the regime strategy across EVERY available Bybit USDT symbol
+    over an explicit date range, ranks by return %, shows the top 50.
+    Usage: /backtest_regime_all_dates DD.MM.YYYY DD.MM.YYYY [capital]
+    "from"/"to" filler words tolerated, e.g.:
+      /backtest_regime_all_dates from 23.10.2025 to 20.09.2026
+    Runs as a DETACHED background task — this command returns immediately
+    and the bot stays fully responsive to everything else while it runs.
+    """
+    args = [a for a in ctx.args if a.lower() not in ("from", "to")]
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Usage: /backtest_regime_all_dates DD.MM.YYYY DD.MM.YYYY [capital]\n"
+            "Example: /backtest_regime_all_dates 23.10.2025 20.09.2026\n\n"
+            "Backtests the regime strategy (LONG above EMA100, SHORT below, "
+            "exit on the opposite cross, no SL/TP) across EVERY available "
+            "Bybit USDT symbol over this date range, then ranks by return % "
+            "and shows the top 50.\n\n"
+            "⚠️ This is genuinely expensive — with 400+ symbols, expect "
+            "20-60+ minutes depending on the date range length. It runs in "
+            "the background: the bot stays fully usable for everything "
+            "else while it works, and you'll get periodic progress updates "
+            "plus the final ranking.")
+        return
+
+    start_date_str = args[0]
+    end_date_str = args[1]
+    start_balance = 10000.0
+    if len(args) >= 3:
+        try: start_balance = float(args[2])
+        except ValueError: pass
+
+    # Validate the date format up front so a typo doesn't only surface
+    # after the symbol list has already been fetched.
+    try:
+        datetime.strptime(start_date_str, "%d.%m.%Y")
+        datetime.strptime(end_date_str, "%d.%m.%Y")
+    except ValueError:
+        await update.message.reply_text(
+            f"❌ Could not parse dates '{start_date_str}' / '{end_date_str}' — "
+            f"use DD.MM.YYYY format, e.g. 23.10.2025")
+        return
+
+    await update.message.reply_text(
+        f"🚀 Launching bulk regime-strategy backtest in the background "
+        f"({start_date_str} → {end_date_str}). This can take 20-60+ "
+        f"minutes — the bot remains fully responsive to other commands "
+        f"the entire time. Progress updates will follow.")
+
+    # Genuinely detached — NOT awaited here, so this handler returns
+    # immediately and the bot's sequential update processing isn't blocked.
+    asyncio.create_task(
+        _run_bulk_regime_backtest_task(
+            update.effective_chat.id, ctx.bot, start_date_str, end_date_str, start_balance))
+
+
+# =============================================================================
+#  REGIME STRATEGY BACKTEST — TOP/BOTTOM 50 VS BTC, RANKED
+#  Same idea and same detached-background-task pattern as the "all Bybit
+#  symbols" bulk backtest above, but the candidate list comes from
+#  _sync_scan_top_coins (the same underlying function behind /uptrendcoins
+#  and /downtrendcoins) instead of every Bybit symbol. Only ~60 major
+#  coins are in that candidate pool (see _sync_scan_top_coins's own
+#  docstring) — "top 50" is nearly the whole pool, not a highly selective
+#  slice of hundreds of coins. Flagged in the command's help text so this
+#  isn't a silent surprise. Because the list is a fixed 50 (not 400+),
+#  this runs in minutes rather than tens of minutes, so it's kept simpler
+#  than the all-symbols version — no progress-update throttling needed.
+# =============================================================================
+
+TOP50_REGIME_BACKTEST_CONCURRENCY = 6   # same conservative cap and rationale
+    # as BULK_REGIME_BACKTEST_CONCURRENCY above — shared thread pool with
+    # live trading, and Bybit rate limits.
+
+async def _run_top50_regime_backtest_task(chat_id: int, bot, symbols_with_meta: list[dict],
+                                           universe_label: str, start_date_str: str,
+                                           end_date_str: str, start_balance: float) -> None:
+    """
+    Detached background task (launched via asyncio.create_task by the
+    caller — never awaited directly, so the triggering command handler
+    returns immediately and the bot stays responsive). Backtests the
+    regime strategy on every symbol in symbols_with_meta over the given
+    date range, then ranks and shows ALL of them (not just the ones that
+    happened to trade) — every candidate the person asked to see, including
+    ones with zero trades in the period, which rank at 0.0% return.
+    """
+    try:
+        symbols = [s["symbol"] for s in symbols_with_meta]
+        await bot.send_message(chat_id=chat_id,
+            text=f"⏳ Step 2/2: running regime-strategy backtest on all "
+                 f"{len(symbols)} coins ({start_date_str} → {end_date_str})...\n"
+                 f"The bot stays fully responsive to other commands while "
+                 f"this runs. Expect several minutes.")
+
+        semaphore = asyncio.Semaphore(TOP50_REGIME_BACKTEST_CONCURRENCY)
+        tasks = [_bulk_backtest_one_symbol(sym, start_date_str, end_date_str, start_balance, semaphore)
+                 for sym in symbols]
+
+        results = {}
+        start_time = time.time()
+        for coro in asyncio.as_completed(tasks):
+            symbol, result = await coro
+            results[symbol] = result
+
+        # ── Rank ALL of them, including zero-trade symbols at 0.0% ──────────
+        ranked = []
+        for symbol, r in results.items():
+            if r.get("error"):
+                ranked.append({"symbol": symbol, "ret_pct": None, "final": start_balance,
+                                "trades": 0, "win_rate": 0.0, "error": r["error"]})
+                continue
+            trades = r.get("trades", [])
+            final = r.get("final_balance", start_balance)
+            ret_pct = (final - start_balance) / start_balance * 100
+            wins = sum(1 for t in trades if t["pnl"] > 0)
+            win_rate = wins / len(trades) * 100 if trades else 0.0
+            ranked.append({"symbol": symbol, "ret_pct": ret_pct, "final": final,
+                            "trades": len(trades), "win_rate": win_rate, "error": None})
+
+        # Errored backtests sort last regardless of (nonexistent) return
+        ranked.sort(key=lambda x: (x["ret_pct"] is None, -(x["ret_pct"] or 0)))
+        total_elapsed_min = (time.time() - start_time) / 60
+
+        header = (
+            f"🏆 <b>Regime Strategy Ranking — {universe_label}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"Period: {start_date_str} → {end_date_str} | Start: ${start_balance:,.0f}\n"
+            f"All {len(ranked)} coins ranked, highest return to lowest — "
+            f"backtested in {total_elapsed_min:.1f} min\n"
+            f"Same rules as /backtest_regime_dates: LONG above EMA100, "
+            f"SHORT below, exit on the opposite cross, no SL/TP, blocked "
+            f"during Choppy/Mean Reverting/Unknown regime.\n\n"
+        )
+
+        chunk_lines = []
+        current = header
+        for i, r in enumerate(ranked, 1):
+            if r["error"]:
+                line = f"{i}. <b>{r['symbol']}</b> — ❌ {r['error']}\n"
+            elif r["trades"] == 0:
+                line = f"{i}. <b>{r['symbol']}</b> — 0.0% (no trades in this period)\n"
+            else:
+                line = (f"{i}. <b>{r['symbol']}</b> — {r['ret_pct']:+.1f}% "
+                        f"(${r['final']:,.0f}) | {r['trades']} trades | "
+                        f"{r['win_rate']:.0f}% WR\n")
+            if len(current) + len(line) > 3900:
+                chunk_lines.append(current)
+                current = line
+            else:
+                current += line
+        chunk_lines.append(current)
+
+        for chunk in chunk_lines:
+            await bot.send_message(chat_id=chat_id, text=chunk, parse_mode="HTML")
+
+        await bot.send_message(chat_id=chat_id,
+            text="<i>The candidate pool itself (~60 major coins, not every "
+                 "Bybit symbol) is the same one behind /uptrendcoins and "
+                 "/downtrendcoins — \"top 50\" is nearly the whole pool. "
+                 "Past backtest performance isn't a guarantee — re-check "
+                 "the top few on a different date range before adding any "
+                 "with /add_symbol_regime.</i>",
+            parse_mode="HTML")
+
+    except Exception as e:
+        logger.error(f"[TOP50 REGIME BACKTEST] task failed: {e}", exc_info=True)
+        try:
+            await bot.send_message(chat_id=chat_id, text=f"❌ Backtest crashed: {e}")
+        except Exception:
+            pass
+
+
+async def _launch_top50_regime_backtest(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+                                         mode: str, command_name: str) -> None:
+    """Shared arg-parsing + launch logic for the two commands below.
+    mode: 'up' for outperformers, 'down' for underperformers."""
+    args = [a for a in ctx.args if a.lower() not in ("from", "to")]
+    direction_word = "outperformers" if mode == "up" else "underperformers"
+    if len(args) < 2:
+        await update.message.reply_text(
+            f"Usage: /{command_name} DD.MM.YYYY DD.MM.YYYY [capital]\n"
+            f"Example: /{command_name} 23.10.2025 20.09.2026\n\n"
+            f"Step 1: finds the top 50 {direction_word} vs BTC over the "
+            f"last 90 days (from a curated pool of ~60 major coins — the "
+            f"same pool /uptrendcoins and /downtrendcoins use, NOT every "
+            f"Bybit symbol).\n"
+            f"Step 2: runs the regime-strategy backtest on all 50 across "
+            f"the date range you give.\n"
+            f"Step 3: ranks all 50 by backtest return %, highest to lowest — "
+            f"every one shown, including any with zero trades.\n\n"
+            f"⚠️ Runs 50 backtests. Expect several minutes. Runs in the "
+            f"background — the bot stays fully responsive to other "
+            f"commands the whole time.")
+        return
+
+    start_date_str, end_date_str = args[0], args[1]
+    start_balance = 10000.0
+    if len(args) >= 3:
+        try: start_balance = float(args[2])
+        except ValueError: pass
+
+    try:
+        datetime.strptime(start_date_str, "%d.%m.%Y")
+        datetime.strptime(end_date_str, "%d.%m.%Y")
+    except ValueError:
+        await update.message.reply_text(
+            f"❌ Could not parse dates '{start_date_str}' / '{end_date_str}' — "
+            f"use DD.MM.YYYY format, e.g. 23.10.2025")
+        return
+
+    await update.message.reply_text(
+        f"⏳ Step 1/2: finding top 50 {direction_word} vs BTC (last 90 days)...")
+    top_coins = await asyncio.to_thread(_sync_scan_top_coins, mode, 90, 50)
+    if not top_coins:
+        await update.message.reply_text("Failed to fetch top-coins data from Bybit. Try again.")
+        return
+
+    universe_label = f"Top {len(top_coins)} {direction_word.capitalize()} vs BTC (90d)"
+    await update.message.reply_text(
+        f"🚀 Found {len(top_coins)} coins. Launching regime-strategy "
+        f"backtest on all of them in the background "
+        f"({start_date_str} → {end_date_str}). The bot remains fully "
+        f"responsive the whole time.")
+
+    asyncio.create_task(
+        _run_top50_regime_backtest_task(
+            update.effective_chat.id, ctx.bot, top_coins, universe_label,
+            start_date_str, end_date_str, start_balance))
+
+
+@public_command
+async def cmd_backtest_regime_50_up_dates(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Finds the top 50 outperformers vs BTC (last 90 days), backtests the
+    regime strategy on all 50 over an explicit date range, ranks all 50
+    by return %. Runs as a detached background task.
+    Usage: /backtest_regime_50_up_dates DD.MM.YYYY DD.MM.YYYY [capital]
+    """
+    await _launch_top50_regime_backtest(update, ctx, "up", "backtest_regime_50_up_dates")
+
+
+@public_command
+async def cmd_backtest_regime_50_down_dates(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Finds the top 50 underperformers vs BTC (last 90 days), backtests the
+    regime strategy on all 50 over an explicit date range, ranks all 50
+    by return %. Runs as a detached background task.
+    Usage: /backtest_regime_50_down_dates DD.MM.YYYY DD.MM.YYYY [capital]
+    """
+    await _launch_top50_regime_backtest(update, ctx, "down", "backtest_regime_50_down_dates")
+
+
+# =============================================================================
 #  REGIME STRATEGY — LIVE TRADING
 #  Trades a MANUALLY CURATED symbol list (add with /add_symbol_regime,
 #  remove with /remove_symbol_regime) — NOT all Bybit symbols automatically.
@@ -8436,6 +8872,7 @@ async def main() -> None:
     # Build Telegram app
     app = Application.builder().token(TELEGRAM_TOKEN).updater(None).build()
     app.add_handler(CommandHandler("start",          cmd_start))
+    app.add_handler(CommandHandler("commands",       cmd_commands))
     app.add_handler(CommandHandler("add_symbol",     cmd_add_symbol))
     app.add_handler(CommandHandler("remove_symbol",  cmd_remove_symbol))
     app.add_handler(CommandHandler("status",         cmd_status))
@@ -8472,6 +8909,9 @@ async def main() -> None:
     app.add_handler(CommandHandler("backtest_compare",  cmd_backtest_compare))
     app.add_handler(CommandHandler("backtest_regime",   cmd_backtest_regime))
     app.add_handler(CommandHandler("backtest_regime_dates", cmd_backtest_regime_dates))
+    app.add_handler(CommandHandler("backtest_regime_all_dates", cmd_backtest_regime_all_dates))
+    app.add_handler(CommandHandler("backtest_regime_50_up_dates", cmd_backtest_regime_50_up_dates))
+    app.add_handler(CommandHandler("backtest_regime_50_down_dates", cmd_backtest_regime_50_down_dates))
     app.add_handler(CommandHandler("regime_status", cmd_regime_status))
     app.add_handler(CommandHandler("add_symbol_regime", cmd_add_symbol_regime))
     app.add_handler(CommandHandler("remove_symbol_regime", cmd_remove_symbol_regime))
