@@ -56,6 +56,14 @@ load_dotenv()
 TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN")
 BYBIT_KEY          = os.getenv("BYBIT_API_KEY")
 BYBIT_SECRET       = os.getenv("BYBIT_API_SECRET")
+# LIVE (real-money) credentials — completely separate from the demo ones
+# above. Used ONLY by the Regime Strategy's live trading. Deliberately a
+# different env var name so there's no possibility of the two getting
+# mixed up. Both are optional at startup — if unset, live trading for
+# the Regime Strategy simply stays disabled (see bybit_live_session below
+# and REGIME_LIVE_TRADING_ENABLED).
+BYBIT_LIVE_KEY      = os.getenv("BYBIT_LIVE_API_KEY")
+BYBIT_LIVE_SECRET   = os.getenv("BYBIT_LIVE_API_SECRET")
 CHAT_ID_STR        = os.getenv("CHAT_ID")
 # STATE FILE PATH — always prefer /var/data (Render persistent disk).
 # If /var/data exists (disk mounted), use it regardless of STATE_FILE env var.
@@ -174,6 +182,8 @@ REGIME_UNKNOWN           = "UNKNOWN"
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  BYBIT CLIENT — Demo Trading endpoint
+#  Used by PsychologyBot (9-filter) and MemeBot. Unchanged — these two
+#  strategies stay on demo regardless of the live session below.
 # ─────────────────────────────────────────────────────────────────────────────
 bybit_session = HTTP(
     testnet=False,
@@ -183,6 +193,38 @@ bybit_session = HTTP(
 )
 # pybit 5.6.2 has no demo= param — override endpoint directly
 bybit_session.endpoint = "https://api-demo.bybit.com"
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  BYBIT CLIENT — LIVE (real-money) endpoint
+#  Used ONLY by the Regime Strategy's live trading — see regime_open_trade,
+#  regime_close_trade, regime_manage_open_position, regime_scan_for_entry,
+#  which all call the _live-suffixed functions below rather than the
+#  shared demo-based ones (get_price, place_order, etc.) that
+#  PsychologyBot/MemeBot use.
+#  REGIME_LIVE_TRADING_ENABLED is the single source of truth for whether
+#  real orders can be placed at all — False until BYBIT_LIVE_API_KEY and
+#  BYBIT_LIVE_API_SECRET are both set on Render. Every live-trading entry
+#  point checks this flag and refuses to act if it's False, so deploying
+#  this code before generating live keys is safe: the Regime Strategy
+#  simply stays unable to trade live until those two env vars exist.
+# ─────────────────────────────────────────────────────────────────────────────
+REGIME_LIVE_TRADING_ENABLED = bool(BYBIT_LIVE_KEY and BYBIT_LIVE_SECRET)
+
+if REGIME_LIVE_TRADING_ENABLED:
+    bybit_live_session = HTTP(
+        testnet=False,
+        api_key=BYBIT_LIVE_KEY,
+        api_secret=BYBIT_LIVE_SECRET,
+        recv_window=5000,
+    )
+    # Real production endpoint — actual money, actual orders.
+    bybit_live_session.endpoint = "https://api.bybit.com"
+    print("[LIVE] Regime Strategy live trading: ENABLED (BYBIT_LIVE_API_KEY/SECRET found)")
+else:
+    bybit_live_session = None
+    print("[LIVE] Regime Strategy live trading: DISABLED — "
+          "set BYBIT_LIVE_API_KEY and BYBIT_LIVE_API_SECRET on Render to enable. "
+          "PsychologyBot and MemeBot are unaffected and continue on demo.")
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  WEBSOCKET — Real-time price feeds
@@ -750,6 +792,200 @@ def _sync_close_full(symbol: str, direction: str) -> None:
         logger.error(f"_sync_close_full({symbol}): {e}")
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  LIVE (real-money) SYNC FUNCTIONS — parallel to the demo functions above,
+#  used ONLY by the Regime Strategy's live trading. Every one of these
+#  checks REGIME_LIVE_TRADING_ENABLED first and returns a safe default
+#  (0.0, None, or an error dict) if live trading isn't configured — never
+#  touches bybit_live_session while it's None. PsychologyBot and MemeBot
+#  never call any of these; they keep using the demo functions above.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _sync_get_balance_live() -> float:
+    if not REGIME_LIVE_TRADING_ENABLED:
+        return 0.0
+    try:
+        resp  = bybit_live_session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
+        coins = resp["result"]["list"][0]["coin"]
+        for c in coins:
+            if c["coin"] == "USDT":
+                raw = c.get("walletBalance") or c.get("availableToWithdraw") or "0"
+                return float(raw) if str(raw).strip() else 0.0
+        return 0.0
+    except Exception as e:
+        logger.error(f"_sync_get_balance_live: {e}")
+        return 0.0
+
+def _sync_get_price_live(symbol: str) -> float:
+    if not REGIME_LIVE_TRADING_ENABLED:
+        return 0.0
+    # No WebSocket for the live session (the existing ws_prices feed is
+    # public market data shared across demo/live, but to keep the live
+    # path fully independent and simple, this goes straight to REST).
+    try:
+        resp = bybit_live_session.get_tickers(category="linear", symbol=symbol)
+        return float(resp["result"]["list"][0]["lastPrice"])
+    except Exception as e:
+        logger.error(f"_sync_get_price_live({symbol}): {e}")
+        return 0.0
+
+def _sync_get_klines_live(symbol: str, interval: str, limit: int = 300) -> Optional[pd.DataFrame]:
+    if not REGIME_LIVE_TRADING_ENABLED:
+        return None
+    try:
+        resp = bybit_live_session.get_kline(
+            category="linear", symbol=symbol, interval=interval, limit=limit)
+        raw = resp["result"]["list"]
+        if not raw:
+            return None
+        df = pd.DataFrame(raw, columns=[
+            "timestamp","open","high","low","close","volume","turnover"])
+        for col in ["open","high","low","close","volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df["timestamp"] = df["timestamp"].astype("int64")
+        df.sort_values("timestamp", inplace=True)
+        df.reset_index(drop=True, inplace=True)
+        return df
+    except Exception as e:
+        logger.error(f"_sync_get_klines_live({symbol},{interval}): {e}")
+        return None
+
+def _sync_get_instrument_constraints_live(symbol: str) -> tuple:
+    if not REGIME_LIVE_TRADING_ENABLED:
+        return 0.001, 1_000_000.0, 0.001, 5.0, 10.0
+    try:
+        resp = bybit_live_session.get_instruments_info(category="linear", symbol=symbol)
+        info         = resp["result"]["list"][0]
+        lot          = info["lotSizeFilter"]
+        lever_filter = info.get("leverageFilter", {})
+        min_qty      = float(lot["minOrderQty"])
+        max_qty      = float(lot.get("maxMktOrderQty", lot.get("maxOrderQty", 1_000_000)))
+        qty_step     = float(lot["qtyStep"])
+        min_notional = float(lot.get("minNotionalValue", 5.0))
+        max_leverage = float(lever_filter.get("maxLeverage", 10.0))
+        logger.info(f"[LIVE CONSTRAINTS] {symbol}: min={min_qty} max={max_qty} "
+                    f"step={qty_step} min_notional={min_notional} max_lev={max_leverage}")
+        return min_qty, max_qty, qty_step, min_notional, max_leverage
+    except Exception as e:
+        logger.error(f"_sync_get_instrument_constraints_live({symbol}): {e}")
+        return 0.001, 1_000_000.0, 0.001, 5.0, 10.0
+
+def _sync_set_leverage_live(symbol: str) -> int:
+    if not REGIME_LIVE_TRADING_ENABLED:
+        return 1
+    import math
+    try:
+        _, _, _, _, max_lev = _sync_get_instrument_constraints_live(symbol)
+        actual_lev = min(10, math.floor(max_lev))
+        if actual_lev < 1:
+            actual_lev = 1
+        resp = bybit_live_session.set_leverage(
+            category="linear", symbol=symbol,
+            buyLeverage=str(actual_lev), sellLeverage=str(actual_lev))
+        ret_code = resp.get("retCode", 0) if isinstance(resp, dict) else 0
+        if ret_code not in (0, 110043):
+            logger.warning(f"[LIVE][{symbol}] set_leverage retCode={ret_code}: {resp.get('retMsg','')}")
+        else:
+            logger.info(f"[LIVE][{symbol}] Leverage set to {actual_lev}x")
+        return actual_lev
+    except Exception as e:
+        logger.warning(f"_sync_set_leverage_live({symbol}): {e}")
+        return 1
+
+def _sync_place_order_live(symbol: str, side: str, qty: float,
+                            reduce_only: bool = False) -> Optional[dict]:
+    if not REGIME_LIVE_TRADING_ENABLED:
+        return {"__error__": "Live trading not configured — missing BYBIT_LIVE_API_KEY/SECRET"}
+    try:
+        min_qty, max_qty, qty_step, _, _ = _sync_get_instrument_constraints_live(symbol)
+        total_qty = _round_qty_step(qty, qty_step, min_qty)
+        remaining  = total_qty
+        last_result = None
+
+        while remaining > 0:
+            batch_qty = min(remaining, max_qty)
+            batch_qty = _round_qty_step(batch_qty, qty_step, min_qty)
+            qty_str   = _format_qty_str(batch_qty, qty_step)
+
+            resp = bybit_live_session.place_order(
+                category="linear", symbol=symbol,
+                side=side, orderType="Market", qty=qty_str,
+                timeInForce="GoodTillCancel", reduceOnly=reduce_only)
+
+            ret_code = resp.get("retCode", 0)
+            if ret_code != 0:
+                logger.error(f"[LIVE] _sync_place_order_live({symbol}): retCode={ret_code} "
+                             f"msg={resp.get('retMsg')} qty={qty_str}")
+                if ret_code == 110090 and batch_qty > min_qty:
+                    reduced = _round_qty_step(batch_qty * 0.80, qty_step, min_qty)
+                    if reduced < min_qty or reduced >= batch_qty:
+                        return {"__error__": resp.get("retMsg", "Unknown error"), "__code__": ret_code}
+                    qty_str2 = _format_qty_str(reduced, qty_step)
+                    resp2 = bybit_live_session.place_order(
+                        category="linear", symbol=symbol,
+                        side=side, orderType="Market", qty=qty_str2,
+                        timeInForce="GoodTillCancel", reduceOnly=reduce_only)
+                    if resp2.get("retCode", 0) == 0:
+                        last_result = resp2["result"]
+                        remaining -= reduced
+                        if remaining > 0:
+                            import time as _time
+                            _time.sleep(0.5)
+                        continue
+                return {"__error__": resp.get("retMsg", "Unknown error"), "__code__": ret_code}
+
+            last_result = resp["result"]
+            remaining  -= batch_qty
+            if remaining > 0:
+                import time as _time
+                _time.sleep(0.5)
+
+        return last_result
+    except Exception as e:
+        logger.error(f"_sync_place_order_live({symbol},{side},{qty}): {e}")
+        return {"__error__": str(e)}
+
+def _sync_get_position_entry_live(symbol: str) -> Optional[float]:
+    if not REGIME_LIVE_TRADING_ENABLED:
+        return None
+    try:
+        resp = bybit_live_session.get_positions(category="linear", symbol=symbol)
+        for pos in resp["result"]["list"]:
+            if float(pos.get("size", 0)) > 0:
+                avg = float(pos.get("avgPrice", 0))
+                return avg if avg > 0 else None
+        return None
+    except Exception as e:
+        logger.error(f"_sync_get_position_entry_live({symbol}): {e}")
+        return None
+
+def _sync_get_position_size_live(symbol: str) -> float:
+    if not REGIME_LIVE_TRADING_ENABLED:
+        return -1.0
+    try:
+        resp = bybit_live_session.get_positions(category="linear", symbol=symbol)
+        for pos in resp["result"]["list"]:
+            size = float(pos.get("size", 0))
+            if size > 0:
+                return size
+        return 0.0
+    except Exception as e:
+        logger.error(f"_sync_get_position_size_live({symbol}): {e}")
+        return -1.0
+
+def _sync_close_full_live(symbol: str, direction: str) -> None:
+    if not REGIME_LIVE_TRADING_ENABLED:
+        return
+    try:
+        close_side = "Sell" if direction == "LONG" else "Buy"
+        resp = bybit_live_session.get_positions(category="linear", symbol=symbol)
+        for pos in resp["result"]["list"]:
+            size = float(pos.get("size", 0))
+            if size > 0:
+                _sync_place_order_live(symbol, close_side, size, reduce_only=True)
+    except Exception as e:
+        logger.error(f"_sync_close_full_live({symbol}): {e}")
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  ASYNC WRAPPERS — safe to await from event loop
 # ─────────────────────────────────────────────────────────────────────────────
 async def get_balance() -> float:
@@ -789,6 +1025,39 @@ async def close_full(symbol: str, direction: str) -> None:
 async def get_open_side(symbol: str) -> Optional[str]:
     async with _api_semaphore:
         return await asyncio.to_thread(_sync_get_open_side, symbol)
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  LIVE (real-money) ASYNC WRAPPERS — used ONLY by the Regime Strategy's
+#  live trading (regime_open_trade, regime_close_trade,
+#  regime_manage_open_position, regime_scan_for_entry). Share the same
+#  _api_semaphore as the demo wrappers above — rate limiting applies
+#  across BOTH sessions combined, which is fine since they hit different
+#  Bybit endpoints entirely.
+# ─────────────────────────────────────────────────────────────────────────────
+async def get_balance_live() -> float:
+    async with _api_semaphore:
+        return await asyncio.to_thread(_sync_get_balance_live)
+
+async def get_price_live(symbol: str) -> float:
+    async with _api_semaphore:
+        return await asyncio.to_thread(_sync_get_price_live, symbol)
+
+async def get_klines_live(symbol: str, interval: str, limit: int = 300) -> Optional[pd.DataFrame]:
+    async with _api_semaphore:
+        return await asyncio.to_thread(_sync_get_klines_live, symbol, interval, limit)
+
+async def get_instrument_constraints_live(symbol: str) -> tuple:
+    async with _api_semaphore:
+        return await asyncio.to_thread(_sync_get_instrument_constraints_live, symbol)
+
+async def place_order_live(symbol: str, side: str, qty: float,
+                            reduce_only: bool = False) -> Optional[dict]:
+    async with _api_semaphore:
+        return await asyncio.to_thread(_sync_place_order_live, symbol, side, qty, reduce_only)
+
+async def close_full_live(symbol: str, direction: str) -> None:
+    async with _api_semaphore:
+        await asyncio.to_thread(_sync_close_full_live, symbol, direction)
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  INDICATOR ENGINE — pure sync, runs in thread via asyncio.to_thread()
@@ -5894,20 +6163,25 @@ async def cmd_backtest_regime_50_down_dates(update: Update, ctx: ContextTypes.DE
 
 async def regime_open_trade(symbol: str, direction: str, regime: str, bot) -> None:
     """
-    Open a live regime-strategy position. Mirrors the mechanics of the
-    9-filter strategy's open_trade (same leverage/sizing/order helpers)
-    but with this strategy's simplified no-SL/no-TP rules — fixed % of
-    balance sizing since there's no SL distance to size risk against.
+    Open a live regime-strategy position on the LIVE (real-money) Bybit
+    session — completely separate from PsychologyBot/MemeBot's demo
+    session. Mirrors the same leverage/sizing/order mechanics but with
+    this strategy's simplified no-SL/no-TP rules — fixed % of balance
+    sizing since there's no SL distance to size risk against.
     """
+    if not REGIME_LIVE_TRADING_ENABLED:
+        logger.warning(f"[REGIME LIVE] {symbol}: entry signal found but live trading "
+                        f"is not configured (missing BYBIT_LIVE_API_KEY/SECRET) — skipped.")
+        return
     try:
-        actual_lev = await asyncio.to_thread(_sync_set_leverage, symbol)
-        entry = await get_price(symbol)
+        actual_lev = await asyncio.to_thread(_sync_set_leverage_live, symbol)
+        entry = await get_price_live(symbol)
         if not entry:
             return
-        balance = await get_balance()
+        balance = await get_balance_live()
         if not balance:
             return
-        min_q, max_q, step, min_notional, max_lev = await get_instrument_constraints(symbol)
+        min_q, max_q, step, min_notional, max_lev = await get_instrument_constraints_live(symbol)
 
         target_margin   = balance * POSITION_PCT
         target_notional = target_margin * actual_lev
@@ -5918,14 +6192,14 @@ async def regime_open_trade(symbol: str, direction: str, regime: str, bot) -> No
             return
 
         side = "Buy" if direction == "LONG" else "Sell"
-        result = await place_order(symbol, side, qty)
+        result = await place_order_live(symbol, side, qty)
         if not result or "__error__" in result:
             err_msg = result.get("__error__", "Unknown") if result else "No response from Bybit"
             logger.warning(f"[REGIME LIVE] Order failed {symbol} {direction}: {err_msg}")
             return
 
         await asyncio.sleep(1)
-        real_entry = await asyncio.to_thread(_sync_get_position_entry, symbol)
+        real_entry = await asyncio.to_thread(_sync_get_position_entry_live, symbol)
         fill_price = real_entry if real_entry else entry
 
         pos = {
@@ -5938,8 +6212,9 @@ async def regime_open_trade(symbol: str, direction: str, regime: str, bot) -> No
 
         emoji = "🟢" if direction == "LONG" else "🔴"
         await alert(bot,
-            f"{emoji} <b>REGIME STRATEGY — TRADE OPENED — {symbol} {direction}</b>\n"
+            f"{emoji} <b>REGIME STRATEGY — LIVE TRADE OPENED — {symbol} {direction}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"💰 REAL MONEY — Bybit live account\n"
             f"📌 Entry  : <code>{fill_price:.4f}</code>\n"
             f"🚫 SL/TP  : NONE — this strategy exits only on an EMA100 cross\n"
             f"{regime_emoji(regime)} Regime at entry: {regime_label(regime)}\n"
@@ -5952,10 +6227,10 @@ async def regime_open_trade(symbol: str, direction: str, regime: str, bot) -> No
 
 
 async def regime_close_trade(symbol: str, pos: dict, exit_price: float, bot) -> None:
-    """Close a live regime-strategy position on an EMA100 cross."""
+    """Close a live regime-strategy position on an EMA100 cross — LIVE session."""
     try:
         direction = pos["direction"]
-        await close_full(symbol, direction)
+        await close_full_live(symbol, direction)
         qty   = pos.get("original_qty", 0)
         entry = pos.get("entry_price", 0)
         pnl = (exit_price - entry) * qty if direction == "LONG" else (entry - exit_price) * qty
@@ -5965,7 +6240,8 @@ async def regime_close_trade(symbol: str, pos: dict, exit_price: float, bot) -> 
 
         emoji = "🟢" if pnl > 0 else "🔴"
         await alert(bot,
-            f"{emoji} <b>REGIME STRATEGY — EMA100 EXIT — {symbol} {direction}</b>\n"
+            f"{emoji} <b>REGIME STRATEGY — LIVE EMA100 EXIT — {symbol} {direction}</b>\n"
+            f"💰 REAL MONEY — Bybit live account\n"
             f"Daily close crossed back over EMA100 — the only exit condition.\n"
             f"Closed @ <code>{exit_price:.4f}</code>\n"
             f"Est. PnL: {pnl:+.2f} USDT\n"
@@ -5977,12 +6253,15 @@ async def regime_close_trade(symbol: str, pos: dict, exit_price: float, bot) -> 
 
 async def regime_manage_open_position(symbol: str, pos: dict, bot) -> None:
     """Check ONE open regime-strategy position for the EMA100 exit, and
-    detect if it was closed externally (manual close or liquidation)."""
+    detect if it was closed externally (manual close or liquidation) —
+    all against the LIVE (real-money) Bybit session."""
+    if not REGIME_LIVE_TRADING_ENABLED:
+        return
     try:
-        actual_size = await asyncio.to_thread(_sync_get_position_size, symbol)
+        actual_size = await asyncio.to_thread(_sync_get_position_size_live, symbol)
 
         if actual_size == 0.0:
-            last_price = await get_price(symbol) or pos.get("entry_price", 0)
+            last_price = await get_price_live(symbol) or pos.get("entry_price", 0)
             entry = pos.get("entry_price", 0)
             qty   = pos.get("original_qty", 0)
             direction = pos["direction"]
@@ -5990,7 +6269,8 @@ async def regime_manage_open_position(symbol: str, pos: dict, bot) -> None:
             regime_positions.pop(symbol, None)
             save_state()
             await alert(bot,
-                f"⚠️ <b>REGIME STRATEGY — POSITION SYNC — {symbol} {direction}</b>\n"
+                f"⚠️ <b>REGIME STRATEGY — LIVE POSITION SYNC — {symbol} {direction}</b>\n"
+                f"💰 REAL MONEY — Bybit live account\n"
                 f"Bybit shows NO open position — closed externally (manual "
                 f"close or liquidation, since this strategy places no "
                 f"bot-side stop).\n"
@@ -6001,13 +6281,13 @@ async def regime_manage_open_position(symbol: str, pos: dict, bot) -> None:
         if actual_size < 0:
             return   # API error this cycle — try again next cycle
 
-        df_1d = await get_klines(symbol, "D", 110)
+        df_1d = await get_klines_live(symbol, "D", 110)
         if df_1d is None or len(df_1d) < 101:
             return
 
         df_closed = df_1d.iloc[:-1]   # closed candles only, avoid live-candle flicker
         ema100_val = float(df_closed["close"].ewm(span=100, adjust=False).mean().iloc[-1])
-        price = await get_price(symbol)
+        price = await get_price_live(symbol)
         if not price:
             return
 
@@ -6021,7 +6301,10 @@ async def regime_manage_open_position(symbol: str, pos: dict, bot) -> None:
 
 
 async def regime_scan_for_entry(symbol: str, bot) -> None:
-    """Check ONE universe symbol for a new regime-strategy entry."""
+    """Check ONE watchlist symbol for a new regime-strategy entry —
+    against the LIVE (real-money) Bybit session."""
+    if not REGIME_LIVE_TRADING_ENABLED:
+        return   # no point fetching data if we can't act on it anyway
     if symbol in regime_positions:
         return
     # Avoid colliding with the 9-filter or MemeBot strategies on the same
@@ -6031,8 +6314,8 @@ async def regime_scan_for_entry(symbol: str, bot) -> None:
 
     try:
         df_1d, df_4h = await asyncio.gather(
-            get_klines(symbol, "D", 300),
-            get_klines(symbol, "240", 300),
+            get_klines_live(symbol, "D", 300),
+            get_klines_live(symbol, "240", 300),
         )
         if df_1d is None or df_4h is None or len(df_1d) < 101:
             return   # not enough history yet — common for newer memecoins
@@ -6098,7 +6381,7 @@ async def regime_position_report(context: ContextTypes.DEFAULT_TYPE) -> None:
     bot = context.bot
     for symbol, pos in list(regime_positions.items()):
         try:
-            price = await get_price(symbol)
+            price = await get_price_live(symbol)
             if not price:
                 continue
             entry     = pos.get("entry_price", 0)
@@ -6122,11 +6405,19 @@ async def regime_position_report(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 @public_command
 async def cmd_regime_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show the live regime strategy's current state: paused/running,
-    the curated symbol list, and any open positions with estimated PnL."""
+    """Show the live regime strategy's current state: account mode
+    (live vs not configured), paused/running, the curated symbol list,
+    and any open positions with estimated PnL."""
+    if REGIME_LIVE_TRADING_ENABLED:
+        account_line = "💰 <b>LIVE — real-money Bybit account</b>"
+    else:
+        account_line = ("⚠️ <b>NOT CONFIGURED</b> — set BYBIT_LIVE_API_KEY and "
+                         "BYBIT_LIVE_API_SECRET on Render to enable live trading")
+
     lines = [
-        f"🌐 <b>Regime Strategy (Live) — Status</b>",
+        f"🌐 <b>Regime Strategy — Status</b>",
         f"━━━━━━━━━━━━━━━━━━━━",
+        account_line,
         f"Status: {'⏸ PAUSED (no new entries)' if regime_paused else '▶️ RUNNING'}",
         f"Watching: {', '.join(regime_symbols) if regime_symbols else 'None — use /add_symbol_regime SYMBOL'}",
         f"Open positions: {len(regime_positions)}",
@@ -6134,7 +6425,8 @@ async def cmd_regime_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     if regime_positions:
         lines.append("")
         for sym, pos in regime_positions.items():
-            price = await get_price(sym) or pos["entry_price"]
+            price = (await get_price_live(sym)) if REGIME_LIVE_TRADING_ENABLED else pos["entry_price"]
+            price = price or pos["entry_price"]
             entry = pos["entry_price"]
             qty   = pos.get("original_qty", 0)
             direction = pos["direction"]
