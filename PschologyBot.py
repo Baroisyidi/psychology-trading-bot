@@ -2914,6 +2914,185 @@ async def cmd_close(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             f"override early.",
             parse_mode="HTML")
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  /add_more — add to an EXISTING position, any strategy
+# ─────────────────────────────────────────────────────────────────────────────
+ADD_MORE_POSITION_PCT = 0.20   # 20% of CURRENT balance, per explicit request
+ADD_MORE_LEVERAGE     = 10     # applied uniformly across all three strategies —
+    # NOTE this overrides MemeBot's own more conservative fresh-entry
+    # sizing (8%/5x, chosen deliberately since "memecoins wick massively")
+    # when /add_more is used on a MemeBot position. That's intentional
+    # per explicit request, not an oversight — flagged in the confirmation
+    # message every time so it's never a silent surprise.
+
+async def _add_more_to_position(update: Update, bot, symbol: str, pos: dict,
+                                 strategy_label: str, is_live: bool) -> None:
+    """
+    Shared add-to-position logic for /add_more, used by all three
+    strategies. Places an additional market order in the SAME direction
+    as the existing position, sized at ADD_MORE_POSITION_PCT of current
+    balance with ADD_MORE_LEVERAGE. Re-queries Bybit's own blended
+    average entry price and total position size after the fill —
+    authoritative, since Bybit (not the bot) actually knows the true
+    blended fill — and updates the strategy's internal tracking to match.
+
+    Leverage is a per-SYMBOL setting on Bybit, not per-order: setting it
+    here changes leverage for the WHOLE position (existing + new size),
+    not just the newly added portion. The confirmation message says this
+    explicitly.
+
+    For MemeBot specifically, sl_price/tp1_price/tp2_price are left at
+    their ORIGINAL levels (not recalculated from the new blended entry) —
+    also stated explicitly in the confirmation.
+    """
+    direction = pos["direction"]
+
+    if is_live:
+        set_lev_fn, price_fn, balance_fn = _sync_set_leverage_live, get_price_live, get_balance_live
+        constraints_fn, order_fn = get_instrument_constraints_live, place_order_live
+        entry_fn, size_fn = _sync_get_position_entry_live, _sync_get_position_size_live
+    else:
+        set_lev_fn, price_fn, balance_fn = _sync_set_leverage, get_price, get_balance
+        constraints_fn, order_fn = get_instrument_constraints, place_order
+        entry_fn, size_fn = _sync_get_position_entry, _sync_get_position_size
+
+    await update.message.reply_text(
+        f"⏳ Adding to {strategy_label} {direction} position on {symbol} "
+        f"({ADD_MORE_POSITION_PCT*100:.0f}% of balance, {ADD_MORE_LEVERAGE}x)...")
+
+    try:
+        actual_lev = await asyncio.to_thread(set_lev_fn, symbol)
+
+        price = await price_fn(symbol)
+        if not price:
+            await update.message.reply_text(f"❌ Could not fetch current price for {symbol}.")
+            return
+        balance = await balance_fn()
+        if not balance:
+            await update.message.reply_text(f"❌ Could not fetch balance.")
+            return
+
+        min_q, max_q, step, min_notional, max_lev = await constraints_fn(symbol)
+        target_margin   = balance * ADD_MORE_POSITION_PCT
+        target_notional = target_margin * actual_lev
+        raw_qty = target_notional / price
+        raw_qty = max(raw_qty, min_notional / price)
+        add_qty = _round_qty(raw_qty, min_q, step)
+
+        if add_qty <= 0:
+            await update.message.reply_text(f"❌ Computed add-on size too small for {symbol}.")
+            return
+
+        side = "Buy" if direction == "LONG" else "Sell"
+        result = await order_fn(symbol, side, add_qty)
+        if not result or "__error__" in result:
+            err = result.get("__error__", "Unknown") if result else "No response from Bybit"
+            await update.message.reply_text(f"❌ Add-on order failed for {symbol}: {err}")
+            return
+
+        await asyncio.sleep(1)
+        old_qty   = pos.get("original_qty", 0)
+        old_entry = pos.get("entry_price", price)
+
+        new_entry = await asyncio.to_thread(entry_fn, symbol)
+        new_size  = await asyncio.to_thread(size_fn, symbol)
+
+        if new_entry and new_size and new_size > 0:
+            pos["entry_price"]   = new_entry
+            pos["original_qty"]  = new_size
+            if "remaining_qty" in pos:
+                pos["remaining_qty"] = new_size
+        else:
+            # Bybit's own position query didn't return cleanly this cycle —
+            # compute the blended average ourselves rather than leave the
+            # bot's internal state stale after a real fill happened.
+            total_qty = old_qty + add_qty
+            pos["entry_price"]  = (old_qty*old_entry + add_qty*price) / total_qty if total_qty else price
+            pos["original_qty"] = total_qty
+            if "remaining_qty" in pos:
+                pos["remaining_qty"] = total_qty
+        if "leverage" in pos:
+            pos["leverage"] = actual_lev
+        save_state()
+
+        sl_tp_note = ""
+        if "sl_price" in pos:
+            sl_tp_note = (f"\n🛡 SL/TP unchanged at original levels: SL "
+                          f"{pos.get('sl_price',0):.4f}, TP1 {pos.get('tp1_price',0):.4f}, "
+                          f"TP2 {pos.get('tp2_price',0):.4f} — NOT recalculated from the "
+                          f"new blended entry")
+
+        emoji = "🟢" if direction == "LONG" else "🔴"
+        await alert(bot,
+            f"{emoji} <b>ADDED TO POSITION — {strategy_label} — {symbol} {direction}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"➕ Added: {add_qty} @ ~{price:.4f}\n"
+            f"📊 New total size: {pos['original_qty']}\n"
+            f"📌 New blended entry: {pos['entry_price']:.4f} (was {old_entry:.4f})\n"
+            f"⚡ Leverage: {actual_lev}x — applies to the WHOLE position "
+            f"(existing + new); leverage is per-symbol on Bybit, not per-order\n"
+            f"💰 Balance used: {ADD_MORE_POSITION_PCT*100:.0f}% of {balance:.2f} USDT"
+            f"{sl_tp_note}"
+            + ("\n💰 REAL MONEY — Bybit live account" if is_live else ""))
+        logger.info(f"[ADD_MORE] {strategy_label} {symbol} added {add_qty} @ {price}, "
+                    f"new total {pos['original_qty']} @ {pos['entry_price']}")
+    except Exception as e:
+        logger.error(f"[ADD_MORE] {symbol} failed: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ Add-more failed for {symbol}: {e}")
+
+
+@owner_only
+async def cmd_add_more(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Add to an EXISTING open position on ANY of the three strategies —
+    PsychologyBot (9-filter), MemeBot, or Regime Strategy — whichever one
+    currently holds a position on the given symbol. Adds 20% of CURRENT
+    balance at 10x leverage, uniformly across all three strategies.
+    Usage: /add_more SYMBOL
+    """
+    if not ctx.args:
+        await update.message.reply_text(
+            "Usage: /add_more SYMBOL\nExample: /add_more BTCUSDT\n\n"
+            "Adds to an existing open position on whichever strategy "
+            "currently holds it (PsychologyBot, MemeBot, or Regime "
+            f"Strategy) — {ADD_MORE_POSITION_PCT*100:.0f}% of current "
+            f"balance at {ADD_MORE_LEVERAGE}x leverage.")
+        return
+
+    symbol = ctx.args[0].upper()
+    if not symbol.endswith("USDT"):
+        symbol += "USDT"
+
+    if symbol in symbol_positions:
+        await _add_more_to_position(update, ctx.bot, symbol, symbol_positions[symbol],
+                                     "PsychologyBot", is_live=False)
+    elif symbol in meme_positions:
+        pos = meme_positions[symbol]
+        if pos.get("tp1_hit") or pos.get("tp2_hit"):
+            await update.message.reply_text(
+                f"⚠️ {symbol} already had TP1/TP2 partially hit on MemeBot — "
+                f"adding more isn't supported on a position that's already "
+                f"taken partial profit, to avoid confusing the SL/TP "
+                f"tracking. Let this trade play out or manage it manually "
+                f"on Bybit if you need to.")
+            return
+        await _add_more_to_position(update, ctx.bot, symbol, pos, "MemeBot", is_live=False)
+    elif symbol in regime_positions:
+        if not REGIME_LIVE_TRADING_ENABLED:
+            await update.message.reply_text(
+                f"⚠️ {symbol} has an open Regime Strategy position, but "
+                f"live trading isn't configured (missing "
+                f"BYBIT_LIVE_API_KEY/SECRET) — nothing to add to.")
+            return
+        await _add_more_to_position(update, ctx.bot, symbol, regime_positions[symbol],
+                                     "Regime Strategy", is_live=True)
+    else:
+        await update.message.reply_text(
+            f"⚠️ No open position found for {symbol} on any strategy "
+            f"(PsychologyBot, MemeBot, or Regime Strategy).")
+
+
 @owner_only
 async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     global bot_paused, consec_losses, daily_loss, weekly_loss
@@ -9171,6 +9350,7 @@ async def main() -> None:
     app.add_handler(CommandHandler("scan",           cmd_scan))
     app.add_handler(CommandHandler("pause",          cmd_pause))
     app.add_handler(CommandHandler("close",          cmd_close))
+    app.add_handler(CommandHandler("add_more",       cmd_add_more))
     app.add_handler(CommandHandler("resume",         cmd_resume))
     app.add_handler(CommandHandler("balance",        cmd_balance))
     # ── MemeBot commands ──────────────────────────────────────────────────────
