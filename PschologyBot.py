@@ -9516,6 +9516,11 @@ async def main() -> None:
     aio_app.router.add_get("/health",   health)
     aio_app.router.add_post("/webhook", webhook_handler)
 
+    # Guard watchdog: alerts here if the Sepolia token monitor goes silent.
+    # Needs MONITOR_PUBLIC_KEY in Render env vars; does nothing without it.
+    from heartbeat_watchdog import attach_guard
+    attach_guard(aio_app, lambda text: app.bot.send_message(chat_id=CHAT_ID, text=text))
+
     runner = web.AppRunner(aio_app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", port).start()
