@@ -150,5 +150,4 @@ techniques against third-party systems. No real user data is used, all
 secrets are kept out of the repository, and wallet keys are stored
 encrypted.
 
-**AI assistance:** *[describe your own contribution and the role of AI
-tools, consistent with the README's "Authorship and AI assistance" section.]*
+
