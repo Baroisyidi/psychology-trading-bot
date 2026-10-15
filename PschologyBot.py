@@ -169,6 +169,9 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+# Telegram request URLs contain the bot token: never write them to the logs.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  REGIME CONSTANTS — defined early so all functions can reference them
@@ -9518,8 +9521,11 @@ async def main() -> None:
 
     # Guard watchdog: alerts here if the Sepolia token monitor goes silent.
     # Needs MONITOR_PUBLIC_KEY in Render env vars; does nothing without it.
-    from heartbeat_watchdog import attach_guard
-    attach_guard(aio_app, lambda text: app.bot.send_message(chat_id=CHAT_ID, text=text))
+    try:
+        from heartbeat_watchdog import attach_guard
+        attach_guard(aio_app, lambda text: app.bot.send_message(chat_id=CHAT_ID, text=text))
+    except Exception as e:  # the guard must never stop the trading bot
+        print(f"[GUARD] disabled: {type(e).__name__}: {e}")
 
     runner = web.AppRunner(aio_app)
     await runner.setup()
