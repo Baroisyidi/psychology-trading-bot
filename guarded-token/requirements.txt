@@ -1,0 +1,8 @@
+eth-ape==0.8.52
+ape-vyper==0.8.12
+vyper==0.4.3
+packaging>=23.1,<24
+pynacl>=1.5
+python-dotenv>=1.0
+requests>=2.31
+scikit-learn==1.9.1

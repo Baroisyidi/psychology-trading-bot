@@ -1,0 +1,10 @@
+name: guarded-token
+default_ecosystem: ethereum
+ethereum:
+  default_network: local
+test:
+  number_of_accounts: 80
+node:
+  ethereum:
+    local:
+      uri: http://127.0.0.1:8545

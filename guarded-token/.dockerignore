@@ -1,0 +1,16 @@
+.venv/
+.build/
+**/__pycache__/
+.pytest_cache/
+.env
+keys/
+alerts.jsonl
+monitor_heartbeat.json
+*.zip
+.git/
+models/
+secrets/
+deployment/
+.env.sepolia
+threat.json
+reports/

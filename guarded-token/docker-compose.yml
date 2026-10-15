@@ -1,0 +1,108 @@
+# Everything for the prototype in one stack:
+#   node      a local Ethereum chain (fake ETH, wiped on restart)
+#   deploy    deploys the token once the chain is up, then exits
+#   monitor   watches the token every second and sends alerts
+#   watchdog  alerts if the monitor goes silent
+#   api       public API protected by puzzles (http://localhost:8080/status)
+#
+#   docker compose up -d               start the stack
+#   docker compose logs -f monitor     watch the alerts
+#   docker compose run --rm attack     play an attack (add "fanout" for the Phase 3 one)
+#   docker compose run --rm app        run the tests
+#   docker compose down                stop everything
+
+name: guarded-token
+
+x-app: &app
+  build: .
+  image: guarded-token:latest
+  init: true
+  env_file:
+    - path: .env
+      required: false
+  environment:
+    NODE_URI: http://node:8545
+    TOKEN_ADDRESS_FILE: /data/token_address
+    HEARTBEAT_PATH: /data/monitor_heartbeat.json
+    ALERT_LOG_PATH: /data/alerts.jsonl
+    THREAT_PATH: /data/threat.json
+
+services:
+  node:
+    image: trufflesuite/ganache:v7.9.2
+    command:
+      - --server.host=0.0.0.0
+      - --chain.chainId=1337
+      - --wallet.mnemonic=test test test test test test test test test test test junk
+      - --wallet.totalAccounts=40
+      - --logging.quiet
+    ports:
+      - "127.0.0.1:8545:8545"   # reachable from your computer only
+
+  deploy:
+    <<: *app
+    command: ["deploy"]
+    depends_on: [node]
+    volumes:
+      - shared:/data
+
+  monitor:
+    <<: *app
+    command: ["monitor"]
+    restart: unless-stopped
+    environment:
+      NODE_URI: http://node:8545
+      TOKEN_ADDRESS_FILE: /data/token_address
+      HEARTBEAT_PATH: /data/monitor_heartbeat.json
+      ALERT_LOG_PATH: /data/alerts.jsonl
+      THREAT_PATH: /data/threat.json
+      # Local chain: the guardian acts for real. Set GUARDIAN_MODE in .env to
+      # "dry-run" (report only) or "off" (alerts only) to change this.
+      GUARDIAN_MODE: ${GUARDIAN_MODE:-on}
+    depends_on:
+      deploy:
+        condition: service_completed_successfully
+    volumes:
+      - shared:/data
+      - monitor-keys:/app/keys     # the monitor's signing key
+
+  watchdog:
+    <<: *app
+    command: ["watchdog"]
+    restart: unless-stopped
+    depends_on: [monitor]
+    volumes:
+      - shared:/data:ro              # reads the heartbeat only
+      - watchdog-keys:/app/keys      # its own key, separate from the monitor's
+
+  api:
+    <<: *app
+    command: ["api"]
+    restart: unless-stopped
+    depends_on:
+      deploy:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:8080:8080"   # reachable from your computer only
+    volumes:
+      - shared:/data:ro          # reads the threat level the monitor writes
+
+  # One-off tools (not started by `up`):
+  attack:
+    <<: *app
+    command: ["attack"]
+    profiles: [tools]
+    volumes:
+      - shared:/data:ro
+
+  app:
+    <<: *app
+    command: ["ape", "test"]
+    profiles: [tools]
+    volumes:
+      - shared:/data
+
+volumes:
+  shared:
+  monitor-keys:
+  watchdog-keys:

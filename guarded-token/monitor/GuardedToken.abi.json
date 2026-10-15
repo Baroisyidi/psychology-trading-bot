@@ -1,0 +1,775 @@
+[
+ {
+  "name": "Transfer",
+  "inputs": [
+   {
+    "name": "sender",
+    "type": "address",
+    "indexed": true
+   },
+   {
+    "name": "receiver",
+    "type": "address",
+    "indexed": true
+   },
+   {
+    "name": "value",
+    "type": "uint256",
+    "indexed": false
+   }
+  ],
+  "anonymous": false,
+  "type": "event"
+ },
+ {
+  "name": "Approval",
+  "inputs": [
+   {
+    "name": "owner",
+    "type": "address",
+    "indexed": true
+   },
+   {
+    "name": "spender",
+    "type": "address",
+    "indexed": true
+   },
+   {
+    "name": "value",
+    "type": "uint256",
+    "indexed": false
+   }
+  ],
+  "anonymous": false,
+  "type": "event"
+ },
+ {
+  "name": "Paused",
+  "inputs": [
+   {
+    "name": "by",
+    "type": "address",
+    "indexed": true
+   }
+  ],
+  "anonymous": false,
+  "type": "event"
+ },
+ {
+  "name": "Unpaused",
+  "inputs": [
+   {
+    "name": "by",
+    "type": "address",
+    "indexed": true
+   }
+  ],
+  "anonymous": false,
+  "type": "event"
+ },
+ {
+  "name": "Blocklisted",
+  "inputs": [
+   {
+    "name": "account",
+    "type": "address",
+    "indexed": true
+   },
+   {
+    "name": "by",
+    "type": "address",
+    "indexed": true
+   }
+  ],
+  "anonymous": false,
+  "type": "event"
+ },
+ {
+  "name": "Unblocked",
+  "inputs": [
+   {
+    "name": "account",
+    "type": "address",
+    "indexed": true
+   },
+   {
+    "name": "by",
+    "type": "address",
+    "indexed": true
+   }
+  ],
+  "anonymous": false,
+  "type": "event"
+ },
+ {
+  "name": "LimitChanged",
+  "inputs": [
+   {
+    "name": "old_limit",
+    "type": "uint256",
+    "indexed": false
+   },
+   {
+    "name": "new_limit",
+    "type": "uint256",
+    "indexed": false
+   },
+   {
+    "name": "by",
+    "type": "address",
+    "indexed": true
+   }
+  ],
+  "anonymous": false,
+  "type": "event"
+ },
+ {
+  "name": "GuardianProposed",
+  "inputs": [
+   {
+    "name": "new_guardian",
+    "type": "address",
+    "indexed": true
+   },
+   {
+    "name": "eta",
+    "type": "uint256",
+    "indexed": false
+   }
+  ],
+  "anonymous": false,
+  "type": "event"
+ },
+ {
+  "name": "GuardianChanged",
+  "inputs": [
+   {
+    "name": "old_guardian",
+    "type": "address",
+    "indexed": true
+   },
+   {
+    "name": "new_guardian",
+    "type": "address",
+    "indexed": true
+   }
+  ],
+  "anonymous": false,
+  "type": "event"
+ },
+ {
+  "name": "GuardianRevoked",
+  "inputs": [
+   {
+    "name": "old_guardian",
+    "type": "address",
+    "indexed": true
+   }
+  ],
+  "anonymous": false,
+  "type": "event"
+ },
+ {
+  "name": "LimitProposed",
+  "inputs": [
+   {
+    "name": "new_limit",
+    "type": "uint256",
+    "indexed": false
+   },
+   {
+    "name": "eta",
+    "type": "uint256",
+    "indexed": false
+   }
+  ],
+  "anonymous": false,
+  "type": "event"
+ },
+ {
+  "name": "AdminProposed",
+  "inputs": [
+   {
+    "name": "new_admin",
+    "type": "address",
+    "indexed": true
+   },
+   {
+    "name": "eta",
+    "type": "uint256",
+    "indexed": false
+   }
+  ],
+  "anonymous": false,
+  "type": "event"
+ },
+ {
+  "name": "AdminChanged",
+  "inputs": [
+   {
+    "name": "old_admin",
+    "type": "address",
+    "indexed": true
+   },
+   {
+    "name": "new_admin",
+    "type": "address",
+    "indexed": true
+   }
+  ],
+  "anonymous": false,
+  "type": "event"
+ },
+ {
+  "name": "PendingCancelled",
+  "inputs": [
+   {
+    "name": "by",
+    "type": "address",
+    "indexed": true
+   }
+  ],
+  "anonymous": false,
+  "type": "event"
+ },
+ {
+  "stateMutability": "nonpayable",
+  "type": "function",
+  "name": "transfer",
+  "inputs": [
+   {
+    "name": "receiver",
+    "type": "address"
+   },
+   {
+    "name": "amount",
+    "type": "uint256"
+   }
+  ],
+  "outputs": [
+   {
+    "name": "",
+    "type": "bool"
+   }
+  ]
+ },
+ {
+  "stateMutability": "nonpayable",
+  "type": "function",
+  "name": "transferFrom",
+  "inputs": [
+   {
+    "name": "sender",
+    "type": "address"
+   },
+   {
+    "name": "receiver",
+    "type": "address"
+   },
+   {
+    "name": "amount",
+    "type": "uint256"
+   }
+  ],
+  "outputs": [
+   {
+    "name": "",
+    "type": "bool"
+   }
+  ]
+ },
+ {
+  "stateMutability": "nonpayable",
+  "type": "function",
+  "name": "approve",
+  "inputs": [
+   {
+    "name": "spender",
+    "type": "address"
+   },
+   {
+    "name": "amount",
+    "type": "uint256"
+   }
+  ],
+  "outputs": [
+   {
+    "name": "",
+    "type": "bool"
+   }
+  ]
+ },
+ {
+  "stateMutability": "nonpayable",
+  "type": "function",
+  "name": "mint",
+  "inputs": [
+   {
+    "name": "receiver",
+    "type": "address"
+   },
+   {
+    "name": "amount",
+    "type": "uint256"
+   }
+  ],
+  "outputs": []
+ },
+ {
+  "stateMutability": "nonpayable",
+  "type": "function",
+  "name": "burn",
+  "inputs": [
+   {
+    "name": "amount",
+    "type": "uint256"
+   }
+  ],
+  "outputs": []
+ },
+ {
+  "stateMutability": "nonpayable",
+  "type": "function",
+  "name": "pause",
+  "inputs": [],
+  "outputs": []
+ },
+ {
+  "stateMutability": "nonpayable",
+  "type": "function",
+  "name": "block_address",
+  "inputs": [
+   {
+    "name": "account",
+    "type": "address"
+   }
+  ],
+  "outputs": []
+ },
+ {
+  "stateMutability": "nonpayable",
+  "type": "function",
+  "name": "tighten_limit",
+  "inputs": [
+   {
+    "name": "new_limit",
+    "type": "uint256"
+   }
+  ],
+  "outputs": []
+ },
+ {
+  "stateMutability": "nonpayable",
+  "type": "function",
+  "name": "unpause",
+  "inputs": [],
+  "outputs": []
+ },
+ {
+  "stateMutability": "nonpayable",
+  "type": "function",
+  "name": "unblock_address",
+  "inputs": [
+   {
+    "name": "account",
+    "type": "address"
+   }
+  ],
+  "outputs": []
+ },
+ {
+  "stateMutability": "nonpayable",
+  "type": "function",
+  "name": "revoke_guardian",
+  "inputs": [],
+  "outputs": []
+ },
+ {
+  "stateMutability": "nonpayable",
+  "type": "function",
+  "name": "propose_guardian",
+  "inputs": [
+   {
+    "name": "new_guardian",
+    "type": "address"
+   }
+  ],
+  "outputs": []
+ },
+ {
+  "stateMutability": "nonpayable",
+  "type": "function",
+  "name": "execute_guardian",
+  "inputs": [],
+  "outputs": []
+ },
+ {
+  "stateMutability": "nonpayable",
+  "type": "function",
+  "name": "propose_limit",
+  "inputs": [
+   {
+    "name": "new_limit",
+    "type": "uint256"
+   }
+  ],
+  "outputs": []
+ },
+ {
+  "stateMutability": "nonpayable",
+  "type": "function",
+  "name": "execute_limit",
+  "inputs": [],
+  "outputs": []
+ },
+ {
+  "stateMutability": "nonpayable",
+  "type": "function",
+  "name": "propose_admin",
+  "inputs": [
+   {
+    "name": "new_admin",
+    "type": "address"
+   }
+  ],
+  "outputs": []
+ },
+ {
+  "stateMutability": "nonpayable",
+  "type": "function",
+  "name": "accept_admin",
+  "inputs": [],
+  "outputs": []
+ },
+ {
+  "stateMutability": "nonpayable",
+  "type": "function",
+  "name": "cancel_pending",
+  "inputs": [],
+  "outputs": []
+ },
+ {
+  "stateMutability": "view",
+  "type": "function",
+  "name": "name",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "string"
+   }
+  ]
+ },
+ {
+  "stateMutability": "view",
+  "type": "function",
+  "name": "symbol",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "string"
+   }
+  ]
+ },
+ {
+  "stateMutability": "view",
+  "type": "function",
+  "name": "decimals",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "uint8"
+   }
+  ]
+ },
+ {
+  "stateMutability": "view",
+  "type": "function",
+  "name": "totalSupply",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "uint256"
+   }
+  ]
+ },
+ {
+  "stateMutability": "view",
+  "type": "function",
+  "name": "balanceOf",
+  "inputs": [
+   {
+    "name": "arg0",
+    "type": "address"
+   }
+  ],
+  "outputs": [
+   {
+    "name": "",
+    "type": "uint256"
+   }
+  ]
+ },
+ {
+  "stateMutability": "view",
+  "type": "function",
+  "name": "allowance",
+  "inputs": [
+   {
+    "name": "arg0",
+    "type": "address"
+   },
+   {
+    "name": "arg1",
+    "type": "address"
+   }
+  ],
+  "outputs": [
+   {
+    "name": "",
+    "type": "uint256"
+   }
+  ]
+ },
+ {
+  "stateMutability": "view",
+  "type": "function",
+  "name": "MAX_SUPPLY",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "uint256"
+   }
+  ]
+ },
+ {
+  "stateMutability": "view",
+  "type": "function",
+  "name": "admin",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "address"
+   }
+  ]
+ },
+ {
+  "stateMutability": "view",
+  "type": "function",
+  "name": "guardian",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "address"
+   }
+  ]
+ },
+ {
+  "stateMutability": "view",
+  "type": "function",
+  "name": "paused",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "bool"
+   }
+  ]
+ },
+ {
+  "stateMutability": "view",
+  "type": "function",
+  "name": "blocklisted",
+  "inputs": [
+   {
+    "name": "arg0",
+    "type": "address"
+   }
+  ],
+  "outputs": [
+   {
+    "name": "",
+    "type": "bool"
+   }
+  ]
+ },
+ {
+  "stateMutability": "view",
+  "type": "function",
+  "name": "transfer_limit",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "uint256"
+   }
+  ]
+ },
+ {
+  "stateMutability": "view",
+  "type": "function",
+  "name": "LIMIT_WINDOW",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "uint256"
+   }
+  ]
+ },
+ {
+  "stateMutability": "view",
+  "type": "function",
+  "name": "window_start",
+  "inputs": [
+   {
+    "name": "arg0",
+    "type": "address"
+   }
+  ],
+  "outputs": [
+   {
+    "name": "",
+    "type": "uint256"
+   }
+  ]
+ },
+ {
+  "stateMutability": "view",
+  "type": "function",
+  "name": "sent_in_window",
+  "inputs": [
+   {
+    "name": "arg0",
+    "type": "address"
+   }
+  ],
+  "outputs": [
+   {
+    "name": "",
+    "type": "uint256"
+   }
+  ]
+ },
+ {
+  "stateMutability": "view",
+  "type": "function",
+  "name": "TIMELOCK_DELAY",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "uint256"
+   }
+  ]
+ },
+ {
+  "stateMutability": "view",
+  "type": "function",
+  "name": "pending_guardian",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "address"
+   }
+  ]
+ },
+ {
+  "stateMutability": "view",
+  "type": "function",
+  "name": "pending_guardian_eta",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "uint256"
+   }
+  ]
+ },
+ {
+  "stateMutability": "view",
+  "type": "function",
+  "name": "pending_limit",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "uint256"
+   }
+  ]
+ },
+ {
+  "stateMutability": "view",
+  "type": "function",
+  "name": "pending_limit_eta",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "uint256"
+   }
+  ]
+ },
+ {
+  "stateMutability": "view",
+  "type": "function",
+  "name": "pending_admin",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "address"
+   }
+  ]
+ },
+ {
+  "stateMutability": "view",
+  "type": "function",
+  "name": "pending_admin_eta",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "uint256"
+   }
+  ]
+ },
+ {
+  "stateMutability": "nonpayable",
+  "type": "constructor",
+  "inputs": [
+   {
+    "name": "_name",
+    "type": "string"
+   },
+   {
+    "name": "_symbol",
+    "type": "string"
+   },
+   {
+    "name": "_max_supply",
+    "type": "uint256"
+   },
+   {
+    "name": "_admin",
+    "type": "address"
+   },
+   {
+    "name": "_guardian",
+    "type": "address"
+   },
+   {
+    "name": "_transfer_limit",
+    "type": "uint256"
+   }
+  ],
+  "outputs": []
+ }
+]

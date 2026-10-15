@@ -1,0 +1,77 @@
+# The guard on the PUBLIC Sepolia test network. Separate from the local
+# stack (docker-compose.yml): no local chain, real 12-second blocks, real
+# (free, test-only) ETH for fees. Settings live in .env.sepolia.
+#
+#   docker compose -f docker-compose.sepolia.yml run --rm tools keys new admin
+#   docker compose -f docker-compose.sepolia.yml run --rm tools deploy-public
+#   docker compose -f docker-compose.sepolia.yml up -d
+#   docker compose -f docker-compose.sepolia.yml logs -f monitor
+#   docker compose -f docker-compose.sepolia.yml run --rm tools drill
+#   docker compose -f docker-compose.sepolia.yml down
+#
+# Folders on your computer, next to this file:
+#   secrets/      encrypted wallet key files     (BACK THIS UP, never share it)
+#   deployment/   the token address and deploy block
+
+name: guarded-token-sepolia
+
+x-app: &app
+  build: .
+  image: guarded-token:latest
+  init: true
+  env_file:
+    - path: .env.sepolia
+      required: true
+  environment: &env
+    GT_DOCKER: "1"               # tools print docker commands in their hints
+    KEYS_DIR: /app/secrets
+    DATA_DIR: /app/deployment
+    HEARTBEAT_PATH: /data/monitor_heartbeat.json
+    ALERT_LOG_PATH: /data/alerts.jsonl
+    THREAT_PATH: /data/threat.json
+  volumes: &vols
+    - ./secrets:/app/secrets
+    - ./deployment:/app/deployment
+    - data:/data
+
+services:
+  monitor:
+    <<: *app
+    command: ["public-monitor"]
+    restart: unless-stopped
+    # GUARDIAN_MODE, POLL_SECONDS etc. come from .env.sepolia (defaults: on, 6s)
+    volumes:
+      - ./secrets:/app/secrets:ro
+      - ./deployment:/app/deployment:ro
+      - data:/data
+      - monitor-keys:/app/keys      # the monitor's signing key: keep it, the remote watchdog knows it
+
+  watchdog:
+    <<: *app
+    command: ["public-watchdog"]
+    restart: unless-stopped
+    depends_on: [monitor]
+    volumes:
+      - data:/data:ro
+      - watchdog-keys:/app/keys
+
+  api:
+    <<: *app
+    command: ["public-api"]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./deployment:/app/deployment:ro
+      - data:/data:ro
+
+  # One-off tools (not started by `up`): keys, deploy-public, admin, drill
+  tools:
+    <<: *app
+    command: ["tools"]
+    profiles: [tools]
+
+volumes:
+  data:
+  monitor-keys:
+  watchdog-keys:
