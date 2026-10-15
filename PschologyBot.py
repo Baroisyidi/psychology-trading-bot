@@ -9495,7 +9495,12 @@ async def main() -> None:
     webhook_url = f"https://{base_url}/webhook"
     port        = int(os.environ.get("PORT", 10000))
 
-    await app.bot.set_webhook(url=webhook_url, drop_pending_updates=True)
+    # WEBHOOK_SECRET (Render env var): Telegram attaches it to every real update,
+    # so forged requests to /webhook are rejected. Letters, digits, _ and - only.
+    webhook_secret = os.environ.get("WEBHOOK_SECRET", "").strip()
+    await app.bot.set_webhook(url=webhook_url, drop_pending_updates=True,
+                              secret_token=webhook_secret or None)
+    print(f"Webhook secret: {'ON' if webhook_secret else 'OFF (set WEBHOOK_SECRET to enable)'}")
     print(f"Webhook → {webhook_url}")
 
     await app.initialize()
@@ -9506,6 +9511,11 @@ async def main() -> None:
         return web.Response(text="OK")
 
     async def webhook_handler(request):
+        if webhook_secret:
+            import hmac
+            sent = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+            if not hmac.compare_digest(sent, webhook_secret):
+                return web.Response(text="Forbidden", status=403)
         try:
             update = Update.de_json(await request.json(), app.bot)
             await app.update_queue.put(update)
