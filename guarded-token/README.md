@@ -1,4 +1,62 @@
-# Guarded Token — Phases 1 to 4, local and on Sepolia
+# Guarded Token: an AI-guarded ERC-20 token with automated detection and response
+
+| | |
+|---|---|
+| **Author** | *IBRAHIM BARO YIDI*, *[MOSCOW TECHICAL UNIVERSITY OF COMMUNICATION AND INFORMATICS, Masters in Quamtum Communication, first year]* |
+| **Contact** | *[Baroisyidi@gmail.com]* |
+| **Version** | 1.0.0 (15 October 2026) |
+| **Status** | Working prototype, deployed on the Sepolia public test network |
+| **License** | MIT for this project's code (see [License](#license)); third-party libraries keep their own licenses |
+| **External resources** | Ethereum Sepolia testnet, Alchemy RPC (free tier), Telegram Bot API, Render (remote watchdog) |
+| **Live deployment** | Token `0x94257114D1bAD555BbD6f7112C6D8D28b213Fb28` on [Sepolia Etherscan](https://sepolia.etherscan.io/address/0x94257114D1bAD555BbD6f7112C6D8D28b213Fb28) |
+
+## Abstract
+
+Fraud on token networks usually succeeds because it is noticed too late:
+by the time a person reads an alert, a stolen wallet has been emptied.
+This project explores whether a machine-learning monitor, combined with
+narrowly limited on-chain powers, can detect and **contain** such attacks
+automatically, within seconds, without giving the AI the power to cause
+irreversible harm.
+
+The system has four layers. (1) An ERC-20 token written in Vyper with
+built-in safety controls: pause, blocklist, an hourly per-wallet transfer
+limit, a supply cap and a 48-hour timelock on administrative changes. (2) A
+monitor that reads every block, scores every transfer and sends
+Ed25519-signed alerts to Telegram, with local and remote watchdogs that
+report if it goes silent. (3) Two models trained on simulated traffic: a
+gradient-boosted fraud classifier and an Isolation Forest anomaly detector
+over 27 streaming features, with plain-language explanations and incident
+grouping. (4) A guardian that responds with escalating, reversible actions
+(blocklist, then a tighter limit, then pause), under safety caps, and a
+proof-of-work / time-lock puzzle gate that makes flooding the public API
+expensive.
+
+On an unseen 28-day simulation the models caught **99 of 99 attacks at 0.9
+false alarms per day**, against 9 of 99 and 106 false alarms per day for
+hand-written rules. In a red-team drill the guardian stopped all five attack
+types without blocking any innocent wallet. Deployed on the public Sepolia
+network, it stopped a live stolen-key drill after **2 payments, in 18
+seconds**, keeping 80% of the funds. The results come from simulated
+traffic and a testnet; the [limitations](#known-limitations) and
+[safe-use rules](#safety-ethics-and-responsible-use) are stated below.
+
+**Keywords:** blockchain security, fraud detection, anomaly detection,
+gradient boosting, Isolation Forest, ERC-20, smart contracts, automated
+incident response, client puzzles, time-lock puzzles, Ed25519, Ethereum
+Sepolia.
+
+**Contents:** [Quick start (Docker)](#option-a-docker-recommended-on-windows) ·
+[Architecture](#architecture) · [Phase 1](#phase-1-the-token) ·
+[Phase 2](#phase-2-the-monitor) · [Phase 3 (AI models)](#phase-3-trained-detection-models) ·
+[Phase 4 (active defence)](#phase-4-active-defence) ·
+[Going public (Sepolia)](#going-public-the-sepolia-test-network) ·
+[Results](#results-summary) · [Project layout](#project-layout) ·
+[Libraries, models and data](#libraries-models-and-data) · [License](#license) ·
+[Limitations](#known-limitations) · [Safety and ethics](#safety-ethics-and-responsible-use) ·
+[Authorship](#authorship-and-ai-assistance) · [References](#references)
+
+## About this README
 
 A learning-prototype ERC-20 token with emergency controls (Phase 1), an
 AI-guard monitor that watches it every second and sends signed alerts to
@@ -674,6 +732,62 @@ The same tools run directly: `python -m tools.keys new admin`,
 `GUARDIAN_KEYSTORE_PASSWORD`, `POLL_SECONDS=6` and `LOG_BLOCK_RANGE=10`,
 then run `python -m monitor`.
 
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph Chain["Ethereum (local chain or Sepolia)"]
+        T["GuardedToken.vy<br/>pause · blocklist · hourly limit<br/>supply cap · 48h timelock"]
+    end
+    subgraph Guard["Monitor (Docker, every block)"]
+        C["Collector<br/>eth_getLogs, adaptive ranges"] --> F["27 streaming features"]
+        F --> M["Fraud model (gradient boosting)<br/>+ anomaly model (Isolation Forest)<br/>+ rules for admin events"]
+        M --> I["Incident grouping"]
+        I --> G["Guardian<br/>blocklist → tighten → pause<br/>(caps, protected wallets, dry-run)"]
+        I --> A["Ed25519-signed alerts"]
+        I --> TH["Threat level"]
+    end
+    T -- events --> C
+    G -- "protective transactions only" --> T
+    A --> TG["Telegram"]
+    TH --> API["Public API<br/>proof-of-work / time-lock puzzles"]
+    Guard -- "heartbeat file" --> LW["Local watchdog"]
+    Guard -- "signed heartbeat" --> RW["Remote watchdog (Render)"]
+    LW --> TG
+    RW --> TG
+    ADM["Admin (encrypted key, human)"] -- "unpause · unblock · timelocked changes" --> T
+```
+
+**Design principles.** The AI acts automatically only through the
+**guardian** role, which the contract restricts to protective, reversible
+actions: it can block, tighten and pause, but never mint, move funds, unpause
+or unblock. Undoing anything needs the human **admin**, and changes that
+weaken protection wait 48 hours. Alerts and heartbeats are signed, so a
+forged "all clear" is detectable. Each layer assumes the one before it can
+fail: the contract limits damage even if the monitor is down, and the
+watchdogs report when it is.
+
+**Data flow per block.** The collector reads the token's events, each
+transfer becomes a feature vector using only past data (as a live system
+must), both models score it, the highest score is used, and related alerts
+are grouped into one incident. The guardian then decides whether to act,
+under its safety caps. The threat level feeds the API's puzzle difficulty.
+
+## Results summary
+
+| Experiment | Setup | Result |
+|---|---|---|
+| Detection on unseen data | 28-day simulation, 99 attacks of 5 types | Models: 99/99 caught at 0.9 false alarms/day. Rules: 9/99 at 106/day |
+| Generalisation to unseen attack types | Retrain without one type, test on it | Most incidents still caught; fewer transfers flagged (e.g. 14% vs 83% for low-and-slow) |
+| Red-team drill (`ape run redteam`) | 5 attack types against the live guardian | 0 GTT escaped in all 5 (vs 2,600–14,435 GTT without the guardian); 0 innocent wallets blocked |
+| Puzzle cost (`python -m defense.flood_demo`) | 10,000 requests at the critical level | Honest client ≈ 30 min of CPU; flooding attacker ≈ 28 h |
+| Live Sepolia drill (`tools.sepolia_drill`) | Stolen-key fan-out on the public testnet | Stopped after 2 payments in 18 s; 80% of funds kept |
+| Test suite | `ape test` | 93 tests passing |
+
+Full details: `ml/report.md` (models) and `reports/redteam.md` (red team).
+Every number above can be reproduced with the commands shown in this README;
+the simulations use fixed random seeds.
+
 ## Project layout
 
 ```
@@ -716,7 +830,53 @@ docker-compose.sepolia.yml     Sepolia stack: monitor, watchdog, API, tools
 docker/entrypoint.py           what each container runs
 .env.example                   settings template (local)
 .env.sepolia.example           settings template (Sepolia)
+LICENSE                        MIT license for this project
 ```
+
+## Libraries, models and data
+
+**Third-party libraries** (installed from `requirements.txt` and the Docker
+base image; versions pinned where it matters):
+
+| Library | Version | Used for | License |
+|---|---|---|---|
+| [Vyper](https://github.com/vyperlang/vyper) | 0.4.3 | smart-contract language and compiler | Apache-2.0 |
+| [Ape](https://github.com/ApeWorX/ape) (`eth-ape`, `ape-vyper`) | 0.8.52 / 0.8.12 | build, test and deploy framework | Apache-2.0 |
+| [web3.py](https://github.com/ethereum/web3.py) | 7.x | blockchain access | MIT |
+| [eth-account](https://github.com/ethereum/eth-account) | 0.13.x | transaction signing, encrypted keystores | MIT |
+| [scikit-learn](https://scikit-learn.org) | 1.9.1 | gradient boosting, Isolation Forest | BSD-3-Clause |
+| [NumPy](https://numpy.org) / [SciPy](https://scipy.org) / [joblib](https://joblib.readthedocs.io) | 2.x / 1.x / 1.x | numerics, model files | BSD-3-Clause |
+| [PyNaCl](https://github.com/pyca/pynacl) | 1.5+ | Ed25519 signatures for alerts and heartbeats | Apache-2.0 |
+| [requests](https://requests.readthedocs.io) | 2.x | Telegram Bot API, heartbeats | Apache-2.0 |
+| [python-dotenv](https://github.com/theskumar/python-dotenv) | 1.x | settings files | BSD-3-Clause |
+| [pytest](https://pytest.org) | 8.x | tests | MIT |
+| [Ganache](https://github.com/trufflesuite/ganache) (Docker image) | 7.9.2 | local test blockchain | MIT |
+| Python (Docker image `python:3.12-slim`) | 3.12 | runtime | PSF License |
+
+**Models.** Both models are trained by this project (`python -m ml.train`,
+run automatically by the Docker build) and saved to `models/`, which is not
+committed: they are rebuilt from the code, so the repository contains no
+opaque binary models. No pre-trained or third-party models are used.
+
+**Data.** All training and test data is **synthetic**, generated by
+`ml/simulate.py` with fixed seeds (train 101, validation 202, test 303). No
+real users' transactions or personal data are used. The live Sepolia
+deployment only processes this project's own test token, whose wallets were
+created for the project.
+
+**External services.** Ethereum Sepolia (public testnet), an Ethereum RPC
+provider such as Alchemy (free tier), the Telegram Bot API for alerts, and
+optionally Render for the remote watchdog. Each needs your own account or
+key; none is included in this repository.
+
+## License
+
+This project's own code, documentation and generated models are released
+under the **MIT License**: see [`LICENSE`](LICENSE). Third-party libraries
+keep their own licenses (table above); all are permissive (MIT, BSD,
+Apache-2.0), allowing use and modification with attribution. The synthetic
+datasets are generated by this project's code and covered by the same MIT
+License.
 
 ## Known limitations
 
@@ -752,3 +912,93 @@ docker/entrypoint.py           what each container runs
 - **Self-contained ERC-20:** rebuild on an audited library such as
   snekmate before any real deployment; use a multisig admin.
 - **Classic ERC-20 `approve` race:** set an allowance to 0 before changing it.
+- **Scope:** the original plan also included phishing-site, malware and
+  smart-contract vulnerability detectors. They are not implemented in this
+  version; the AI part covers fraud and anomaly detection on token transfers.
+- **Restart time grows:** after a restart the monitor re-reads the token's
+  history from the deployment block (silently, to rebuild its picture of
+  known wallets). On a free RPC plan this takes longer as the chain grows.
+
+## Safety, ethics and responsible use
+
+**Purpose.** This is a defensive research prototype: it detects and contains
+attacks on a token its operator controls. It is not a tool for attacking
+other systems.
+
+**Dual-use components and how they are limited.** The repository contains
+attack *simulators* (`ml/simulate.py`, `scripts/attack_sim.py`,
+`scripts/redteam.py`, `tools/sepolia_drill.py`), because a detector cannot be
+trained or tested without examples of attacks. They are limited as follows:
+
+- They only generate transfers of **this project's own test token**, between
+  wallets the operator creates. They contain no exploits, malware, phishing
+  content or techniques against third-party contracts.
+- The public-network tools **refuse to run on Ethereum mainnet** and other
+  real-money networks (`tools/chain.py`, `MAINNETS`), and the project is
+  documented as testnet-only.
+- The live drill uses a throwaway wallet funded by the operator, and returns
+  leftover test ETH afterwards.
+
+**Limits on the AI's own power.** Automated decisions can be wrong, so the
+system is built so that a wrong decision is cheap to undo:
+
+- The guardian can only take **protective, reversible** actions (blocklist,
+  tighten, pause). It cannot move, mint or burn funds.
+- It needs **corroboration** (two strong alerts, or one very strong one)
+  before blocking, has **caps** (at most 30 blocks per hour and 25 wallets per
+  incident), never blocks **protected wallets**, and supports **dry-run** mode,
+  which reports what it would do without doing it.
+- Every action is announced on Telegram with instructions for undoing it.
+  Only the human admin can unblock or unpause, and weakening protections waits
+  48 hours, so a stolen key cannot quietly disable the safeguards.
+- Alerts include **plain-language reasons**, so a person can check why the
+  model acted (interpretability), and the false-alarm rate was calibrated
+  against a fixed budget.
+
+**Fairness and side effects.** Tightening the hourly limit affects every
+holder, not only the attacker; the red-team report measures this (8 normal
+transfers were delayed in the drill). Blocklisting is a centralised power:
+anyone running a token like this should tell its users that the power exists
+and how it is governed.
+
+**Security practices in this repository.** No keys, tokens or personal data
+are committed (`.gitignore` excludes `secrets/`, `deployment/` and `.env`
+files). Wallet keys are stored encrypted (Ethereum keystore v3: scrypt +
+AES). Error messages hide RPC keys and bot tokens automatically
+(`monitor/redact.py`). Alerts and heartbeats are signed with Ed25519, and
+forged or replayed heartbeats are rejected.
+
+**Safe-use rules.** Use only on test networks, with fresh wallets that hold
+no real value. Never commit `.env` files or the `secrets/` folder. Before
+any real-money use, the contract needs an independent audit, a multisig
+admin, retraining on real traffic, and a legal review: token issuance is
+regulated in many countries.
+
+## Authorship and AI assistance
+
+*[Edit this section so it accurately describes your own contribution.]*
+
+The project was conceived, specified and directed by the author, who chose
+the design (token on an existing chain, Python stack, testnet-only scope),
+ran and verified every phase on their own machine, deployed it to Sepolia,
+operated the live drills and integrated the remote watchdog with an existing
+Telegram bot. Much of the source code and documentation was written with the
+help of an AI coding assistant (Anthropic's Claude), working from the
+author's requirements and test results. All results reported here were
+produced by running the code.
+
+## References
+
+1. F. Vogelsteller, V. Buterin. *EIP-20: Token Standard.* Ethereum Improvement Proposals, 2015.
+2. G. Wood. *Ethereum: A Secure Decentralised Generalised Transaction Ledger* (Yellow Paper).
+3. Vyper documentation. https://docs.vyperlang.org
+4. F. T. Liu, K. M. Ting, Z.-H. Zhou. *Isolation Forest.* Proc. IEEE ICDM, 2008.
+5. J. H. Friedman. *Greedy Function Approximation: A Gradient Boosting Machine.* Annals of Statistics, 29(5), 2001.
+6. G. Ke et al. *LightGBM: A Highly Efficient Gradient Boosting Decision Tree.* NeurIPS, 2017 (the histogram method behind scikit-learn's HistGradientBoostingClassifier).
+7. F. Pedregosa et al. *Scikit-learn: Machine Learning in Python.* JMLR, 12, 2011.
+8. C. Dwork, M. Naor. *Pricing via Processing or Combatting Junk Mail.* CRYPTO, 1992.
+9. A. Back. *Hashcash: A Denial of Service Counter-Measure.* 2002.
+10. R. L. Rivest, A. Shamir, D. A. Wagner. *Time-lock Puzzles and Timed-release Crypto.* MIT/LCS/TR-684, 1996.
+11. D. J. Bernstein, N. Duif, T. Lange, P. Schwabe, B.-Y. Yang. *High-speed High-security Signatures.* Journal of Cryptographic Engineering, 2(2), 2012 (Ed25519).
+12. Ethereum Foundation. *Web3 Secret Storage Definition* (keystore v3).
+13. Telegram. *Bot API.* https://core.telegram.org/bots/api
